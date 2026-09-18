@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+# Simulation output
+# ---------------------------------------------------------------------------
+# Everything a run produces lands in runs/<name>/. It is regenerable, and it is
+# big: the per-episode trade ledger is the bulk of it, and a single long run can
+# be well over 100 MB (this working tree reached 1.9 GB across ~25 runs). The
+# code and the configs are the repo; results are reproducible from them.
+#
+# To keep one result anyway -- a report is only a few KB and is worth committing
+# when it backs a claim:
+#
+#     git add -f runs/main/report.md runs/main/metrics.jsonl runs/main/config.json
+#
+# Name the files rather than the directory. `git add -f runs/main/` overrides
+# every rule below as well and will happily stage a 12 MB trades.csv with them.
+runs/
+
+# The same artefacts by name, so they stay ignored if output is ever written
+# somewhere other than runs/, or if the line above is removed.
+**/trades.jsonl
+**/trades.csv
+**/progress.json
+**/progress.json.tmp
+**/gui_config.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+.Python
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Model weights
+# ---------------------------------------------------------------------------
+# Not written today -- agents are rebuilt from a seed rather than checkpointed --
+# but torch artefacts have a way of appearing, and they should never be commits.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ---------------------------------------------------------------------------
+# Editors and IDEs
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# OS cruft
+# ---------------------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# ---------------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------------
+*.log
+*.out
+*.tmp
+scratch/
+tmp/
