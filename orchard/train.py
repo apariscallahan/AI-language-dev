@@ -70,6 +70,10 @@ class History:
     comprehension: list[float] = field(default_factory=list)
     judgement: list[float] = field(default_factory=list)
     variety_acc: list[float] = field(default_factory=list)
+    farmer_reads: list[float] = field(default_factory=list)
+    buyer_reads: list[float] = field(default_factory=list)
+    farmer_reads_transfer: list[float] = field(default_factory=list)
+    buyer_reads_transfer: list[float] = field(default_factory=list)
     variety_transfer: list[float] = field(default_factory=list)
     qty_acc: list[float] = field(default_factory=list)
     topsim: list[float] = field(default_factory=list)
@@ -108,9 +112,14 @@ class Trainer:
         cfg.to_json(os.path.join(out_dir, "config.json"))
 
         torch.manual_seed(cfg.train.seed)
-        torch.set_num_threads(max(1, cfg.train.torch_threads))
+        from .hardware import setup as hw_setup
+        dev = hw_setup(cfg)
+        # Pin the resolved device back onto the config so everything downstream --
+        # agents, the tensor world, saved config.json -- agrees on one answer.
+        cfg.train.device = str(dev)
+        self.torch_device = dev
         self.rng = random.Random(cfg.train.seed)
-        self.device = cfg.train.device
+        self.device = str(dev)
 
         self.log = RunLogger(out_dir, quiet=quiet)
         self.ledger = Ledger(cfg, out_dir, stride=cfg.log.ledger_stride)
@@ -118,6 +127,14 @@ class Trainer:
         self.birth_log = JsonlLog(out_dir, "births.jsonl")
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
+        # The fast path.  Same distributions, drawn on device in one go; the
+        # scalar World stays for metrics probes and for the readable definition.
+        self.tensor_world = None
+        if cfg.train.vectorised:
+            from .batched import TensorWorld
+            g = torch.Generator(device=dev)
+            g.manual_seed(cfg.train.seed + 11)
+            self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
         self.pop = Population(cfg, random.Random(cfg.train.seed + 2), device=self.device)
         self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
                                n_farms=cfg.population.n_farmers)
@@ -140,6 +157,7 @@ class Trainer:
         self.chance = chance_success_rate(cfg, self.world)
         self.newborn_reports: list[dict[str, Any]] = []
         self.resume_note = resume_note
+        self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
         self._headline: dict[str, Any] = {}
@@ -223,6 +241,8 @@ class Trainer:
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))
         L("expected turnover  : ~%.1f generations per lineage" % expected_generations(c))
+        from .hardware import describe
+        L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
         if self.resume_note:
             L(self.resume_note)
@@ -260,6 +280,15 @@ class Trainer:
     # ------------------------------------------------------------------
     def checkpoint(self, final: bool = False) -> dict[str, Any]:
         cfg, L = self.cfg, self.log
+        # A checkpoint fired at exactly train.episodes would otherwise be repeated
+        # by the final one, with nothing changed in between.  Re-measuring drift
+        # against a snapshot taken seconds earlier guarantees 0.000, and that row
+        # is the one the report reads.
+        if final and self._last_checkpoint_episode == self.episode:
+            if self.metrics_log.rows:
+                self.metrics_log.rows[-1]["final"] = True
+                return self.metrics_log.rows[-1]
+        self._last_checkpoint_episode = self.episode
         t0 = time.time()
         ev = evaluate_success(cfg, self.pop, self.world,
                               max(200, cfg.log.intelligibility_episodes),
@@ -302,6 +331,8 @@ class Trainer:
             "comprehension_rate": ev["comprehension_rate"],
             "comprehension_on_viable": ev["comprehension_on_viable"],
             "judgement_rate": ev["judgement_rate"],
+            "farmer_reads_buyer": ev["farmer_reads_buyer"],
+            "buyer_reads_farmer": ev["buyer_reads_farmer"],
             "farmer_variety_acc": ev["farmer_variety_acc"],
             "farmer_qty_acc": ev["farmer_qty_acc"],
             "farmer_price_acc": ev["farmer_price_acc"],
@@ -336,6 +367,10 @@ class Trainer:
         h.comprehension.append(ev["comprehension_rate"])
         h.judgement.append(ev["judgement_rate"])
         h.variety_acc.append(ev["farmer_variety_acc"])
+        h.farmer_reads.append(ev["farmer_reads_buyer"])
+        h.buyer_reads.append(ev["buyer_reads_farmer"])
+        h.farmer_reads_transfer.append(abl.get("farmer_reads_transfer", float("nan")))
+        h.buyer_reads_transfer.append(abl.get("buyer_reads_transfer", float("nan")))
         h.qty_acc.append(ev["farmer_qty_acc"])
         h.variety_transfer.append(abl.get("variety_transfer", float("nan")))
         h.topsim.append(comp["mean"])
@@ -355,8 +390,8 @@ class Trainer:
         h.rho_length_frequency.append(lenfreq.get("rho_symbols", float("nan")))
         h.topsim_frequent.append(buckets.get("frequent", {}).get("topsim", float("nan")))
         h.topsim_rare.append(buckets.get("rare", {}).get("topsim", float("nan")))
-        h.drift_frequent.append(forms.get("drift_frequent", float("nan")))
-        h.drift_rare.append(forms.get("drift_rare", float("nan")))
+        h.drift_frequent.append(forms.get("drift_frequent_interval", float("nan")))
+        h.drift_rare.append(forms.get("drift_rare_interval", float("nan")))
         h.reward.append(ev["mean_reward"])
         h.generations.append(comp_pop["farmers"]["mean_generation"])
 
@@ -365,6 +400,8 @@ class Trainer:
             "success": round(ev["success_rate"], 4),
             "comprehension": round(ev["comprehension_rate"], 4),
             "variety_naming": round(ev["farmer_variety_acc"], 4),
+            "farmer_reads": round(ev["farmer_reads_buyer"], 4),
+            "buyer_reads": round(ev["buyer_reads_farmer"], 4),
             "channel_transfer": (round(abl["variety_transfer"], 4)
                                  if isinstance(abl.get("variety_transfer"), float)
                                  and abl["variety_transfer"] == abl["variety_transfer"]
@@ -399,6 +436,8 @@ class Trainer:
           % (ev["success_rate"], self.train_success.mean, self.chance))
         L("  on viable deals   : %.3f   (%.0f%% of encounters are viable)"
           % (ev["success_rate_on_viable"], 100 * ev["viable_frac"]))
+        L("  reading each other : farmer reads buyer %.3f | buyer reads farmer %.3f"
+          % (ev["farmer_reads_buyer"], ev["buyer_reads_farmer"]))
         L("  reference accuracy: variety %.3f, quantity %.3f, price-in-range %.3f"
           % (ev["farmer_variety_acc"], ev["farmer_qty_acc"], ev["farmer_price_acc"]))
         L("                      (can the farmer name what the buyer asked for? "
@@ -461,6 +500,14 @@ class Trainer:
                  abl.get("scrambled_qty_acc", float("nan")),
                  abl.get("muted_qty_acc", float("nan")),
                  100 * (abl.get("qty_transfer") or 0.0)))
+            L("  farmer reads buyer: %.3f intact | %.3f muted  (%.0f%% of headroom)"
+              % (abl.get("intact_farmer_reads", float("nan")),
+                 abl.get("muted_farmer_reads", float("nan")),
+                 100 * (abl.get("farmer_reads_transfer") or 0.0)))
+            L("  buyer reads farmer: %.3f intact | %.3f muted  (%.0f%% of headroom)"
+              % (abl.get("intact_buyer_reads", float("nan")),
+                 abl.get("muted_buyer_reads", float("nan")),
+                 100 * (abl.get("buyer_reads_transfer") or 0.0)))
             L("  information transfer: %.3f of the available headroom on full "
               "comprehension" % abl.get("information_transfer", float("nan")))
             L("  viability judged  : %.3f intact -> %.3f scrambled (drop %.3f)"
@@ -570,8 +617,14 @@ class Trainer:
 
         while self.episode < cfg.train.episodes:
             n = min(B, cfg.train.episodes - self.episode)
-            scen, f_idx, b_idx = self.economy.make_batch(
-                n, len(self.pop.farmers), len(self.pop.buyers))
+            if self.tensor_world is not None:
+                f_idx, b_idx = self.pop.pair(n, device=self.device)
+                scen = self.economy.make_batch_tensor(
+                    n, len(self.pop.farmers), len(self.pop.buyers),
+                    self.tensor_world, f_idx, b_idx)
+            else:
+                scen, f_idx, b_idx = self.economy.make_batch(
+                    n, len(self.pop.farmers), len(self.pop.buyers))
             frac = self.episode / max(1, cfg.train.episodes)
             if cfg.train.algo == "gumbel":
                 from .gumbel import run_and_update_gumbel
@@ -584,16 +637,29 @@ class Trainer:
                                      f_idx, b_idx, device=self.device)
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
-            settle = self.economy.settle(f_idx, batch.outcomes)
+            settle = (self.economy.settle_tensor(f_idx, batch.res)
+                      if batch.res is not None
+                      else self.economy.settle(f_idx, batch.outcomes))
             self.totals["apples_sold"] += settle["apples_sold"]
             self.totals["value"] += settle["value"]
             self.totals["profit"] += settle["profit"]
             self.totals["episodes"] += n
-            for o in batch.outcomes:
-                self.failure_counts[o.failure_mode] = self.failure_counts.get(o.failure_mode, 0) + 1
-                self.totals["trades"] += int(o.success)
-            self.train_success.extend(float(o.success) for o in batch.outcomes)
-            self.train_comprehension.extend(float(o.comprehended) for o in batch.outcomes)
+            if batch.res is not None:
+                from .batched import failure_modes
+                for mode in failure_modes(batch.res):
+                    self.failure_counts[mode] = self.failure_counts.get(mode, 0) + 1
+                succ = batch.success_t
+                self.totals["trades"] += int(succ.sum())
+                self.train_success.extend(succ.float().tolist())
+                self.train_comprehension.extend(batch.comprehended_t.float().tolist())
+            else:
+                for o in batch.outcomes:
+                    self.failure_counts[o.failure_mode] = (
+                        self.failure_counts.get(o.failure_mode, 0) + 1)
+                    self.totals["trades"] += int(o.success)
+                self.train_success.extend(float(o.success) for o in batch.outcomes)
+                self.train_comprehension.extend(
+                    float(o.comprehended) for o in batch.outcomes)
             self.train_reward.extend(
                 (o.farmer_reward + o.buyer_reward) / 2 for o in batch.outcomes)
 

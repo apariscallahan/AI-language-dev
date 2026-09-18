@@ -86,18 +86,27 @@ class Population:
     def all_agents(self) -> list[Agent]:
         return self.farmers + self.buyers
 
-    def pair(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Random Farmer/Buyer pairings for ``n`` episodes (spec 1.1: a marketplace)."""
-        f = torch.tensor([self.rng.randrange(len(self.farmers)) for _ in range(n)],
-                         dtype=torch.long)
-        b = torch.tensor([self.rng.randrange(len(self.buyers)) for _ in range(n)],
-                         dtype=torch.long)
-        return f, b
+    def pair(self, n: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
+        """Farmer/Buyer pairings for ``n`` episodes (spec 1.1: a marketplace).
+
+        Episode i goes to farmer ``i % n_farmers`` and buyer
+        ``(i // n_farmers) % n_buyers``.  Because scenarios are drawn i.i.d., this
+        is distributionally the same marketplace as drawing each pairing at
+        random, but it gives every agent exactly its share of the batch instead of
+        a multinomial count -- lower gradient variance -- and it makes each
+        agent's slice of the batch a compile-time constant, which is what lets the
+        rollout run without stalling the device to ask who plays what.
+        """
+        nf, nb = len(self.farmers), len(self.buyers)
+        i = torch.arange(n, device=device)
+        return i % nf, torch.div(i, nf, rounding_mode="floor") % nb
 
     # ------------------------------------------------------------------
     def record_episode_participation(self, f_idx: torch.Tensor, b_idx: torch.Tensor,
                                      batch) -> None:
         """Age every agent by the episodes it actually played, and tally its results."""
+        if getattr(batch, "res", None) is not None:
+            return self._record_from_tensors(f_idx, b_idx, batch)
         for i in range(len(batch)):
             o = batch.outcomes[i]
             fa = self.farmers[int(f_idx[i])]
@@ -114,6 +123,38 @@ class Population:
                 ba.value_traded += o.trade_value
                 fa.profit += o.farmer_profit
                 ba.profit += o.buyer_savings
+
+    def _record_from_tensors(self, f_idx: torch.Tensor, b_idx: torch.Tensor,
+                             batch) -> None:
+        """The same tallies, as a handful of scatter_adds instead of B iterations."""
+        res = batch.res
+        succ = res["success"]
+        for pool, idx, rew, money in (
+                (self.farmers, f_idx, batch.f_reward, res["farmer_profit"]),
+                (self.buyers, b_idx, batch.b_reward, res["buyer_savings"])):
+            n = len(pool)
+            idx = idx.long()
+            counts = torch.zeros(n, device=idx.device).scatter_add_(
+                0, idx, torch.ones_like(idx, dtype=torch.float))
+            rewards = torch.zeros(n, device=idx.device).scatter_add_(0, idx, rew.float())
+            successes = torch.zeros(n, device=idx.device).scatter_add_(
+                0, idx, succ.float())
+            apples = torch.zeros(n, device=idx.device).scatter_add_(
+                0, idx, (res["traded_qty"] * succ.long()).float())
+            value = torch.zeros(n, device=idx.device).scatter_add_(
+                0, idx, res["trade_value"] * succ.float())
+            profit = torch.zeros(n, device=idx.device).scatter_add_(
+                0, idx, money * succ.float())
+            for a, c, r, sx, ap, va, pf in zip(
+                    pool, counts.tolist(), rewards.tolist(), successes.tolist(),
+                    apples.tolist(), value.tolist(), profit.tolist()):
+                a.age += int(c)
+                a.n_episodes += int(c)
+                a.reward_sum += r
+                a.n_success += int(sx)
+                a.apples_traded += int(ap)
+                a.value_traded += va
+                a.profit += pf
 
     # ------------------------------------------------------------------
     def turn_over(self, episode: int,

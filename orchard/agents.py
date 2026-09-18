@@ -127,6 +127,14 @@ class CommNet(nn.Module):
         self.variety_head = nn.Linear(d, w.n_varieties)
         self.decide_qty_head = nn.Linear(d, w.max_qty + 1)
         self.decide_price_head = nn.Linear(d, w.n_price_bins)
+        # What this agent thinks the OTHER party's private situation is.  Read at
+        # the same position as the decision, from the same state, but scored
+        # against the other's hidden facts rather than against the deal -- this is
+        # what makes "did you understand me" a thing either side can be paid for.
+        self.belief_variety_head = nn.Linear(d, w.n_varieties)
+        self.belief_qty_head = nn.Linear(d, w.max_qty + 1)
+        self.belief_quality_head = nn.Linear(d, w.n_quality)
+        self.belief_price_head = nn.Linear(d, w.n_price_bins)
         self.value_head = nn.Linear(d, 1)
 
         self.register_buffer("_self_mask", speaker_self_mask(cfg, role), persistent=False)
@@ -210,9 +218,16 @@ class CommNet(nn.Module):
 
     def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor):
         h = self.encode(obs, tokens)[:, -1]
+        return (self.decision_heads(h) + self.belief_heads(h)
+                + (self.value_head(h).squeeze(-1),))
+
+    def decision_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return (self.accept_head(h), self.variety_head(h),
-                self.decide_qty_head(h), self.decide_price_head(h),
-                self.value_head(h).squeeze(-1))
+                self.decide_qty_head(h), self.decide_price_head(h))
+
+    def belief_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return (self.belief_variety_head(h), self.belief_qty_head(h),
+                self.belief_quality_head(h), self.belief_price_head(h))
 
     def full_pass(self, obs: torch.Tensor, tokens: torch.Tensor,
                   read_positions: torch.Tensor):
@@ -228,8 +243,9 @@ class CommNet(nn.Module):
         tok_logits = self.token_head(hr)                    # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)
         hd = h[:, -1]
-        dec = (self.accept_head(hd), self.variety_head(hd),
-               self.decide_qty_head(hd), self.decide_price_head(hd))
+        dec = self.decision_heads(hd)
+        if self.cfg.reward.belief_heads:
+            dec = dec + self.belief_heads(hd)
         dec_value = self.value_head(hd).squeeze(-1)
         return tok_logits, tok_values, dec, dec_value
 
@@ -270,6 +286,9 @@ class Agent:
 
 def make_agent(cfg: Config, *, agent_id: int, role: int, slot: int, generation: int,
                birth_episode: int, lifespan: int, device: str = "cpu") -> Agent:
+    if str(device) == "auto":                      # resolve the config sentinel
+        from .hardware import resolve_device
+        device = resolve_device("auto")
     net = CommNet(cfg, role).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=cfg.train.lr)
     return Agent(agent_id=agent_id, role=role, slot=slot, generation=generation,

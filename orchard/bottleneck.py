@@ -54,8 +54,8 @@ class StoredEpisode:
     b_obs: torch.Tensor      # (4,)
     tokens: torch.Tensor     # (D,)
     active: torch.Tensor     # (D,) bool
-    f_dec: torch.Tensor      # (4,)
-    b_dec: torch.Tensor      # (4,)
+    f_dec: torch.Tensor      # (8,) deal + belief
+    b_dec: torch.Tensor      # (8,)
     episode: int
     f_generation: int
     b_generation: int

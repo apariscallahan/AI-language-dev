@@ -38,6 +38,70 @@ population size and lifespan together. The panel asks for generations because
 that is what you actually want to choose, converts it to an episode budget, and
 always shows you the number it arrived at.
 
+### On a cloud GPU
+
+```bash
+bash cloud_run.sh
+```
+
+Checks a CUDA device is actually visible, then runs `configs/gpu.json` — two
+million episodes, batch 2048, sixteen agents — writing to a timestamped run
+directory. Everything after the script name is passed through, so
+`bash cloud_run.sh --bottleneck off --episodes 500000` works.
+
+`--device auto` is the default everywhere: CUDA when a GPU is visible, CPU
+otherwise, so the same command works on a laptop and on a cloud box. Asking for
+`--device cuda` on a CPU-only torch build fails immediately with the reason
+rather than silently running on the CPU for six hours.
+
+**What makes it worth a GPU.** The simulation used to do one Python call and one
+dataclass construction *per episode* to sample the world and score the trade.
+That is invisible on a CPU, where the transformer forwards dominate, and fatal on
+a GPU, where they do not. Measured on a 4096-episode batch:
+
+| host-side work per batch | before | after |
+|---|---|---|
+| world sampling | 105 ms | 5.3 ms |
+| trade scoring | 502 ms | 5.2 ms |
+| **total** | **607 ms** | **11 ms** |
+
+That was a hard ceiling of about 6,700 episodes/sec no matter how fast the GPU
+was; it is now around 390,000, so the GPU is the limit instead of the
+interpreter. `orchard/batched.py` holds the tensor world and tensor reward, and
+`tests/test_batched.py` asserts they agree with the scalar versions *exactly* —
+same rewards, same success flags — on random batches. The scalar code in
+`world.py` and `env.py` remains the readable definition of the rules; if the two
+ever disagree, it is right and the tensor one is wrong.
+
+Two smaller things also mattered: the rollout no longer reads a tensor on the
+host every symbol step to check whether anyone is still talking (that
+synchronises the device), and pairings are now fixed strides rather than random
+draws, which makes each agent's slice of the batch a constant instead of
+something to be derived from a tensor mid-loop. Because scenarios are i.i.d. the
+two pairings are the same marketplace, but the fixed one also gives every agent
+exactly its share of the batch instead of a multinomial count, which lowers
+gradient variance.
+
+Other GPU switches: `--amp on` for bfloat16 autocast (bf16 rather than fp16, so
+there is no loss scaling to get wrong), `--compile on` for `torch.compile`, and
+TF32 matmuls on by default.
+
+### Comparing anything: use several seeds
+
+```bash
+python sweep.py --config configs/gpu.json --out runs/ablation --seeds 5 \
+    --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
+```
+
+**Do not draw conclusions from single runs of this simulation.** It is bimodal: a
+population either finds a referential convention or it does not. Four
+neighbouring conditions at 40k episodes produced 76%, 0%, 92% and 6% of the
+channel headroom — a spread that swamps any effect worth measuring. `sweep.py`
+runs each arm across seeds and reports mean, spread and the per-seed values, so
+the bimodality is visible rather than averaged into a misleading single number.
+Use `--parallel 1` on a single GPU and a higher number on a CPU box with cores to
+spare.
+
 ### The command line
 
 ```bash
@@ -150,6 +214,62 @@ for common things" directly; it is a prediction, and `report.md` reports the
 correlation rather than eyeballing it.
 
 ---
+
+## Closing the loop: reading, and being read
+
+A speaker only has a reason to be informative if something it cares about depends
+on having been understood. For a long time nothing did, and it was costing the
+farmer side most of its signal.
+
+Measured on the reward function directly, with no trained agents involved:
+
+| | score from own state alone | with the other's facts | gain from listening |
+|---|---|---|---|
+| farmer | 1.385 | 2.428 | **1.044** of 3 |
+| buyer | 2.204 | 2.428 | **0.224** of 3 |
+
+The buyer was collecting 91% of its comprehension reward simply by restating the
+want and need it already held — no listening required. And neither role had *any*
+term for being understood: swap a partner between "decoded perfectly" and "ignored
+the message" and the only thing that moved was the joint trade outcome.
+
+So each agent now also states **what it believes the other party's private
+situation to be** — the farmer about the buyer's shopping list, the buyer about
+what is actually in the barn for the line it came for — and that statement is
+scored against the truth. Two reward terms follow from it:
+
+- `reward.decode` pays an agent for having read the other correctly;
+- `reward.understood` pays an agent for having *been* read correctly.
+
+The second is the one that was missing. It is per-message rather than per-trade,
+it is symmetric, and every field it scores is one the answering agent cannot
+observe, so neither term is obtainable without the channel. After the change both
+roles have a comparable stake in being understood (0.211 / 0.243) and comparable
+gains from listening (0.540 / 0.469, previously 1.044 / 0.224).
+
+`tests/test_reward_loop.py` guards all of this, including a test that holds the
+trade fixed and checks the reward still moves with whether the partner read you —
+otherwise the term would just be trade success under another name.
+
+## Making deals common enough to practise
+
+Both sides are drawn fresh and independently every round; that independence is
+what keeps the private information private, and it is not negotiable. But
+independence alone left only **56.6%** of rounds viable, so buyers spent nearly
+half their time practising correct refusals.
+
+The obvious fix — correlate the farmer's stock with the buyer's wanted variety —
+would have raised viability and destroyed the experiment, since the farmer could
+then predict the request from its own barn. Instead the *marginals* were widened,
+and the lever that worked best was `world.need_max_frac`: **a shop stocks more
+than any one shopper asks for.** That lifts P(stock ≥ need) a long way while
+leaving the farmer's stock broadly spread and therefore still unguessable.
+
+Viability is now **69.7%** with the remaining 30% spread across all four causes
+(variety not stocked 34%, not enough of it 28%, quality too low 23%, price gap
+15%), so walking away stays a real, multi-reason outcome rather than a rare edge
+case. Narrowing the stock range instead would have hit the same viability while
+pushing the buyer's blind-guess baseline from 0.57 to 0.70.
 
 ## Two findings worth knowing before you change anything
 
@@ -313,6 +433,17 @@ Any field is overridable: `--set world.zipf_alpha=0 --set bottleneck.frequency_s
 | `run.log` | the complete console history |
 | `plots/metrics.svg`, `plots/vocabulary.svg` (+ `.png`) | progress over the run |
 | `report.md` | final metrics, the inferred dictionary, example transcripts early/middle/late, economic totals, and a threshold-computed verdict |
+| `progress.json` | rewritten every batch; what the GUI's progress bar reads |
+
+Two runs can be put side by side on the measures that decide whether a change did
+anything:
+
+```bash
+python compare_runs.py runs/main runs/main2
+```
+
+It reads each run's own `metrics.jsonl`, `token_semantics.json` and ledger, so it
+reports what the run recorded rather than what a report was written to say.
 
 Reports are rewritten at every checkpoint, so a long run can be read while it is
 still going and an interrupted one is never left with only raw JSONL.

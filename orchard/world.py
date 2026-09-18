@@ -265,22 +265,38 @@ class World:
     def variety_probs(self) -> list[float]:
         return self._zipf_weights(self.cfg.n_varieties, self.cfg.zipf_alpha_variety)
 
+    def need_ceiling(self) -> int:
+        """The largest order a shopper ever places."""
+        return max(1, int(round(self.cfg.need_max_frac * self.cfg.max_qty)))
+
     def qty_probs(self) -> list[float]:
-        """P(need_qty = q) for q = 1..max_qty."""
-        return self._zipf_weights(self.cfg.max_qty, self.cfg.zipf_alpha)
+        """P(need_qty = q) for q = 1..max_qty (zero above the order ceiling)."""
+        w = self._zipf_weights(self.need_ceiling(), self.cfg.zipf_alpha)
+        return w + [0.0] * (self.cfg.max_qty - len(w))
 
     def sample_farmer(self) -> FarmerState:
         c, r = self.cfg, self.rng
         stocks, quals = [], []
+        floor = max(1, int(round(c.stock_floor_frac * c.max_qty)))
         for _ in range(c.n_varieties):
             if r.random() < c.p_stocked:
-                stocks.append(self._skew_high(1, c.max_qty))
-                quals.append(self._skew_high(0, c.n_quality - 1))
+                stocks.append(self._skew_high(floor, c.max_qty))
+                q = self._skew_high(0, c.n_quality - 1)
+                for _ in range(c.quality_bias):
+                    q = max(q, self._skew_high(0, c.n_quality - 1))
+                quals.append(q)
             else:
                 stocks.append(0)
                 quals.append(0)
         return FarmerState(stocks=tuple(stocks), qualities=tuple(quals),
                            reservation=self._skew_low(0, c.reservation_max_bin))
+
+    def _shopper_quality(self) -> int:
+        c = self.cfg
+        q = self._skew_low(0, c.n_quality - 1)
+        for _ in range(c.quality_bias):
+            q = min(q, self._skew_low(0, c.n_quality - 1))
+        return q
 
     def sample_buyer(self) -> BuyerState:
         """The buyer's request carries the world's frequency skew.
@@ -294,8 +310,8 @@ class World:
         c, r = self.cfg, self.rng
         return BuyerState(
             want_variety=self._zipf_draw(c.n_varieties, c.zipf_alpha_variety),
-            need_qty=self._zipf_draw(c.max_qty, c.zipf_alpha, offset=1),
-            min_quality=self._skew_low(0, c.n_quality - 1),
+            need_qty=self._zipf_draw(self.need_ceiling(), c.zipf_alpha, offset=1),
+            min_quality=self._shopper_quality(),
             max_price=self._skew_high(c.budget_min_bin, c.n_price_bins - 1),
         )
 

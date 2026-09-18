@@ -158,6 +158,74 @@ class Economy:
         return stats
 
     # ------------------------------------------------------------------
+    # tensor path
+    # ------------------------------------------------------------------
+    def inventory_tensors(self, device) -> tuple:
+        """Current per-farm stock, quality and cost, as (n_farms, V) / (n_farms,)."""
+        stocks = torch.tensor([inv.remaining for inv in self.inventories],
+                              dtype=torch.long, device=device)
+        quals = torch.tensor([list(inv.state.qualities) for inv in self.inventories],
+                             dtype=torch.long, device=device)
+        res = torch.tensor([inv.state.reservation for inv in self.inventories],
+                           dtype=torch.long, device=device)
+        return stocks, quals, res
+
+    def make_batch_tensor(self, n: int, n_farmers: int, n_buyers: int,
+                          tensor_world, f_idx, b_idx, *, held_out: bool = False):
+        """A ScenarioBatch: buyer halves drawn fresh, farmer halves read off the farms.
+
+        The two sides are assembled separately and never consult each other, which
+        is the same independence the scalar path guarantees -- it is just done with
+        one gather instead of one Python object per episode.
+        """
+        from .batched import ScenarioBatch
+        sb = tensor_world.sample(n, held_out=held_out)
+        if not self.cfg.economy.persistent_inventory:
+            sb.day = self.day
+            for _ in range(max(1, n // max(1, self.cfg.economy.episodes_per_day))):
+                self.begin_day()
+            return sb
+        for _ in range(max(1, n // max(1, self.cfg.economy.episodes_per_day))):
+            self.begin_day()
+        stocks, quals, res = self.inventory_tensors(sb.want_variety.device)
+        return ScenarioBatch(
+            stocks=stocks[f_idx].clamp(min=0), qualities=quals[f_idx],
+            reservation=res[f_idx], want_variety=sb.want_variety,
+            need_qty=sb.need_qty, min_quality=sb.min_quality,
+            max_price=sb.max_price, held_out=sb.held_out, day=self.day)
+
+    def settle_tensor(self, f_idx, res: dict) -> dict[str, float]:
+        """Deplete farms by the batch's completed sales, without a Python loop."""
+        import torch as _t
+        succ = res["success"]
+        qty = res["traded_qty"] * succ.long()
+        stats = {
+            "apples_sold": int(qty.sum()),
+            "value": float((res["trade_value"] * succ.float()).sum()),
+            "profit": float((res["farmer_profit"] * succ.float()).sum()),
+            "soldout": 0,
+        }
+        if not self.cfg.economy.persistent_inventory:
+            return stats
+        variety = res["agreed_variety"]
+        flat = f_idx.long() * self.cfg.world.n_varieties + variety.long()
+        n_cells = self.n_farms * self.cfg.world.n_varieties
+        sold = _t.zeros(n_cells, dtype=_t.long, device=qty.device)
+        sold.scatter_add_(0, flat, qty)
+        sold = sold.view(self.n_farms, self.cfg.world.n_varieties).tolist()
+        for farm in range(self.n_farms):
+            inv = self.inventories[farm]
+            for v in range(self.cfg.world.n_varieties):
+                if sold[farm][v]:
+                    inv.remaining[v] = max(0, inv.remaining[v] - sold[farm][v])
+                    inv.sold_total += sold[farm][v]
+            if inv.empty:
+                self.soldouts += 1
+                stats["soldout"] += 1
+                self.inventories[farm] = self._draw(farm)
+        return stats
+
+    # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         w = self.cfg.world
         return {

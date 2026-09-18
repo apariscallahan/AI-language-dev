@@ -427,25 +427,46 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
         b_idx = torch.tensor([rng.choice(list(b_sel)) for _ in range(n)], dtype=torch.long)
     batch = run_episodes(cfg, scen, pop.farmers, pop.buyers, f_idx, b_idx, device=device,
                          channel_mode=channel_mode)
-    succ = sum(o.success for o in batch.outcomes)
-    viable = sum(s.viable for s in scen)
-    succ_viable = sum(o.success for o, s in zip(batch.outcomes, scen) if s.viable)
+    # Tensor views, so a 4096-episode evaluation is a few reductions rather than
+    # 4096 attribute lookups on dataclasses that had to be built first.
+    succ_t = batch.success_t
+    viable_t = batch.viable_t.to(succ_t.device)
+    succ = int(succ_t.sum())
+    viable = int(viable_t.sum())
+    succ_viable = int((succ_t & viable_t).sum())
     # "comprehended" = the two independently-produced beliefs matched each other
     # and described an executable deal, whether or not the pair chose to trade.
     # It separates "did the message get through" from "did they want the deal".
-    comp = sum(o.comprehended for o in batch.outcomes)
-    comp_viable = sum(o.comprehended for o, s in zip(batch.outcomes, scen) if s.viable)
-    judged = sum(o.both_judged_viability for o in batch.outcomes)
+    comp_t = batch.comprehended_t
+    comp = int(comp_t.sum())
+    comp_viable = int((comp_t & viable_t).sum())
+    judged = int(batch.judged_t.sum())
 
     # Reference accuracy, per dimension.  Joint comprehension is a conjunction of
     # four things and stays near zero long after the first real words appear, so
     # this is the metric that actually shows a vocabulary arriving: can the farmer
     # name the variety the buyer asked for, and the number they asked for?  Both
     # are facts only the buyer holds.
-    n_var_hits = sum(int(batch.f_dec[i, 1]) == scen[i].buyer.want_variety
-                     for i in range(n))
-    n_qty_hits = sum(int(batch.f_dec[i, 2]) == scen[i].buyer.need_qty for i in range(n))
-    n_price_hits = sum(scen[i].price_in_zopa(int(batch.f_dec[i, 3])) for i in range(n))
+    if batch.sb is not None:
+        sb = batch.sb
+        n_var_hits = int((batch.f_dec[:, 1] == sb.want_variety).sum())
+        n_qty_hits = int((batch.f_dec[:, 2] == sb.need_qty).sum())
+        n_price_hits = int(((batch.f_dec[:, 3] >= sb.reservation)
+                            & (batch.f_dec[:, 3] <= sb.max_price)).sum())
+    else:
+        n_var_hits = sum(int(batch.f_dec[i, 1]) == scen[i].buyer.want_variety
+                         for i in range(n))
+        n_qty_hits = sum(int(batch.f_dec[i, 2]) == scen[i].buyer.need_qty
+                         for i in range(n))
+        n_price_hits = sum(scen[i].price_in_zopa(int(batch.f_dec[i, 3]))
+                           for i in range(n))
+
+    # The closed loop, per direction: each agent states what it believes the other
+    # party's private situation to be, and this is how often it is right.  Unlike
+    # the deal-decision measures above, neither side can move these without the
+    # channel -- every field is one the answering agent cannot observe.
+    f_decode = float(batch.farmer_decode_t.float().mean())
+    b_decode = float(batch.buyer_decode_t.float().mean())
     return {
         "n": n,
         "success_rate": succ / n,
@@ -453,6 +474,8 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
         "comprehension_rate": comp / n,
         "comprehension_on_viable": comp_viable / viable if viable else float("nan"),
         "judgement_rate": judged / n,
+        "farmer_reads_buyer": f_decode,
+        "buyer_reads_farmer": b_decode,
         "farmer_variety_acc": n_var_hits / n,
         "farmer_qty_acc": n_qty_hits / n,
         "farmer_price_acc": n_price_hits / n,
@@ -563,6 +586,15 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
         "scrambled_qty_acc": scrambled["farmer_qty_acc"],
         "muted_qty_acc": muted["farmer_qty_acc"],
         # against silence: everything the channel is worth
+        # how much of each *direction* of the loop the channel is responsible for
+        "intact_farmer_reads": intact["farmer_reads_buyer"],
+        "muted_farmer_reads": muted["farmer_reads_buyer"],
+        "intact_buyer_reads": intact["buyer_reads_farmer"],
+        "muted_buyer_reads": muted["buyer_reads_farmer"],
+        "farmer_reads_transfer": _headroom(intact["farmer_reads_buyer"],
+                                           muted["farmer_reads_buyer"]),
+        "buyer_reads_transfer": _headroom(intact["buyer_reads_farmer"],
+                                          muted["buyer_reads_farmer"]),
         "variety_transfer": _headroom(intact["farmer_variety_acc"],
                                       muted["farmer_variety_acc"]),
         "qty_transfer": _headroom(intact["farmer_qty_acc"], muted["farmer_qty_acc"]),

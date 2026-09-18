@@ -84,6 +84,7 @@ CSV_FIELDS = [
     "msg_text",
     "farmer_accept", "farmer_believed_variety", "farmer_believed_qty", "farmer_believed_price",
     "buyer_accept", "buyer_believed_variety", "buyer_believed_qty", "buyer_believed_price",
+    "farmer_reads_buyer", "buyer_reads_farmer",
     "success", "failure_mode", "reasons",
     "traded_qty", "traded_price", "trade_value", "farmer_profit", "buyer_savings",
     "farmer_reward", "buyer_reward",
@@ -156,6 +157,12 @@ class Ledger:
             "buyer_believed_qty": bd.qty,
             "buyer_believed_price": w.price_values[bd.price],
 
+            "farmer_reads_buyer": round(outcome.farmer_decode, 3),
+            "buyer_reads_farmer": round(outcome.buyer_decode, 3),
+            "farmer_belief": (list(transcript.farmer_beliefs.as_tuple())
+                              if transcript.farmer_beliefs else None),
+            "buyer_belief": (list(transcript.buyer_beliefs.as_tuple())
+                             if transcript.buyer_beliefs else None),
             "success": outcome.success,
             "failure_mode": outcome.failure_mode,
             "reasons": ";".join(outcome.reasons),
@@ -184,13 +191,15 @@ class Ledger:
             ep = episode0 + i
             if ep % self.stride:
                 continue
+            # Only the rows that are actually written get built into objects,
+            # which is why a wide stride is cheap on a long run.
             tr = batch.transcript(i)
             self.write(self.row(
-                episode=ep, season=season, scenario=batch.scenarios[i],
+                episode=ep, season=season, scenario=batch.scenario(i),
                 farmer=pop.farmers[int(batch.f_idx[i])],
                 buyer=pop.buyers[int(batch.b_idx[i])],
                 transcript=tr, fd=tr.farmer_decision, bd=tr.buyer_decision,
-                outcome=batch.outcomes[i]))
+                outcome=tr.outcome))
             n += 1
         return n
 

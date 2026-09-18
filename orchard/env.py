@@ -70,6 +70,56 @@ class Decision:
         return (self.accept, self.variety, self.qty, self.price)
 
 
+@dataclass(frozen=True)
+class Beliefs:
+    """What one agent says the OTHER party's private situation is.
+
+    This is a claim about facts the speaker cannot see, so it can only be right if
+    the other party told it something and it read that correctly.  Scoring it is
+    what closes the communication loop in both directions: the reader is paid for
+    reading, and the party who was read is paid for having been readable.
+    """
+    variety: int
+    qty: int
+    quality: int
+    price: int
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return (self.variety, self.qty, self.quality, self.price)
+
+
+def decode_hits(beliefs: Beliefs, sc: Scenario, role: int,
+                cfg: Config) -> list[bool]:
+    """Per-field: did this agent correctly recover the other party's state?
+
+    The farmer is asked about the buyer's shopping list; the buyer is asked about
+    what is actually in the barn for the line it came for.  Nothing here is
+    visible to the agent being scored, and nothing is derivable from its own
+    half of the world -- the two sides are drawn independently (see world.py).
+    """
+    R = cfg.reward
+    if role == FARMER:
+        b = sc.buyer
+        return [
+            beliefs.variety == b.want_variety,
+            abs(beliefs.qty - b.need_qty) <= R.belief_qty_tol,
+            beliefs.quality == b.min_quality,
+            abs(beliefs.price - b.max_price) <= R.belief_price_tol,
+        ]
+    # The buyer reports on the line it asked about, so stock 0 means "he does not
+    # carry it" -- getting that right is itself a thing the farmer had to convey.
+    return [
+        abs(beliefs.qty - sc.offered_stock) <= R.belief_qty_tol,
+        beliefs.quality == sc.offered_quality,
+        abs(beliefs.price - sc.farmer.reservation) <= R.belief_price_tol,
+    ]
+
+
+def decode_score(beliefs: Beliefs, sc: Scenario, role: int, cfg: Config) -> float:
+    hits = decode_hits(beliefs, sc, role, cfg)
+    return sum(hits) / len(hits)
+
+
 @dataclass
 class Outcome:
     success: bool
@@ -86,6 +136,13 @@ class Outcome:
     trade_value: float = 0.0        # currency, price * qty
     # diagnostics
     both_accept: bool = False
+    # How well each side read the other, 0..1.  These are the closed-loop numbers:
+    # farmer_decode is also what the buyer is paid for being understood, and
+    # buyer_decode is what the farmer is paid for being understood.
+    farmer_decode: float = 0.0
+    buyer_decode: float = 0.0
+    farmer_decode_hits: tuple = ()
+    buyer_decode_hits: tuple = ()
     # Would this episode have succeeded had both agents accepted?  Isolates
     # "did they understand each other" from "did they choose to trade".
     comprehended: bool = False
@@ -175,7 +232,9 @@ def _classify(sc: Scenario, fd: Decision, bd: Decision, agree: dict[str, bool],
 
 
 def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
-            farmer_tokens: int = 0, buyer_tokens: int = 0) -> Outcome:
+            farmer_tokens: int = 0, buyer_tokens: int = 0,
+            f_beliefs: Beliefs | None = None,
+            b_beliefs: Beliefs | None = None) -> Outcome:
     """Score one finished negotiation.
 
     ``farmer_tokens`` / ``buyer_tokens`` are the symbols that agent emitted and
@@ -243,6 +302,22 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
     terms["farmer_judgement"] = f_judge
     terms["buyer_judgement"] = b_judge
 
+    # ---- the closed loop: read the other, and be readable ----------------
+    f_hits = decode_hits(f_beliefs, sc, FARMER, cfg) if f_beliefs else []
+    b_hits = decode_hits(b_beliefs, sc, BUYER, cfg) if b_beliefs else []
+    f_decode = (sum(f_hits) / len(f_hits)) if f_hits else 0.0
+    b_decode = (sum(b_hits) / len(b_hits)) if b_hits else 0.0
+    if f_hits or b_hits:
+        # Each agent is paid twice over: once for reading the other, and once for
+        # having been read.  The second term is the one that gives a speaker any
+        # reason to be informative rather than merely to trade well.
+        fr += R.decode * f_decode + R.understood * b_decode
+        br += R.decode * b_decode + R.understood * f_decode
+        terms["farmer_decode"] = R.decode * f_decode
+        terms["buyer_decode"] = R.decode * b_decode
+        terms["farmer_understood"] = R.understood * b_decode
+        terms["buyer_understood"] = R.understood * f_decode
+
     # ---- the trade decision itself -------------------------------------
     if both_accept:
         if success:
@@ -298,6 +373,8 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
         success=success, failure_mode=mode, reasons=reasons,
         farmer_reward=fr, buyer_reward=br,
         both_accept=both_accept,
+        farmer_decode=f_decode, buyer_decode=b_decode,
+        farmer_decode_hits=tuple(f_hits), buyer_decode_hits=tuple(b_hits),
         comprehended=bool(mutual and executable),
         both_judged_viability=bool(bool(fd.accept) == sc.viable
                                    and bool(bd.accept) == sc.viable),
@@ -354,6 +431,8 @@ class Transcript:
     scenario: Scenario
     farmer_decision: Decision | None = None
     buyer_decision: Decision | None = None
+    farmer_beliefs: "Beliefs | None" = None
+    buyer_beliefs: "Beliefs | None" = None
     outcome: Outcome | None = None
 
     def turn_tokens(self, cfg: Config, turn: int) -> list[int]:
@@ -418,6 +497,13 @@ class RandomScriptedAgent:
                         qty=self.rng.randint(0, w.max_qty),
                         price=self.rng.randrange(w.n_price_bins))
 
+    def believe(self, obs, history) -> Beliefs:
+        w = self.cfg.world
+        return Beliefs(variety=self.rng.randrange(w.n_varieties),
+                       qty=self.rng.randint(0, w.max_qty),
+                       quality=self.rng.randrange(w.n_quality),
+                       price=self.rng.randrange(w.n_price_bins))
+
 
 class HonestScriptedAgent:
     """An oracle pair used only in tests: ignores the channel and plays the true deal.
@@ -442,6 +528,14 @@ class HonestScriptedAgent:
         lo, hi = sc.zopa
         return Decision(1, sc.deal_variety, sc.deal_qty, (lo + hi) // 2)
 
+    def believe(self, obs, history) -> Beliefs:
+        sc: Scenario = self.scenario_ref()
+        if self.role == FARMER:
+            b = sc.buyer
+            return Beliefs(b.want_variety, b.need_qty, b.min_quality, b.max_price)
+        return Beliefs(sc.buyer.want_variety, sc.offered_stock,
+                       sc.offered_quality, sc.farmer.reservation)
+
 
 def run_scripted_episode(cfg: Config, scenario: Scenario, farmer_agent, buyer_agent) -> Transcript:
     """Drive one episode with objects exposing ``speak``/``decide`` (no torch)."""
@@ -462,6 +556,8 @@ def run_scripted_episode(cfg: Config, scenario: Scenario, farmer_agent, buyer_ag
 
     fd = farmer_agent.decide(farmer_obs(scenario, cfg), history)
     bd = buyer_agent.decide(buyer_obs(scenario, cfg), history)
+    fb = farmer_agent.believe(farmer_obs(scenario, cfg), history)
+    bb = buyer_agent.believe(buyer_obs(scenario, cfg), history)
 
     def n_costed(role: int) -> int:
         n = 0
@@ -473,6 +569,8 @@ def run_scripted_episode(cfg: Config, scenario: Scenario, farmer_agent, buyer_ag
                     n += 1
         return n
 
-    outcome = resolve(cfg, scenario, fd, bd, n_costed(FARMER), n_costed(BUYER))
+    outcome = resolve(cfg, scenario, fd, bd, n_costed(FARMER), n_costed(BUYER),
+                      f_beliefs=fb, b_beliefs=bb)
     return Transcript(tokens=tokens, scenario=scenario, farmer_decision=fd,
-                      buyer_decision=bd, outcome=outcome)
+                      buyer_decision=bd, outcome=outcome,
+                      farmer_beliefs=fb, buyer_beliefs=bb)

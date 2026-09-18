@@ -38,7 +38,20 @@ class WorldConfig:
     # skewed-but-independent marginals in World, this is what keeps roughly half
     # of encounters worth doing WITHOUT making either side's private state
     # predictable from the other's -- see the note at the top of world.py.
-    p_stocked: float = 0.85
+    p_stocked: float = 0.90
+    # Both sides are drawn fresh and independently every round -- that is what
+    # keeps the private information genuinely private.  These shift the *marginals*
+    # so the two distributions overlap often enough that closing a deal is the
+    # common case, without ever making one side's draw depend on the other's.
+    stock_floor_frac: float = 0.0   # farms carry at least this fraction of max_qty
+    quality_bias: int = 0           # extra skew: farms up, shoppers down
+    # A shop stocks more than any one shopper asks for.  This is the cleanest way
+    # to make deals common: it lifts P(stock >= need) a long way while leaving the
+    # farmer's stock broadly spread, so the buyer still cannot guess it without
+    # being told.  Narrowing the *stock* range instead would raise viability just
+    # as well and quietly make the farmer's state predictable, which is the thing
+    # this whole world design exists to prevent.
+    need_max_frac: float = 0.65     # shoppers ask for up to this fraction of max_qty
 
     # Held-out (variety, quantity) combinations, never sampled during training,
     # used for the zero-shot generalisation metric (spec 5.6).
@@ -202,10 +215,41 @@ class RewardConfig:
     genuine information transfer: the two agents must *agree with each other*,
     and each holds only half of what is needed to agree correctly.
     """
+    # ---- the two halves of a closed communication loop --------------------
+    # Measured before these existed: the buyer got 91% of its comprehension score
+    # (2.204 of 2.428) just by naming its own want and need, so it had no reason
+    # to listen; and neither role had any term at all for being *understood*.
+    # Whatever an agent said, its reward was the same as long as the trade came
+    # out the same way, which left nothing teaching either side to be informative.
+    #
+    # Each agent now states what it believes the other party's private situation
+    # to be, and that statement is scored against the truth.  Then:
+    #   decode      pays an agent for reading the other correctly
+    #   understood  pays an agent for having been read correctly
+    # The second is the one that was missing.  It is symmetric, it is per-message
+    # rather than per-trade, and neither term is obtainable without the channel:
+    # every field scored is one the scoring agent cannot observe.
+    # Off restores the pre-belief-head agent exactly: four decision outputs, no
+    # belief statement sampled, no decode/understood terms.  Kept switchable
+    # because adding the heads also doubles the sampled action space, and those
+    # two effects have to be separable when something regresses.
+    belief_heads: bool = True
+    # How strongly the belief heads pull on the speaker's gradient.  They are the
+    # point of the closed loop, but they also double the sampled action space, and
+    # the score-function term over them is high-variance; below 1 keeps the loop
+    # without letting it drown the deal-decision signal.
+    belief_grad_weight: float = 1.0
+    decode: float = 0.45            # I worked out your situation
+    understood: float = 0.45        # you worked out mine
+    belief_qty_tol: int = 1         # counts as read correctly if within this
+    belief_price_tol: int = 1
+
     success: float = 1.5            # viable deal, both accept, beliefs agree, feasible
     correct_no_deal: float = 0.25   # not viable, both reject  (the right answer)
     agree_per_dim: float = 0.05     # the two agents' beliefs match, per dimension
-    correct_per_dim: float = 0.20   # this agent's belief is actually right, per dimension
+    correct_per_dim: float = 0.10   # this agent's deal decision is right, per dimension
+                                    # (halved when decode/understood arrived: the
+                                    # comprehension signal now lives there instead)
     judgement: float = 0.25         # this agent's accept/reject matches whether a deal
                                     # was actually possible -- the fourth comprehension
                                     # dimension, and the one that trains the accept head
@@ -310,8 +354,26 @@ class TrainConfig:
     decision_entropy_coef_final: float = 0.002
     normalise_adv: bool = True
     seed: int = 0
-    device: str = "cpu"
+
+    # ---- where and how it runs -------------------------------------------
+    # "auto" picks cuda when a GPU is visible and cpu otherwise, which is what you
+    # want for a script that has to run on a laptop and on a cloud box unchanged.
+    device: str = "auto"
     torch_threads: int = 4
+    # Sample scenarios and score trades as whole batches of tensors rather than
+    # one Python call per episode.  On a GPU the scalar path is the entire
+    # bottleneck -- a batch of 4096 costs 4096 interpreter round trips before a
+    # kernel launches.  tests/test_batched.py asserts the two agree exactly.
+    vectorised: bool = True
+    # bfloat16 autocast for the forward passes.  bf16 rather than fp16 because it
+    # needs no loss scaling and these are tiny models where range matters more
+    # than precision.  Ignored on CPU without bf16 support.
+    amp: bool = False
+    compile: bool = False           # torch.compile the agent networks
+    tf32: bool = True               # allow TF32 matmuls on Ampere and later
+    # Episodes generated per optimiser step.  A GPU wants this an order of
+    # magnitude larger than a CPU does; see configs/gpu.json.
+    log_every_batches: int = 0      # 0 = quiet between checkpoints
 
 
 # --------------------------------------------------------------------------
@@ -421,6 +483,14 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--summary-every", type=int, default=None)
     p.add_argument("--ledger-stride", type=int, default=None)
     p.add_argument("--threads", type=int, default=None)
+    p.add_argument("--device", type=str, default=None,
+                   help="auto (default), cpu, cuda, or cuda:N")
+    p.add_argument("--amp", type=_tobool, default=None,
+                   help="on/off: bfloat16 autocast")
+    p.add_argument("--compile", type=_tobool, default=None,
+                   help="on/off: torch.compile the agent networks")
+    p.add_argument("--vectorised", type=_tobool, default=None,
+                   help="on/off: tensor world and reward (leave on for GPU)")
     p.add_argument("--algo", type=str, default=None, choices=["gumbel", "reinforce"])
     p.add_argument("--persistent-inventory", type=_tobool, default=None,
                    help="on/off: farms hold a depleting lot across market days")
@@ -467,6 +537,10 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ("summary_every", cfg.log, "summary_every"),
         ("ledger_stride", cfg.log, "ledger_stride"),
         ("threads", cfg.train, "torch_threads"),
+        ("device", cfg.train, "device"),
+        ("amp", cfg.train, "amp"),
+        ("compile", cfg.train, "compile"),
+        ("vectorised", cfg.train, "vectorised"),
         ("algo", cfg.train, "algo"),
         ("persistent_inventory", cfg.economy, "persistent_inventory"),
     ]
@@ -511,5 +585,6 @@ def validate(cfg: Config) -> None:
     assert p.n_farmers >= 1 and p.n_buyers >= 1
     assert p.lifespan_min <= p.lifespan_max
     assert cfg.train.algo in ("gumbel", "reinforce")
+    assert cfg.train.device == "auto" or cfg.train.device.split(":")[0] in ("cpu", "cuda")
     assert cfg.economy.episodes_per_day >= 1
     assert cfg.economy.season_days >= 1

@@ -56,6 +56,10 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
 
     var_transfer = nn(abl.get("variety_transfer"))
     checks["named_things"] = var_transfer == var_transfer and var_transfer > 0.2
+    _fr, _br = nn(abl.get("farmer_reads_transfer")), nn(abl.get("buyer_reads_transfer"))
+    # Unknown (an older run without these numbers) must not read as a failure.
+    checks["loop_closes_both_ways"] = (
+        (_fr != _fr and _br != _br) or (_fr > 0.15 and _br > 0.15))
     checks["learned_to_trade"] = succ == succ and succ > max(3 * chance, chance + 0.05)
     # Measured against silence, and only meaningful once there is some comprehension
     # to lose: the relative figure is 0/0 when nothing is understood either way.
@@ -113,6 +117,13 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
                   % (nn(abl.get("intact_variety_acc"), 0.0),
                      nn(abl.get("muted_variety_acc"), 0.0),
                      100 * var_transfer, 100 * content))
+    fr_t = nn(abl.get("farmer_reads_transfer"))
+    br_t = nn(abl.get("buyer_reads_transfer"))
+    if fr_t == fr_t and br_t == br_t:
+        ev.append("the loop closes in both directions: the farmer recovers %.0f%% of "
+                  "the headroom on the buyer's private fields, the buyer %.0f%% on the "
+                  "farmer's (both measured against being muted)"
+                  % (100 * fr_t, 100 * br_t))
     if n_words:
         ev.append("%d distinct words in use, %.0f%% of them multi-atom compounds, "
                   "%.2f words per utterance"
@@ -133,6 +144,12 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
                    "and/or the vocabulary has collapsed to a near-constant signal. "
                    "The performance is coming from base rates and reward shaping, not "
                    "from communication.")
+    elif not checks["loop_closes_both_ways"] and checks["named_things"]:
+        verdict = "ONE-WAY SIGNALLING"
+        summary = ("Information is crossing the channel, but only in one direction: "
+                   "one side is being read and the other is not. Check the two "
+                   "'reads' rows below -- a language needs both halves, and a "
+                   "speaker with no one listening has no reason to stay informative.")
     elif checks["compositional"] and checks["well_above_chance"] and checks["shared_code"]:
         verdict = "COMPOSITIONAL LANGUAGE"
         summary = ("The run shows the signature of a compositional, shared code: similar "
@@ -250,6 +267,10 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("|---|---|---|")
     A("| task success rate (5.1) | %.3f | chance is %.4f |"
       % (g(final, "eval_success"), chance))
+    A("| farmer reads the buyer | %.3f | share of the buyer's private fields it "
+      "recovered |" % g(final, "farmer_reads_buyer"))
+    A("| buyer reads the farmer | %.3f | share of the farmer's private fields it "
+      "recovered |" % g(final, "buyer_reads_farmer"))
     A("| farmer names the right variety | %.3f | a fact only the buyer holds; "
       "chance %.3f |" % (g(final, "farmer_variety_acc"), 1.0 / cfg.world.n_varieties))
     A("| farmer names the right quantity | %.3f | likewise; chance %.3f |"
@@ -406,15 +427,23 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("")
     fs = final.get("form_survival", {}) or {}
     if fs:
+        A("All three rows are accumulated over the whole run, across %d "
+          "meaning-to-meaning comparisons -- not the last checkpoint alone."
+          % int(g(fs, "n_comparisons", 0)))
+        A("")
         A("| measure | frequent meanings | rare meanings |")
         A("|---|---|---|")
-        A("| drift between checkpoints | %.3f | %.3f |"
+        A("| mean drift per checkpoint | %.3f | %.3f |"
           % (g(fs, "drift_frequent"), g(fs, "drift_rare")))
-        A("| share of forms replaced | %.2f | %.2f |"
+        A("| share of checkpoints where the form changed | %.2f | %.2f |"
           % (g(fs, "changed_frequent"), g(fs, "changed_rare")))
+        A("| outright replacements logged | %d | %d |"
+          % (int(g(fs, "n_events_frequent", 0)), int(g(fs, "n_events_rare", 0))))
         A("")
-        A("Replacements observed: %d, of which %d rebuilt from commoner parts."
-          % (int(g(fs, "n_events", 0)), int(g(fs, "n_regularised", 0))))
+        A("Replacements observed: %d, of which %d rebuilt from commoner parts. "
+          "Drift at the final checkpoint alone was %.3f (frequent) and %.3f (rare)."
+          % (int(g(fs, "n_events", 0)), int(g(fs, "n_regularised", 0)),
+             g(fs, "drift_frequent_interval"), g(fs, "drift_rare_interval")))
         A("")
     events = final.get("form_events") or []
     if events:

@@ -37,9 +37,11 @@ import torch.nn.functional as F
 
 from .agents import Agent, dialogue_offset, own_dialogue_positions
 from .config import Config
-from .env import (BUYER, FARMER, Decision, Outcome, buyer_obs, farmer_obs,
-                  resolve, speaker_of_turn)
-from .rollout import BatchRollout, UpdateStats, anneal, group_by_agent
+from .env import (BUYER, FARMER, Beliefs, Decision, Outcome, buyer_obs,
+                  farmer_obs, resolve, speaker_of_turn)
+from .batched import ScenarioBatch, resolve_batch
+from .rollout import (BatchRollout, UpdateStats, anneal, group_by_agent,
+                      n_outputs, split_decision)
 from .world import Scenario
 
 
@@ -48,23 +50,35 @@ def gumbel_tau(cfg: Config, frac_done: float) -> float:
     return anneal(t.gumbel_tau, t.gumbel_tau_final, frac_done, t.gumbel_tau_anneal_frac)
 
 
-def run_and_update_gumbel(cfg: Config, scenarios: Sequence[Scenario],
+def run_and_update_gumbel(cfg: Config, scenarios,
                           farmers: Sequence[Agent], buyers: Sequence[Agent],
                           f_idx: torch.Tensor, b_idx: torch.Tensor, *,
                           frac_done: float = 0.0, device: str = "cpu",
                           train: bool = True,
                           generator: Optional[torch.Generator] = None
                           ) -> tuple[BatchRollout, UpdateStats]:
-    """Play a batch with a reparameterised message channel, then learn from it."""
+    """Play a batch with a reparameterised message channel, then learn from it.
+
+    ``scenarios`` is either a list of :class:`~orchard.world.Scenario` -- the
+    readable path -- or a :class:`~orchard.batched.ScenarioBatch`, which keeps the
+    whole batch on device and never enters the interpreter per episode.
+    """
     c = cfg.channel
     t = cfg.train
+    batched = isinstance(scenarios, ScenarioBatch)
     B = len(scenarios)
     D = c.dialogue_len
     NT = c.n_token_ids
     tau = gumbel_tau(cfg, frac_done)
 
-    f_obs = torch.tensor([farmer_obs(s, cfg) for s in scenarios], dtype=torch.long, device=device)
-    b_obs = torch.tensor([buyer_obs(s, cfg) for s in scenarios], dtype=torch.long, device=device)
+    if batched:
+        f_obs = scenarios.obs(cfg, FARMER)
+        b_obs = scenarios.obs(cfg, BUYER)
+    else:
+        f_obs = torch.tensor([farmer_obs(s, cfg) for s in scenarios],
+                             dtype=torch.long, device=device)
+        b_obs = torch.tensor([buyer_obs(s, cfg) for s in scenarios],
+                             dtype=torch.long, device=device)
     obs_of = {FARMER: f_obs, BUYER: b_obs}
     idx_of = {FARMER: f_idx, BUYER: b_idx}
     pool_of = {FARMER: farmers, BUYER: buyers}
@@ -84,12 +98,14 @@ def run_and_update_gumbel(cfg: Config, scenarios: Sequence[Scenario],
         alive = torch.ones(B, dtype=torch.bool, device=device)
 
         for k in range(c.max_msg_len):
-            if not bool(alive.any()):
-                break
+            # Deliberately no `if not alive.any(): break`.  That reads a tensor on
+            # the host and so synchronises the device on every symbol step, which
+            # costs far more than the work it would skip.  Finished utterances are
+            # masked to PAD below and contribute nothing.
             p = turn * c.max_msg_len + k
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
-            for a_i, ep in group_by_agent(idx, alive):
+            for a_i, ep in group_by_agent(idx):
                 h = pool[a_i].net.encode(obs[ep], soft[ep], upto=seq_pos)[:, -1]
                 logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))
 
@@ -116,15 +132,15 @@ def run_and_update_gumbel(cfg: Config, scenarios: Sequence[Scenario],
     dec_value: dict[int, torch.Tensor] = {}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
-        out = torch.zeros((B, 4), dtype=torch.long, device=device)
+        n_out = n_outputs(cfg)
+        out = torch.zeros((B, n_out), dtype=torch.long, device=device)
         logp_sum = torch.zeros(B, device=device)
         ent_sum = torch.zeros(B, device=device)
         val = torch.zeros(B, device=device)
         for a_i, ep in group_by_agent(idx):
             net = pool[a_i].net
             h = net.encode(obs[ep], soft[ep])[:, -1]
-            heads = (net.accept_head(h), net.variety_head(h),
-                     net.decide_qty_head(h), net.decide_price_head(h))
+            heads = (net.decision_heads(h) + net.belief_heads(h))[:n_out]
             val = val.index_copy(0, ep, net.value_head(h).squeeze(-1))
             lps = torch.zeros(ep.shape[0], device=device)
             ents = torch.zeros(ep.shape[0], device=device)
@@ -133,8 +149,15 @@ def run_and_update_gumbel(cfg: Config, scenarios: Sequence[Scenario],
                 with torch.no_grad():
                     a = torch.multinomial(lp.exp(), 1, generator=generator).squeeze(-1)
                 out[ep, col] = a
-                lps = lps + lp.gather(-1, a.unsqueeze(-1)).squeeze(-1)
+                # The belief heads are what make "were you understood" scoreable,
+                # but they are also four more sampled actions; weighting them
+                # keeps the loop without doubling the noise on the deal decision.
+                wgt = 1.0 if col < 4 else cfg.reward.belief_grad_weight
+                lps = lps + wgt * lp.gather(-1, a.unsqueeze(-1)).squeeze(-1)
                 ents = ents + (-(lp.exp() * lp).sum(-1))
+            # Entropy is averaged over heads, not summed: adding heads must not
+            # silently raise the exploration bonus and keep agents random longer.
+            ents = ents / max(1, len(heads))
             logp_sum = logp_sum.index_copy(0, ep, lps)
             ent_sum = ent_sum.index_copy(0, ep, ents)
         dec_sampled[role] = out
@@ -147,22 +170,35 @@ def run_and_update_gumbel(cfg: Config, scenarios: Sequence[Scenario],
     f_emitted = content[:, own_dialogue_positions(cfg, FARMER)].sum(dim=1)
     b_emitted = content[:, own_dialogue_positions(cfg, BUYER)].sum(dim=1)
     outcomes: list[Outcome] = []
-    f_rew = torch.zeros(B, device=device)
-    b_rew = torch.zeros(B, device=device)
-    for i, sc in enumerate(scenarios):
-        fd = Decision(*[int(v) for v in dec_sampled[FARMER][i]])
-        bd = Decision(*[int(v) for v in dec_sampled[BUYER][i]])
-        o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]))
-        outcomes.append(o)
-        f_rew[i] = o.farmer_reward
-        b_rew[i] = o.buyer_reward
+    res = None
+    if batched:
+        # One pass over the batch instead of B trips through the interpreter.
+        use_bel = cfg.reward.belief_heads
+        res = resolve_batch(
+            cfg, scenarios, dec_sampled[FARMER][:, :4], dec_sampled[BUYER][:, :4],
+            f_emitted, b_emitted,
+            f_bel=dec_sampled[FARMER][:, 4:8] if use_bel else None,
+            b_bel=dec_sampled[BUYER][:, 4:8] if use_bel else None)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    else:
+        f_rew = torch.zeros(B, device=device)
+        b_rew = torch.zeros(B, device=device)
+        for i, sc in enumerate(scenarios):
+            fd, fb = split_decision(dec_sampled[FARMER][i])
+            bd, bb = split_decision(dec_sampled[BUYER][i])
+            o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
+                        f_beliefs=fb, b_beliefs=bb)
+            outcomes.append(o)
+            f_rew[i] = o.farmer_reward
+            b_rew[i] = o.buyer_reward
 
     batch = BatchRollout(
-        scenarios=list(scenarios), tokens=tokens, active=active,
+        scenarios=[] if batched else list(scenarios), tokens=tokens, active=active,
         f_obs=f_obs, b_obs=b_obs, f_idx=f_idx, b_idx=b_idx,
         f_dec=dec_sampled[FARMER].detach(), b_dec=dec_sampled[BUYER].detach(),
         f_reward=f_rew.detach(), b_reward=b_rew.detach(), outcomes=outcomes,
-        f_emitted=f_emitted, b_emitted=b_emitted)
+        f_emitted=f_emitted, b_emitted=b_emitted,
+        res=res, sb=scenarios if batched else None, n=B, cfg_ref=cfg)
 
     stats = UpdateStats()
     if not train:

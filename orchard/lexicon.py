@@ -303,6 +303,12 @@ class FormTracker:
         self.history: dict[tuple[int, int], list[tuple[int, str]]] = defaultdict(list)
         self.events: list[FormEvent] = []
         self._last: dict[tuple[int, int], list[int]] = {}
+        # Run-level totals.  A single interval's drift is noisy and, at the final
+        # checkpoint, can be a guaranteed zero; the honest summary of "how much did
+        # this bucket move over the run" is the accumulation.
+        self._drift_sum = {"frequent": 0.0, "rare": 0.0}
+        self._drift_n = {"frequent": 0, "rare": 0}
+        self._changed = {"frequent": 0, "rare": 0}
 
     # ------------------------------------------------------------------
     def _compositionality(self, words: Sequence[tuple[int, ...]],
@@ -357,13 +363,29 @@ class FormTracker:
                             regularised=bool(nc > oc + 1e-9)))
             self._last[k] = cur
 
+        for b in ("frequent", "rare"):
+            self._drift_sum[b] += sum(drift[b])
+            self._drift_n[b] += counted[b]
+            self._changed[b] += changed[b]
+
+        def overall(b: str) -> float:
+            n = self._drift_n[b]
+            return self._drift_sum[b] / n if n else float("nan")
+
         return {
-            "drift_frequent": _mean(drift["frequent"]),
-            "drift_rare": _mean(drift["rare"]),
-            "changed_frequent": changed["frequent"] / max(counted["frequent"], 1),
-            "changed_rare": changed["rare"] / max(counted["rare"], 1),
+            # this checkpoint only
+            "drift_frequent_interval": _mean(drift["frequent"]),
+            "drift_rare_interval": _mean(drift["rare"]),
+            # over the whole run so far -- what the report should quote
+            "drift_frequent": overall("frequent"),
+            "drift_rare": overall("rare"),
+            "changed_frequent": self._changed["frequent"] / max(self._drift_n["frequent"], 1),
+            "changed_rare": self._changed["rare"] / max(self._drift_n["rare"], 1),
             "n_events": len(self.events),
+            "n_events_frequent": sum(1 for e in self.events if e.bucket == "frequent"),
+            "n_events_rare": sum(1 for e in self.events if e.bucket == "rare"),
             "n_regularised": sum(1 for e in self.events if e.regularised),
+            "n_comparisons": self._drift_n["frequent"] + self._drift_n["rare"],
             "generations_alive": gens,
         }
 

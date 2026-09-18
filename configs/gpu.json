@@ -1,5 +1,5 @@
 {
-  "name": "open",
+  "name": "gpu",
   "world": {
     "n_varieties": 3,
     "n_quality": 3,
@@ -36,6 +36,8 @@
     "dropout": 0.0
   },
   "reward": {
+    "belief_heads": true,
+    "belief_grad_weight": 1.0,
     "decode": 0.45,
     "understood": 0.45,
     "belief_qty_tol": 1,
@@ -54,11 +56,11 @@
     "price_tol": 0
   },
   "population": {
-    "n_farmers": 4,
-    "n_buyers": 4,
+    "n_farmers": 8,
+    "n_buyers": 8,
     "turnover": true,
-    "lifespan_min": 10000,
-    "lifespan_max": 20000,
+    "lifespan_min": 40000,
+    "lifespan_max": 80000,
     "initial_stagger": true
   },
   "bottleneck": {
@@ -79,8 +81,8 @@
     "gumbel_tau_final": 0.5,
     "gumbel_tau_anneal_frac": 0.6,
     "gumbel_mix_reinforce": 0.1,
-    "episodes": 240000,
-    "batch_size": 128,
+    "episodes": 2000000,
+    "batch_size": 2048,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
@@ -91,19 +93,24 @@
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
     "seed": 0,
-    "device": "cpu",
-    "torch_threads": 4
+    "device": "auto",
+    "torch_threads": 4,
+    "vectorised": true,
+    "amp": true,
+    "compile": false,
+    "tf32": true,
+    "log_every_batches": 0
   },
   "log": {
-    "ledger_stride": 1,
-    "checkpoint_every": 20000,
-    "summary_every": 20000,
+    "ledger_stride": 50,
+    "checkpoint_every": 100000,
+    "summary_every": 100000,
     "n_example_transcripts": 3,
-    "topsim_samples": 150,
+    "topsim_samples": 300,
     "stability_probes": 32,
-    "intelligibility_episodes": 600,
-    "zeroshot_episodes": 600,
-    "ablation_episodes": 800,
+    "intelligibility_episodes": 4096,
+    "zeroshot_episodes": 4096,
+    "ablation_episodes": 4096,
     "word_analysis_samples": 400,
     "rare_frequent_split": 0.5,
     "track_form_survival": true,

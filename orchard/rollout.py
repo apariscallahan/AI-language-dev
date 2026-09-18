@@ -26,14 +26,22 @@ import torch.nn.functional as F
 
 from .agents import Agent, dialogue_offset, own_dialogue_positions
 from .config import Config
-from .env import (BUYER, FARMER, Decision, Outcome, Transcript, buyer_obs,
-                  farmer_obs, resolve, speaker_of_turn)
+from .env import (BUYER, FARMER, Beliefs, Decision, Outcome, Transcript,
+                  buyer_obs, farmer_obs, resolve, speaker_of_turn)
 from .world import Scenario
 
 
 # --------------------------------------------------------------------------
 @dataclass
 class BatchRollout:
+    """One batch of finished negotiations.
+
+    On the vectorised path the outcome lives in ``res`` as tensors and the
+    per-episode :class:`~orchard.env.Outcome` objects are built only for the
+    episodes something actually asks for -- the ledger's stride, a printed
+    transcript.  Materialising all of them was costing one dataclass construction
+    per episode, which on a GPU is the whole batch time.
+    """
     scenarios: list[Scenario]
     tokens: torch.Tensor                 # (B, D) emitted dialogue, PAD-filled
     active: torch.Tensor                 # (B, D) bool: slot was a real sampled action
@@ -41,24 +49,94 @@ class BatchRollout:
     b_obs: torch.Tensor                  # (B, 4)
     f_idx: torch.Tensor                  # (B,) index into the farmer agent list
     b_idx: torch.Tensor                  # (B,) index into the buyer agent list
-    f_dec: torch.Tensor                  # (B, 4) accept, variety, qty, price
-    b_dec: torch.Tensor                  # (B, 4)
+    f_dec: torch.Tensor                  # (B, 8) accept, variety, qty, price,
+    b_dec: torch.Tensor                  # then the four belief fields
     f_reward: torch.Tensor               # (B,)
     b_reward: torch.Tensor               # (B,)
     outcomes: list[Outcome] = field(default_factory=list)
     f_emitted: torch.Tensor | None = None
     b_emitted: torch.Tensor | None = None
+    # vectorised path only
+    res: dict[str, torch.Tensor] | None = None
+    sb: Any = None
+    n: int = 0
 
     def __len__(self) -> int:
-        return len(self.scenarios)
+        return self.n or len(self.scenarios)
+
+    # ---- tensor views, so summaries never need the dataclasses ----------
+    def _t(self, key: str) -> torch.Tensor:
+        if self.res is not None:
+            return self.res[key]
+        raise AttributeError("no tensor outcome on this rollout")
+
+    @property
+    def vectorised(self) -> bool:
+        return self.res is not None
+
+    @property
+    def success_t(self) -> torch.Tensor:
+        if self.res is not None:
+            return self.res["success"]
+        return torch.tensor([o.success for o in self.outcomes])
+
+    @property
+    def comprehended_t(self) -> torch.Tensor:
+        if self.res is not None:
+            return self.res["comprehended"]
+        return torch.tensor([o.comprehended for o in self.outcomes])
+
+    @property
+    def judged_t(self) -> torch.Tensor:
+        if self.res is not None:
+            return self.res["both_judged"]
+        return torch.tensor([o.both_judged_viability for o in self.outcomes])
+
+    @property
+    def farmer_decode_t(self) -> torch.Tensor:
+        if self.res is not None:
+            return self.res["farmer_decode"]
+        return torch.tensor([o.farmer_decode for o in self.outcomes])
+
+    @property
+    def buyer_decode_t(self) -> torch.Tensor:
+        if self.res is not None:
+            return self.res["buyer_decode"]
+        return torch.tensor([o.buyer_decode for o in self.outcomes])
+
+    @property
+    def viable_t(self) -> torch.Tensor:
+        if self.sb is not None:
+            return self.sb.viable
+        return torch.tensor([s.viable for s in self.scenarios])
+
+    def scenario(self, i: int) -> Scenario:
+        if self.scenarios:
+            return self.scenarios[i]
+        return self.sb.scenario(i)
+
+    def outcome(self, i: int) -> Outcome:
+        """Build one Outcome on demand (ledger rows, printed transcripts)."""
+        if self.outcomes:
+            return self.outcomes[i]
+        from .env import resolve
+        fd, fb = split_decision(self.f_dec[i])
+        bd, bb = split_decision(self.b_dec[i])
+        return resolve(self.cfg_ref, self.sb.scenario(i), fd, bd,
+                       int(self.f_emitted[i]), int(self.b_emitted[i]),
+                       f_beliefs=fb, b_beliefs=bb)
+
+    cfg_ref: Any = None
 
     def transcript(self, i: int) -> Transcript:
-        fd = Decision(*[int(v) for v in self.f_dec[i]])
-        bd = Decision(*[int(v) for v in self.b_dec[i]])
         return Transcript(tokens=[int(t) for t in self.tokens[i]],
-                          scenario=self.scenarios[i],
-                          farmer_decision=fd, buyer_decision=bd,
-                          outcome=self.outcomes[i] if self.outcomes else None)
+                          scenario=self.scenario(i),
+                          farmer_decision=split_decision(self.f_dec[i])[0],
+                          buyer_decision=split_decision(self.b_dec[i])[0],
+                          farmer_beliefs=split_decision(self.f_dec[i])[1],
+                          buyer_beliefs=split_decision(self.b_dec[i])[1],
+                          outcome=(self.outcomes[i] if self.outcomes
+                                   else (self.outcome(i) if self.res is not None else None)))
 
     def obs_for_role(self, role: int) -> torch.Tensor:
         return self.f_obs if role == FARMER else self.b_obs
@@ -71,6 +149,43 @@ class BatchRollout:
 
     def dec_for_role(self, role: int) -> torch.Tensor:
         return self.f_dec if role == FARMER else self.b_dec
+
+
+N_OUTPUTS = 8          # accept, variety, qty, price | belief x4
+
+
+def n_outputs(cfg) -> int:
+    """Sampled discrete outputs per agent: 4 for the deal, 4 more for the belief."""
+    return 8 if cfg.reward.belief_heads else 4
+
+
+def split_decision(row) -> tuple[Decision, Optional[Beliefs]]:
+    """Unpack one agent's discrete outputs into a deal and (maybe) a belief."""
+    v = [int(x) for x in row]
+    return Decision(*v[:4]), (Beliefs(*v[4:8]) if len(v) >= 8 else None)
+
+
+_GROUP_CACHE: dict[tuple, list[tuple[int, torch.Tensor]]] = {}
+
+
+def group_by_agent_static(n: int, n_agents: int, stride_offset: int,
+                          device: torch.device) -> list[tuple[int, torch.Tensor]]:
+    """Index sets for a stride pairing, computed once and reused.
+
+    With :meth:`orchard.population.Population.pair` handing episode i to agent
+    ``i % n_agents``, every agent owns a fixed stride slice.  That makes the
+    groups constants rather than something to be derived from a tensor each
+    step -- which matters because deriving them reads the tensor on the host and
+    stalls the device.
+    """
+    key = (n, n_agents, stride_offset, str(device))
+    hit = _GROUP_CACHE.get(key)
+    if hit is None:
+        hit = [(a, torch.arange(a, n, n_agents, device=device))
+               for a in range(n_agents)]
+        hit = [(a, ep) for a, ep in hit if ep.numel() > 0]
+        _GROUP_CACHE[key] = hit
+    return hit
 
 
 def group_by_agent(idx: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -179,10 +294,11 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         pool = farmers if role == FARMER else buyers
         idx = f_idx if role == FARMER else b_idx
         obs = f_obs if role == FARMER else b_obs
-        out = torch.zeros((B, 4), dtype=torch.long, device=device)
+        n_out = n_outputs(cfg)
+        out = torch.zeros((B, n_out), dtype=torch.long, device=device)
         for a_i, ep in group_by_agent(idx):
-            acc, var, qty, pri, _ = pool[a_i].net.decision_logits(obs[ep], views[role][ep])
-            for col, lg in enumerate((acc, var, qty, pri)):
+            heads = pool[a_i].net.decision_logits(obs[ep], views[role][ep])[:n_out]
+            for col, lg in enumerate(heads):
                 if greedy:
                     out[ep, col] = lg.argmax(dim=-1)
                 else:
@@ -202,9 +318,10 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     f_rew = torch.zeros(B)
     b_rew = torch.zeros(B)
     for i, sc in enumerate(scenarios):
-        fd = Decision(*[int(v) for v in decs[FARMER][i]])
-        bd = Decision(*[int(v) for v in decs[BUYER][i]])
-        o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]))
+        fd, fb = split_decision(decs[FARMER][i])
+        bd, bb = split_decision(decs[BUYER][i])
+        o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
+                    f_beliefs=fb, b_beliefs=bb)
         outcomes.append(o)
         f_rew[i] = o.farmer_reward
         b_rew[i] = o.buyer_reward
@@ -297,8 +414,11 @@ def update_agents(cfg: Config, batch: BatchRollout, farmers: Sequence[Agent],
             dec_ent = torch.zeros_like(R)
             for col, lg in enumerate(dec_logits):
                 lp = F.log_softmax(lg, dim=-1)
-                dec_logp = dec_logp + lp.gather(-1, dec_all[ep][:, col:col + 1]).squeeze(-1)
+                wgt = 1.0 if col < 4 else cfg.reward.belief_grad_weight
+                dec_logp = dec_logp + wgt * lp.gather(
+                    -1, dec_all[ep][:, col:col + 1]).squeeze(-1)
                 dec_ent = dec_ent + (-(lp.exp() * lp).sum(-1))
+            dec_ent = dec_ent / max(1, len(dec_logits))
             adv_dec = (R - dec_value).detach()
             pl_dec = -(adv_dec * dec_logp).mean()
             vl_dec = ((dec_value - R) ** 2).mean()
