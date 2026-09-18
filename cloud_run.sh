@@ -13,4 +13,4 @@ PY
 
 RUN="${RUN:-runs/gpu_$(date +%Y%m%d_%H%M%S)}"
 echo "writing to $RUN"
-exec python -m orchard.run --config configs/gpu.json --out "$RUN" --device auto "$@"
+exec python -m orchard.run --config "${CONFIG:-configs/gpu_community.json}" --out "$RUN" --device auto "$@"

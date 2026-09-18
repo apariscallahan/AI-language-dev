@@ -40,6 +40,9 @@ always shows you the number it arrived at.
 
 ### On a cloud GPU
 
+**[CLOUD.md](CLOUD.md) is the guide for this** — presets, how to change any
+setting from the CLI, memory sizing, and the two traps that will waste money.
+
 ```bash
 bash cloud_run.sh
 ```

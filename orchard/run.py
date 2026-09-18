@@ -77,6 +77,101 @@ def smoke(cfg: Config) -> int:
 
 
 # --------------------------------------------------------------------------
+def benchmark(cfg: Config, n_batches: int = 12) -> int:
+    """Time this machine on this configuration and print what the run will cost.
+
+    Worth doing before starting anything long on a rented box: it reports real
+    episodes per second for these exact settings, an estimate for the configured
+    episode count, and peak GPU memory, so a preset that will not fit or will not
+    finish is obvious in under a minute.
+    """
+    import time
+
+    import torch
+
+    from .agents import count_parameters, make_agent, sequence_len
+    from .batched import TensorWorld
+    from .env import BUYER, FARMER
+    from .hardware import describe, setup
+    from .population import Population
+    from .train import expected_generations
+
+    dev = setup(cfg)
+    cfg.train.device = str(dev)
+    torch.manual_seed(cfg.train.seed)
+
+    print("=" * 78)
+    print("BENCHMARK -- %s" % cfg.name)
+    print("=" * 78)
+    print("  %s" % describe(dev, cfg))
+
+    pop = Population(cfg, random.Random(0), device=str(dev))
+    per_agent = count_parameters(pop.farmers[0].net)
+    n_agents = cfg.population.n_farmers + cfg.population.n_buyers
+    print("  agents            : %d farmers + %d buyers = %d"
+          % (cfg.population.n_farmers, cfg.population.n_buyers, n_agents))
+    print("  brain             : d=%d, %d layers, %s params each, %s in total"
+          % (cfg.model.d_model, cfg.model.n_layers, "{:,}".format(per_agent),
+             "{:,}".format(per_agent * n_agents)))
+    print("  weights + Adam    : %.2f GB" % (per_agent * n_agents * 4 * 3 / 1e9))
+    print("  sequence length   : %d  (%d symbols x %d turns of dialogue)"
+          % (sequence_len(cfg), cfg.channel.max_symbols, cfg.channel.n_turns))
+    print("  batch             : %d episodes -> %d per agent per step"
+          % (cfg.train.batch_size,
+             cfg.train.batch_size // max(1, cfg.population.n_farmers)))
+
+    tw = TensorWorld(cfg, device=str(dev),
+                     generator=torch.Generator(device=dev).manual_seed(0))
+    B = cfg.train.batch_size
+    f_idx, b_idx = pop.pair(B, device=str(dev))
+
+    from .gumbel import run_and_update_gumbel
+    from .rollout import run_episodes, update_agents
+
+    def one_step():
+        sb = tw.sample(B)
+        if cfg.train.algo == "gumbel":
+            run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
+                                  frac_done=0.1, device=str(dev))
+        else:
+            batch = run_episodes(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
+                                 device=str(dev))
+            update_agents(cfg, batch, pop.farmers, pop.buyers, frac_done=0.1,
+                          device=str(dev))
+
+    print("\n  warming up...")
+    for _ in range(3):
+        one_step()
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+    t0 = time.time()
+    for _ in range(n_batches):
+        one_step()
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    dt = (time.time() - t0) / n_batches
+    eps = B / dt
+
+    print("\n  measured          : %.3f s per batch, %s episodes/sec"
+          % (dt, "{:,.0f}".format(eps)))
+    if dev.type == "cuda":
+        print("  peak GPU memory   : %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
+    total_h = cfg.train.episodes / eps / 3600
+    print("  configured run    : %s episodes -> %.1f hours of training"
+          % ("{:,}".format(cfg.train.episodes), total_h))
+    n_ck = max(1, cfg.train.episodes // max(1, cfg.log.checkpoint_every))
+    print("  plus %d checkpoints; the metric suite replays episodes three times "
+          "for the\n  channel ablation, so allow roughly %.0f%% on top."
+          % (n_ck, 15))
+    print("  generations       : ~%.1f lineage turnovers" % expected_generations(cfg))
+    print("=" * 78)
+    print("  If the hours are wrong, change --episodes, or --batch-size for speed.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 def compare(paths: list[str], out: str) -> int:
     from .plots import write_comparison
     runs: dict[str, Any] = {}
@@ -167,6 +262,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="finished run directories to overlay")
     p.add_argument("--compare-out", type=str, default="runs/comparison")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--benchmark", nargs="?", type=int, const=12, default=None,
+                   metavar="N",
+                   help="time N batches on this machine and print what the "
+                        "configured run will cost, then exit")
     args = p.parse_args(argv)
 
     if args.compare:
@@ -175,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_from_args(args)
     if args.smoke:
         return smoke(cfg)
+    if args.benchmark:
+        return benchmark(cfg, args.benchmark)
 
     out = args.out or os.path.join("runs", cfg.name)
     os.makedirs(out, exist_ok=True)

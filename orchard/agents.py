@@ -206,7 +206,12 @@ class CommNet(nn.Module):
         n = self.seq_len if upto is None else upto
         x = x[:, :n]
         mask = self._causal[:n, :n]
-        h = self.encoder(x, mask=mask)
+        if self.cfg.train.grad_checkpoint and self.training and x.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+            h = checkpoint(lambda t: self.encoder(t, mask=mask), x,
+                           use_reentrant=False)
+        else:
+            h = self.encoder(x, mask=mask)
         return self.norm(h)
 
     # ------------------------------------------------------------------

@@ -370,6 +370,12 @@ class TrainConfig:
     # than precision.  Ignored on CPU without bf16 support.
     amp: bool = False
     compile: bool = False           # torch.compile the agent networks
+    # Recompute encoder activations in the backward pass instead of keeping them.
+    # The Gumbel path builds one graph spanning every symbol step of an episode,
+    # so activation memory grows as batch x sequence x width x symbol-steps and is
+    # what limits big configurations long before parameter count does.  Costs
+    # roughly 30% more compute and buys back most of that memory.
+    grad_checkpoint: bool = False
     tf32: bool = True               # allow TF32 matmuls on Ampere and later
     # Episodes generated per optimiser step.  A GPU wants this an order of
     # magnitude larger than a CPU does; see configs/gpu.json.
