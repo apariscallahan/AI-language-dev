@@ -410,3 +410,73 @@ class FormTracker:
                         "prob": round(self.prob[k], 4),
                         "trail": [{"episode": e, "form": t or "<silence>"} for e, t in trail]})
         return out
+
+
+# ==========================================================================
+# where a word came from: the referential phase, or the negotiation phases
+# ==========================================================================
+class WordProvenance:
+    """Tracks which curriculum phase each word first appeared and settled in.
+
+    Some of the structure visible at the end of a curriculum run is simply
+    inherited from the lineup game -- the agents already had words for varieties
+    and quantities before a price was ever mentioned. Saying "negotiation produced
+    this" without checking would be claiming a cause that is not there. So every
+    word is stamped with the phase it was first seen in and the phase it became
+    regular in, and the report separates the two populations.
+    """
+
+    def __init__(self, settle_count: int = 20):
+        self.settle_count = settle_count
+        self.first_phase: dict[str, str] = {}
+        self.first_episode: dict[str, int] = {}
+        self.counts_by_phase: dict[str, Counter] = defaultdict(Counter)
+        self.settled_phase: dict[str, str] = {}
+
+    def observe(self, phase_name: str, episode: int, word_counts: dict[str, int]) -> None:
+        for word, n in word_counts.items():
+            if word not in self.first_phase:
+                self.first_phase[word] = phase_name
+                self.first_episode[word] = episode
+            self.counts_by_phase[phase_name][word] += int(n)
+            if (word not in self.settled_phase
+                    and self.counts_by_phase[phase_name][word] >= self.settle_count):
+                self.settled_phase[word] = phase_name
+
+    # ------------------------------------------------------------------
+    def summary(self, phases: Sequence[str]) -> dict[str, Any]:
+        total_by_phase = {p: sum(self.counts_by_phase[p].values()) for p in phases}
+        out: dict[str, Any] = {"phases": list(phases), "n_words": len(self.first_phase)}
+        for p in phases:
+            first = [w for w, f in self.first_phase.items() if f == p]
+            settled = [w for w, f in self.settled_phase.items() if f == p]
+            out[p] = {
+                "first_appeared": len(first),
+                "settled_here": len(settled),
+                "word_tokens": total_by_phase[p],
+            }
+        return out
+
+    def new_in_phase(self, phase_name: str, limit: int = 15) -> list[dict[str, Any]]:
+        """Words that first showed up in this phase, commonest first.
+
+        For the negotiation phases this is the place to look for anything like
+        offer / counter-offer / accept / reject vocabulary that the lineup game
+        had no reason to invent.
+        """
+        rows = [(w, self.counts_by_phase[phase_name][w])
+                for w, f in self.first_phase.items() if f == phase_name]
+        rows.sort(key=lambda kv: -kv[1])
+        return [{"word": w, "count": n, "settled": self.settled_phase.get(w) == phase_name,
+                 "first_episode": self.first_episode[w]} for w, n in rows[:limit]]
+
+    def inherited(self, later_phase: str, earlier_phase: str = "refer") -> dict[str, Any]:
+        """How much of a later phase's vocabulary was already there."""
+        used_later = set(self.counts_by_phase[later_phase])
+        from_earlier = {w for w in used_later if self.first_phase.get(w) == earlier_phase}
+        return {
+            "words_in_use": len(used_later),
+            "inherited_from_%s" % earlier_phase: len(from_earlier),
+            "new_here": len(used_later) - len(from_earlier),
+            "inherited_share": (len(from_earlier) / len(used_later)) if used_later else 0.0,
+        }

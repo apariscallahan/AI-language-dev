@@ -82,16 +82,26 @@ def buyer_schema(cfg: WorldConfig) -> list[int]:
     return [K_VARIETY, K_QTY, K_QUALITY, K_PRICE]
 
 
-def n_obs_slots(cfg: WorldConfig) -> int:
-    """Both roles use one sequence layout, so the shorter one is padded."""
-    return max(len(farmer_schema(cfg)), len(buyer_schema(cfg)))
+def n_obs_slots(cfg: WorldConfig, full: "object | None" = None) -> int:
+    """Slots in the shared observation layout.
+
+    One layout serves every role in every phase, with the shorter ones padded.
+    That is what lets a population carry its weights across a curriculum
+    transition: the architecture does not change, only what is written into it.
+    The lineup game needs the most room -- three fields per candidate.
+    """
+    n = max(len(farmer_schema(cfg)), len(buyer_schema(cfg)))
+    if full is not None and getattr(full, "curriculum", None) is not None:
+        n = max(n, 3 * full.curriculum.n_candidates)
+    return n
 
 
-def obs_schema(cfg: WorldConfig, role: int) -> list[int]:
+def obs_schema(cfg: WorldConfig, role: int, full: "object | None" = None) -> list[int]:
     """Field kinds for each observation slot, padded with K_EMPTY."""
     from .env import FARMER
     base = farmer_schema(cfg) if role == FARMER else buyer_schema(cfg)
-    return base + [K_EMPTY] * (n_obs_slots(cfg) - len(base))
+    n = n_obs_slots(cfg, full)
+    return base[:n] + [K_EMPTY] * max(0, n - len(base))
 
 
 def field_labels(cfg: WorldConfig, role: int) -> list[str]:
@@ -103,7 +113,8 @@ def field_labels(cfg: WorldConfig, role: int) -> list[str]:
                  + ["reservation"])
     else:
         names = ["want_variety", "need_qty", "min_quality", "max_price"]
-    return names + ["-"] * (n_obs_slots(cfg) - len(names))
+    n = n_obs_slots(cfg)
+    return names[:n] + ["-"] * max(0, n - len(names))
 
 
 def field_spans(cfg: WorldConfig, role: int) -> list[int]:

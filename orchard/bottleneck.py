@@ -4,16 +4,27 @@ When an agent dies its replacement does not inherit weights.  Instead it gets a
 short supervised apprenticeship on a **deliberately small sample** of recent
 successful trades by the living population, and only then joins the RL loop.
 
-The sample is also **skewed toward what was common** (addendum 2.3).  Drawing
-episodes in proportion to how often each meaning actually came up is what a
-learner's experience is really like: a newborn sees hundreds of ordinary trades
-and may see a given unusual one never.  It therefore reliably generalises the
-systematic pattern for common cases, and often simply cannot reproduce whatever
-narrow form a rare case happened to acquire -- which is where vocabulary loss and
-the regularisation of rare forms come from, with no separate forgetting
-mechanism.  ``BottleneckConfig.frequency_skew`` controls how hard this bites:
-1.0 is natural proportion, 0.0 flattens it so rare meanings are as well
-represented as common ones.
+How much a newborn sees
+-----------------------
+Nearly all of it.  An earlier version drew a few hundred transcripts, which had
+the asymmetry backwards: with a sample that small, a form used in 2% of trades
+might appear a handful of times or not at all, so *common* vocabulary was at risk
+of being lost, not just obscure vocabulary.  Real transmission does not look like
+that.  Children reliably acquire essentially everything the adults around them
+use with any regularity; loss and drift are marginal phenomena at the rare end.
+
+So the sample is now a near-complete pass over the parent generation's recent
+successful trades (``coverage``, default all of them).  The asymmetry then falls
+out of the statistics instead of being imposed by a cap: a form used in 1% of
+trades still appears hundreds of times in a 40,000-transcript sample and
+transmits reliably, while one used in 0.01% may genuinely not appear at all, or
+appear once and not be learned.  Only the second kind is at real risk, which is
+the point.
+
+Sampling stays proportional to how often each meaning actually came up
+(``frequency_skew``, 1.0 = natural proportion), so the *composition* of a
+newborn's experience still mirrors the parent generation's.  What changed is that
+it is no longer artificially thin.
 
 The smallness is the whole mechanism.  Kirby-style iterated learning produces
 systematic structure precisely because each generation must reconstruct the whole
@@ -85,36 +96,66 @@ class TranscriptStore:
     def __len__(self) -> int:
         return len(self._buf)
 
+    def meaning_of(self, batch, i: int) -> tuple[int, int]:
+        """The (variety, quantity) this episode was about."""
+        sb = batch.sb
+        if sb is None:
+            sc = batch.scenarios[i]
+            return (sc.buyer.want_variety, sc.buyer.need_qty)
+        if hasattr(sb, "want_variety"):                     # a trading batch
+            return (int(sb.want_variety[i]), int(sb.need_qty[i]))
+        m = sb.true_meaning[i]                              # a lineup round
+        return (int(m[0]), int(m[1]))
+
+    def _push(self, batch, i: int, farmers, buyers, episode: int) -> None:
+        item = StoredEpisode(
+            f_obs=batch.f_obs[i].detach().clone(),
+            b_obs=batch.b_obs[i].detach().clone(),
+            tokens=batch.tokens[i].detach().clone(),
+            active=batch.active[i].detach().clone(),
+            f_dec=batch.f_dec[i].detach().clone(),
+            b_dec=batch.b_dec[i].detach().clone(),
+            episode=episode,
+            f_generation=farmers[int(batch.f_idx[i])].generation,
+            b_generation=buyers[int(batch.b_idx[i])].generation,
+            meaning=self.meaning_of(batch, i),
+        )
+        if len(self._buf) < self.capacity:
+            self._buf.append(item)
+        else:
+            old = self._buf[self._pos]
+            self.meaning_counts[old.meaning] -= 1
+            if self.meaning_counts[old.meaning] <= 0:
+                del self.meaning_counts[old.meaning]
+            self._buf[self._pos] = item
+            self._pos = (self._pos + 1) % self.capacity
+        self.meaning_counts[item.meaning] += 1
+        self.total_added += 1
+
     def add_batch(self, batch: BatchRollout, farmers, buyers, episode: int) -> int:
+        """File this batch's usable transcripts for the next generation to learn from.
+
+        The tensor path carries its outcome in ``batch.res`` and builds no
+        per-episode Outcome objects, so iterating ``batch.outcomes`` silently
+        stored nothing at all -- every newborn then got an empty curriculum and
+        started from random weights, which with turnover on kept resetting the
+        population. Hence the explicit branch, and the test that guards it.
+        """
+        if batch.res is not None:
+            keep = batch.res["success"]
+            if not self.cfg.bottleneck.only_successful:
+                keep = torch.ones_like(keep)
+            idx = keep.nonzero(as_tuple=True)[0].tolist()
+            for i in idx:
+                self._push(batch, i, farmers, buyers, episode)
+            return len(idx)
+
         added = 0
         for i, o in enumerate(batch.outcomes):
             if self.cfg.bottleneck.only_successful and not o.success:
                 continue
-            sc = batch.scenarios[i]
-            item = StoredEpisode(
-                f_obs=batch.f_obs[i].detach().clone(),
-                b_obs=batch.b_obs[i].detach().clone(),
-                tokens=batch.tokens[i].detach().clone(),
-                active=batch.active[i].detach().clone(),
-                f_dec=batch.f_dec[i].detach().clone(),
-                b_dec=batch.b_dec[i].detach().clone(),
-                episode=episode,
-                f_generation=farmers[int(batch.f_idx[i])].generation,
-                b_generation=buyers[int(batch.b_idx[i])].generation,
-                meaning=(sc.buyer.want_variety, sc.buyer.need_qty),
-            )
-            if len(self._buf) < self.capacity:
-                self._buf.append(item)
-            else:
-                old = self._buf[self._pos]
-                self.meaning_counts[old.meaning] -= 1
-                if self.meaning_counts[old.meaning] <= 0:
-                    del self.meaning_counts[old.meaning]
-                self._buf[self._pos] = item
-                self._pos = (self._pos + 1) % self.capacity
-            self.meaning_counts[item.meaning] += 1
+            self._push(batch, i, farmers, buyers, episode)
             added += 1
-            self.total_added += 1
         return added
 
     def sample(self, n: int, rng: random.Random) -> list[StoredEpisode]:
@@ -159,6 +200,42 @@ class TranscriptStore:
                     break
         return picked
 
+    def word_coverage(self, cfg, items: list[StoredEpisode]) -> dict[str, Any]:
+        """How much of the population's vocabulary this curriculum contains.
+
+        This is the number that decides whether a form transmits.  A word the
+        newborn never sees cannot be learned; a word it sees hundreds of times
+        will be.  Reported per birth so the frequent/rare asymmetry is auditable
+        rather than assumed.
+        """
+        from .env import parse_words, word_text
+        def words_of(pool):
+            c: Counter = Counter()
+            for it in pool:
+                for w in parse_words(cfg, [int(x) for x in it.tokens]):
+                    c[word_text(cfg, w)] += 1
+            return c
+        shown = words_of(items)
+        whole = words_of(self._buf)
+        if not whole:
+            return {}
+        total = sum(whole.values())
+        # a form is "common" if it is more than 1 in 1000 of all word tokens
+        common = {w for w, n in whole.items() if n / total >= 1e-3}
+        rare = set(whole) - common
+        seen_enough = {w for w, n in shown.items() if n >= 3}
+        return {
+            "vocabulary_in_population": len(whole),
+            "vocabulary_shown": len(shown),
+            "common_forms": len(common),
+            "common_forms_shown": len(common & set(shown)),
+            "common_forms_learnable": len(common & seen_enough),
+            "rare_forms": len(rare),
+            "rare_forms_shown": len(rare & set(shown)),
+            "common_coverage": (len(common & seen_enough) / len(common)) if common else 1.0,
+            "rare_coverage": (len(rare & seen_enough) / len(rare)) if rare else 1.0,
+        }
+
     def meaning_profile(self, items: list[StoredEpisode]) -> dict[str, Any]:
         """What the newborn was actually shown, for the birth log."""
         seen = Counter(it.meaning for it in items)
@@ -178,6 +255,7 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     bc = cfg.bottleneck
     info: dict[str, Any] = {
         "enabled": bc.enabled,
+        "coverage": bc.coverage,
         "requested_samples": bc.n_samples,
         "store_size": len(store),
         "n_samples": 0,
@@ -192,7 +270,11 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         info["skipped"] = "bottleneck disabled"
         return info
 
-    samples = store.sample(bc.n_samples, rng)
+    # 0 means "derive from coverage"; a positive n_samples forces an explicit cap,
+    # which is mostly useful for reproducing the old, lossy behaviour.
+    want = (bc.n_samples if bc.n_samples > 0
+            else min(bc.max_samples, max(1, int(round(bc.coverage * len(store))))))
+    samples = store.sample(want, rng)
     if len(samples) < 8:
         info["skipped"] = "not enough successful transcripts yet"
         return info
@@ -209,9 +291,11 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         gens[g] = gens.get(g, 0) + 1
     info["teacher_generations"] = {str(k): v for k, v in sorted(gens.items())}
     info["n_samples"] = len(samples)
+    info["store_coverage"] = len(samples) / max(1, len(store))
     info["epochs"] = bc.epochs
     info["frequency_skew"] = bc.frequency_skew
     info["meaning_coverage"] = store.meaning_profile(samples)
+    info["word_coverage"] = store.word_coverage(cfg, samples)
     info["sample_episode_span"] = [min(s.episode for s in samples),
                                    max(s.episode for s in samples)]
 

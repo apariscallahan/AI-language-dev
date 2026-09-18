@@ -58,7 +58,7 @@ N_SLOT_TYPES = N_FIXED_SLOT_TYPES + 5        # + one per field kind
 
 def dialogue_offset(cfg: Config) -> int:
     """Index of the first dialogue slot: BOS + the role-padded obs slots + SEP."""
-    return 1 + n_obs_slots(cfg.world) + 1
+    return 1 + n_obs_slots(cfg.world, cfg) + 1
 
 
 def sequence_len(cfg: Config) -> int:
@@ -95,7 +95,7 @@ class CommNet(nn.Module):
         self.d_model = d
         self.seq_len = sequence_len(cfg)
 
-        self.schema = obs_schema(w, role)
+        self.schema = obs_schema(w, role, cfg)
         self.n_obs = len(self.schema)
         self.dialogue_offset = dialogue_offset(cfg)
 
@@ -135,6 +135,23 @@ class CommNet(nn.Module):
         self.belief_qty_head = nn.Linear(d, w.max_qty + 1)
         self.belief_quality_head = nn.Linear(d, w.n_quality)
         self.belief_price_head = nn.Linear(d, w.n_price_bins)
+        # Which candidate in the lineup (referential phase only).  This is a
+        # pointer rather than a flat classifier: it scores the hidden state *at
+        # each candidate's own slots*, so "compare the message against this
+        # candidate" is something the attention can express directly instead of a
+        # relational trick the network has to discover from nothing.  Present in
+        # every phase so the architecture -- and the carried weights -- never
+        # change at a curriculum boundary.
+        self.choice_proj = nn.Linear(d, d)
+        # Both sides of the match are normalised before the dot product.  Without
+        # this the candidate side is a sum of three freshly-initialised embeddings
+        # (norm ~0.24) against a query of norm ~6.8, which put the choice logits at
+        # std 0.03 where every other head sits near 1.0 -- a policy so close to
+        # uniform that the gradient could not move it, and the lineup game sat
+        # exactly at chance no matter how long it ran.
+        self.choice_ln_cand = nn.LayerNorm(d)
+        self.choice_ln_query = nn.LayerNorm(d)
+        self.n_candidates = max(2, cfg.curriculum.n_candidates)
         self.value_head = nn.Linear(d, 1)
 
         self.register_buffer("_self_mask", speaker_self_mask(cfg, role), persistent=False)
@@ -153,7 +170,8 @@ class CommNet(nn.Module):
                 nn.init.zeros_(mod.bias)
 
     # ------------------------------------------------------------------
-    def embed(self, obs: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    def embed(self, obs: torch.Tensor, tokens: torch.Tensor,
+              schema: "list[int] | None" = None) -> torch.Tensor:
         """obs: (B,4) long -> (B, seq_len, d).
 
         ``tokens`` is either (B,D) integer ids, or (B,D,n_token_ids) of
@@ -174,7 +192,7 @@ class CommNet(nn.Module):
         tables = {K_VARIETY: self.variety_emb, K_QTY: self.qty_emb,
                   K_QUALITY: self.quality_emb, K_PRICE: self.price_emb}
         cols = []
-        for i, kind in enumerate(self.schema):
+        for i, kind in enumerate(schema if schema is not None else self.schema):
             if kind == K_EMPTY:
                 vec = self.empty_emb.weight[0].expand(B, d)
             else:
@@ -200,9 +218,10 @@ class CommNet(nn.Module):
         return x + self.pos_emb.weight.unsqueeze(0)
 
     def encode(self, obs: torch.Tensor, tokens: torch.Tensor,
-               upto: Optional[int] = None) -> torch.Tensor:
+               upto: Optional[int] = None,
+               schema: "list[int] | None" = None) -> torch.Tensor:
         """Hidden states for the prefix of length ``upto`` (default: whole sequence)."""
-        x = self.embed(obs, tokens)
+        x = self.embed(obs, tokens, schema)
         n = self.seq_len if upto is None else upto
         x = x[:, :n]
         mask = self._causal[:n, :n]
@@ -216,15 +235,16 @@ class CommNet(nn.Module):
 
     # ------------------------------------------------------------------
     def next_token_logits(self, obs: torch.Tensor, tokens: torch.Tensor,
-                          seq_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
+                          seq_pos: int, schema=None) -> tuple[torch.Tensor, torch.Tensor]:
         """Logits for the token that will occupy ``seq_pos``, plus that state's value."""
-        h = self.encode(obs, tokens, upto=seq_pos)[:, -1]
+        h = self.encode(obs, tokens, upto=seq_pos, schema=schema)[:, -1]
         return self.token_head(h), self.value_head(h).squeeze(-1)
 
-    def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor):
-        h = self.encode(obs, tokens)[:, -1]
-        return (self.decision_heads(h) + self.belief_heads(h)
-                + (self.value_head(h).squeeze(-1),))
+    def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor, schema=None):
+        """Every discrete head, then the value.  Order matches curriculum.py's
+        head indices, so callers can slice the first N_HEADS and trust it."""
+        h = self.encode(obs, tokens, schema=schema)[:, -1]
+        return self.all_heads(h, obs) + (self.value_head(h).squeeze(-1),)
 
     def decision_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return (self.accept_head(h), self.variety_head(h),
@@ -233,6 +253,54 @@ class CommNet(nn.Module):
     def belief_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return (self.belief_variety_head(h), self.belief_qty_head(h),
                 self.belief_quality_head(h), self.belief_price_head(h))
+
+    def candidate_embeddings(self, obs: torch.Tensor) -> torch.Tensor:
+        """(B, K, d) -- each lineup candidate embedded from its own three fields.
+
+        Built from the raw observation rather than from hidden states, because the
+        encoder is causal: a candidate sits early in the sequence and cannot
+        attend forward to the message. Scoring it against a hidden state taken at
+        a candidate slot would therefore be scoring it against something that has
+        not heard anything, which is exactly how the first version of this head
+        managed to be entirely independent of what was said.
+        """
+        K = self.n_candidates
+        vecs = []
+        for k in range(K):
+            i = 3 * k
+            if i + 2 >= obs.shape[1]:
+                vecs.append(torch.zeros_like(vecs[0]) if vecs else
+                            self.empty_emb.weight[0].expand(obs.shape[0], self.d_model))
+                continue
+            # Outside the lineup phase these slots hold trading fields whose
+            # ranges do not match these tables, and the head's output is unused.
+            # Clamping keeps the lookup legal rather than making every call site
+            # have to know which phase it is in.
+            vecs.append(
+                self.variety_emb(obs[:, i].clamp(0, self.variety_emb.num_embeddings - 1))
+                + self.qty_emb(obs[:, i + 1].clamp(0, self.qty_emb.num_embeddings - 1))
+                + self.quality_emb(
+                    obs[:, i + 2].clamp(0, self.quality_emb.num_embeddings - 1)))
+        return torch.stack(vecs, dim=1)
+
+    def choice_logits(self, h_last: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        """(B, K) -- how well each candidate matches what was just heard.
+
+        A dot product between a projection of the final hidden state (which has
+        seen the whole message) and each candidate's embedding: the standard
+        listener for a signalling game, and the one structure that makes
+        "does this description fit this candidate" directly expressible.
+        """
+        cand = self.choice_ln_cand(self.candidate_embeddings(obs))   # (B, K, d)
+        q = self.choice_ln_query(self.choice_proj(h_last)).unsqueeze(-1)
+        return torch.bmm(cand, q).squeeze(-1) / math.sqrt(self.d_model)
+
+    def all_heads(self, h: torch.Tensor, obs: Optional[torch.Tensor] = None
+                  ) -> tuple[torch.Tensor, ...]:
+        """Every discrete output, in the fixed order curriculum.py indexes."""
+        choice = (self.choice_logits(h, obs) if obs is not None
+                  else h.new_zeros((h.shape[0], self.n_candidates)))
+        return self.decision_heads(h) + self.belief_heads(h) + (choice,)
 
     def full_pass(self, obs: torch.Tensor, tokens: torch.Tensor,
                   read_positions: torch.Tensor):
@@ -248,9 +316,7 @@ class CommNet(nn.Module):
         tok_logits = self.token_head(hr)                    # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)
         hd = h[:, -1]
-        dec = self.decision_heads(hd)
-        if self.cfg.reward.belief_heads:
-            dec = dec + self.belief_heads(hd)
+        dec = self.all_heads(hd, obs)
         dec_value = self.value_head(hd).squeeze(-1)
         return tok_logits, tok_values, dec, dec_value
 

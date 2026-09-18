@@ -343,6 +343,59 @@ babbling, or turn it up to watch agents go quiet.
 
 ---
 
+## The curriculum: learn to refer before learning to haggle
+
+Dropped straight into the full trading task from random weights, agents have to
+solve five things at once before any of them pays off even once — emit a stable
+signal, put true private information in it, have the other side decode it, close
+the loop so decoding changes a decision, and get the trade arithmetic right as
+well. A run at that setting produced success 0.000 at *every* checkpoint,
+comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
+
+So the task is built up, and a rung is only left behind once it has worked:
+
+| phase | what is added | chance rate |
+|---|---|---|
+| `refer` | a lineup game: the informer describes one meaning, the guesser picks it out of K candidates. No price, no budget, no negotiation, no market. | 1/K |
+| `haggle` | price and budget, so accept/reject has a payoff — still one message each | ~0 |
+| `bargain` | several turns, so counter-offers become possible | ~0 |
+| `market` | the full economy: persistent stock, restocking, viability | ~0 |
+
+The point of the first rung is that 1/K is a gradient RL can climb, where the
+full task's success probability from random weights is about 1e-3.
+
+**Weights carry across every transition.** The population that learned to refer
+is the population that learns to haggle — nothing is reinitialised at a boundary.
+That works because all four phases share one sequence layout, one channel and one
+set of heads; a phase that uses fewer turns just leaves the later dialogue slots
+empty. (The transmission bottleneck still applies normally to newborns *within* a
+phase. That is a separate mechanism and is untouched.)
+
+**Promotion is on evidence, not on a schedule.** All of these have to hold at the
+same checkpoint before the next phase starts:
+
+- success clear of that phase's chance rate (and above an absolute floor),
+- topological similarity clear of its own shuffled null,
+- the channel-scramble control showing a real drop when messages are muted.
+
+Success alone is not enough, because a pair can score on base rates without
+saying anything. Every transition is logged with the numbers that justified it.
+
+If a phase runs past `curriculum.max_episodes_per_phase` without meeting them, the
+run **does not advance**: it flags the stall loudly, names the unmet criteria, and
+either holds or stops (`curriculum.on_stall`). Building the next phase on top of
+one that never converged would only reproduce the failure a rung higher.
+
+### Telling inherited structure from new structure
+
+Some of the vocabulary visible at the end was inherited from the lineup game
+rather than caused by negotiation pressure. Every word is stamped with the phase
+it first appeared in and the phase it settled in, so the report separates
+"structure the referential game already produced" from "structure negotiation
+specifically added" — and lists the words that first appeared in a negotiation
+phase, which is where anything like offer / counter-offer / accept / refuse
+vocabulary would show up.
+
 ## Generations, and what gets lost
 
 Agents age, die at a randomised lifespan, and are replaced by newborns with fresh
@@ -351,17 +404,30 @@ language and some must acquire it. A code that only works between two co-adapted
 agents fails to transmit and is selected against.
 
 A newborn's apprenticeship (the **transmission bottleneck**) is supervised learning
-on a *deliberately small* sample of recent successful trades — a few hundred, never
-the full history. The squeeze is the mechanism: a lookup table cannot survive it, a
-systematic code can be rebuilt from fragments.
+on the parent generation's recent successful trades. It sees **nearly all of them**
+(`bottleneck.coverage`, default 1.0, up to `max_samples`), not a few hundred.
 
-The sample is also **skewed toward what was common** (`bottleneck.frequency_skew`).
-A learner sees hundreds of ordinary trades and may see a given unusual one never.
-So it reliably generalises the pattern for common cases and often simply cannot
-reproduce whatever narrow form a rare case picked up — which is where vocabulary
-loss comes from, with no separate forgetting mechanism. When a rare meaning's form
-is lost and rebuilt out of words that are common elsewhere, that is the shape of an
-irregular verb levelling out, and `FormTracker` logs it with before/after examples.
+That sizing is the point. An earlier version drew a small fixed sample — as few as
+43–90 transcripts in practice — and that had the asymmetry backwards: with a sample
+that thin, a form used in 2% of trades might appear a handful of times or not at
+all, so *common* vocabulary was at risk of being lost, not just obscure vocabulary.
+Real transmission does not look like that. Children reliably acquire essentially
+everything the adults around them use with any regularity; loss and drift are
+marginal phenomena at the rare end.
+
+With near-complete coverage the asymmetry falls out of the statistics instead of
+being imposed by a cap: a form used in 1% of trades still appears hundreds of times
+in a 40,000-transcript sample and transmits reliably, while one used in 0.01% may
+genuinely not appear at all. Only the second kind is at real risk. Sampling stays
+proportional to how often each meaning actually came up
+(`bottleneck.frequency_skew`), so the *composition* of a newborn's experience still
+mirrors the parent generation's — it is simply no longer artificially thin.
+
+Every birth records what vocabulary it was actually shown, and the report gives
+retention for common and rare forms **separately** rather than as an aggregate, so
+the asymmetry is visible rather than assumed. When a rare meaning's form is lost and
+rebuilt out of words that are common elsewhere, that is the shape of an irregular
+verb levelling out, and `FormTracker` logs it with before/after examples.
 
 This is why metrics are bucketed into frequent and rare meanings. A global average
 hides exactly this effect.

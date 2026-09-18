@@ -415,22 +415,29 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
           device: str = "cpu", rng: Optional[random.Random] = None,
           scenarios: Optional[Sequence[Scenario]] = None,
           pairing: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-          channel_mode: str = "intact") -> dict[str, Any]:
+          channel_mode: str = "intact", phase=None, sampler=None) -> dict[str, Any]:
     if not f_sel or not b_sel or n <= 0:
         return {"n": 0, "success_rate": float("nan"), "mean_reward": float("nan")}
     rng = rng or random.Random(0)
-    scen = list(scenarios) if scenarios is not None else         [world.sample(held_out=held_out) for _ in range(n)]
+    if scenarios is not None:
+        scen = scenarios
+    elif sampler is not None:
+        scen = sampler(n, held_out)          # the phase supplies its own world
+    else:
+        scen = [world.sample(held_out=held_out) for _ in range(n)]
     if pairing is not None:
         f_idx, b_idx = pairing
     else:
         f_idx = torch.tensor([rng.choice(list(f_sel)) for _ in range(n)], dtype=torch.long)
         b_idx = torch.tensor([rng.choice(list(b_sel)) for _ in range(n)], dtype=torch.long)
     batch = run_episodes(cfg, scen, pop.farmers, pop.buyers, f_idx, b_idx, device=device,
-                         channel_mode=channel_mode)
+                         channel_mode=channel_mode, phase=phase)
     # Tensor views, so a 4096-episode evaluation is a few reductions rather than
     # 4096 attribute lookups on dataclasses that had to be built first.
     succ_t = batch.success_t
-    viable_t = batch.viable_t.to(succ_t.device)
+    referential = batch.sb is not None and not hasattr(batch.sb, "viable")
+    viable_t = (torch.ones_like(succ_t) if referential
+                else batch.viable_t.to(succ_t.device))
     succ = int(succ_t.sum())
     viable = int(viable_t.sum())
     succ_viable = int((succ_t & viable_t).sum())
@@ -447,7 +454,10 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     # this is the metric that actually shows a vocabulary arriving: can the farmer
     # name the variety the buyer asked for, and the number they asked for?  Both
     # are facts only the buyer holds.
-    if batch.sb is not None:
+    if referential:
+        # In the lineup game "naming the right thing" is the guess itself.
+        n_var_hits = n_qty_hits = n_price_hits = int(succ_t.sum())
+    elif batch.sb is not None:
         sb = batch.sb
         n_var_hits = int((batch.f_dec[:, 1] == sb.want_variety).sum())
         n_qty_hits = int((batch.f_dec[:, 2] == sb.need_qty).sum())
@@ -488,11 +498,12 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
 
 
 def evaluate_success(cfg: Config, pop: Population, world: World, n: int,
-                     device: str = "cpu", rng: Optional[random.Random] = None
-                     ) -> dict[str, Any]:
+                     device: str = "cpu", rng: Optional[random.Random] = None,
+                     phase=None, sampler=None) -> dict[str, Any]:
     f_all = list(range(len(pop.farmers)))
     b_all = list(range(len(pop.buyers)))
-    return _play(cfg, pop, world, n, f_all, b_all, held_out=False, device=device, rng=rng)
+    return _play(cfg, pop, world, n, f_all, b_all, held_out=False, device=device,
+                 rng=rng, phase=phase, sampler=sampler)
 
 
 # ---- 5.6 zero-shot generalisation ---------------------------------------
@@ -531,8 +542,8 @@ def _headroom(intact: float, scrambled: float) -> float:
 
 
 def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
-                     device: str = "cpu", rng: Optional[random.Random] = None
-                     ) -> dict[str, Any]:
+                     device: str = "cpu", rng: Optional[random.Random] = None,
+                     phase=None, sampler=None) -> dict[str, Any]:
     """Causal test: does the channel actually carry information?
 
     The same scenarios and the same pairings are played twice.  In the second
@@ -548,10 +559,12 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
     rng = rng or random.Random(0)
     f_all = list(range(len(pop.farmers)))
     b_all = list(range(len(pop.buyers)))
-    intact = _play(cfg, pop, world, n, f_all, b_all, device=device, rng=rng)
-    if not intact.get("scenarios"):
+    intact = _play(cfg, pop, world, n, f_all, b_all, device=device, rng=rng,
+                   phase=phase, sampler=sampler)
+    if intact.get("scenarios") is None:
         return {"n": 0}
-    same = dict(scenarios=intact["scenarios"], pairing=intact["pairing"])
+    same = dict(scenarios=intact["scenarios"], pairing=intact["pairing"],
+                phase=phase, sampler=sampler)
     scrambled = _play(cfg, pop, world, n, f_all, b_all, device=device, rng=rng,
                       channel_mode="scrambled", **same)
     muted = _play(cfg, pop, world, n, f_all, b_all, device=device, rng=rng,

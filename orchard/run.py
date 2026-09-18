@@ -304,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
         if trainer.forms is not None:
             final["form_events"] = trainer.forms.report_rows()
             final["form_timeline"] = trainer.forms.timeline()
+        final["curriculum"] = trainer.curriculum_report()
 
         path = write_report(
             cfg, out, final=final, chance=trainer.chance, sem=sem,

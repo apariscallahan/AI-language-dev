@@ -211,7 +211,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
                  farmers: Sequence[Agent], buyers: Sequence[Agent],
                  f_idx: torch.Tensor, b_idx: torch.Tensor,
                  *, device: str = "cpu", greedy: bool = False,
-                 channel_mode: str = "intact",
+                 channel_mode: str = "intact", phase=None,
                  generator: Optional[torch.Generator] = None) -> BatchRollout:
     """Play a batch of negotiations to completion.
 
@@ -237,12 +237,27 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     """
     if channel_mode not in ("intact", "scrambled", "muted"):
         raise ValueError("unknown channel_mode %r" % (channel_mode,))
+    from .batched import ScenarioBatch, resolve_batch
+    from .curriculum import (H_CHOICE, N_HEADS, ReferentialBatch, ladder,
+                             phase_schema, resolve_referential)
     c = cfg.channel
+    if phase is None:
+        phase = ladder(cfg)[-1]
+    referential = isinstance(scenarios, ReferentialBatch)
+    tensor_in = referential or isinstance(scenarios, ScenarioBatch)
+    schema_of = {FARMER: phase_schema(cfg, FARMER, phase),
+                 BUYER: phase_schema(cfg, BUYER, phase)}
     B = len(scenarios)
     D = c.dialogue_len
 
-    f_obs = torch.tensor([farmer_obs(s, cfg) for s in scenarios], dtype=torch.long, device=device)
-    b_obs = torch.tensor([buyer_obs(s, cfg) for s in scenarios], dtype=torch.long, device=device)
+    if tensor_in:
+        f_obs = scenarios.obs(cfg, FARMER)
+        b_obs = scenarios.obs(cfg, BUYER)
+    else:
+        f_obs = torch.tensor([farmer_obs(s, cfg) for s in scenarios],
+                             dtype=torch.long, device=device)
+        b_obs = torch.tensor([buyer_obs(s, cfg) for s in scenarios],
+                             dtype=torch.long, device=device)
     tokens = torch.full((B, D), c.pad_id, dtype=torch.long, device=device)
     active = torch.zeros((B, D), dtype=torch.bool, device=device)
     # Per-role views of the dialogue.  One shared object unless a control is on.
@@ -250,8 +265,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     views = ({FARMER: tokens.clone(), BUYER: tokens.clone()} if altered
              else {FARMER: tokens, BUYER: tokens})
 
-    for turn in range(c.n_turns):
-        role = speaker_of_turn(turn)
+    for turn in range(min(phase.n_turns, c.n_turns)):
+        role = phase.speaker_of_turn(turn)
         other = BUYER if role == FARMER else FARMER
         pool = farmers if role == FARMER else buyers
         idx = f_idx if role == FARMER else b_idx
@@ -265,7 +280,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
             for a_i, ep in group_by_agent(idx, alive):
-                lg, _ = pool[a_i].net.next_token_logits(obs[ep], views[role][ep], seq_pos)
+                lg, _ = pool[a_i].net.next_token_logits(
+                    obs[ep], views[role][ep], seq_pos, schema=schema_of[role])
                 logits[ep] = lg
             if greedy:
                 tok = logits.argmax(dim=-1)
@@ -294,10 +310,10 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         pool = farmers if role == FARMER else buyers
         idx = f_idx if role == FARMER else b_idx
         obs = f_obs if role == FARMER else b_obs
-        n_out = n_outputs(cfg)
-        out = torch.zeros((B, n_out), dtype=torch.long, device=device)
+        out = torch.zeros((B, N_HEADS), dtype=torch.long, device=device)
         for a_i, ep in group_by_agent(idx):
-            heads = pool[a_i].net.decision_logits(obs[ep], views[role][ep])[:n_out]
+            heads = pool[a_i].net.decision_logits(
+                obs[ep], views[role][ep], schema=schema_of[role])[:N_HEADS]
             for col, lg in enumerate(heads):
                 if greedy:
                     out[ep, col] = lg.argmax(dim=-1)
@@ -315,23 +331,38 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     b_emitted = content[:, b_pos].sum(dim=1)
 
     outcomes: list[Outcome] = []
-    f_rew = torch.zeros(B)
-    b_rew = torch.zeros(B)
-    for i, sc in enumerate(scenarios):
-        fd, fb = split_decision(decs[FARMER][i])
-        bd, bb = split_decision(decs[BUYER][i])
-        o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
-                    f_beliefs=fb, b_beliefs=bb)
-        outcomes.append(o)
-        f_rew[i] = o.farmer_reward
-        b_rew[i] = o.buyer_reward
+    res = None
+    if referential:
+        res = resolve_referential(cfg, scenarios, decs[BUYER][:, H_CHOICE],
+                                  f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif tensor_in:
+        use_bel = cfg.reward.belief_heads
+        res = resolve_batch(cfg, scenarios, decs[FARMER][:, :4], decs[BUYER][:, :4],
+                            f_emitted, b_emitted,
+                            f_bel=decs[FARMER][:, 4:8] if use_bel else None,
+                            b_bel=decs[BUYER][:, 4:8] if use_bel else None)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    else:
+        f_rew = torch.zeros(B)
+        b_rew = torch.zeros(B)
+        for i, sc in enumerate(scenarios):
+            fd, fb = split_decision(decs[FARMER][i])
+            bd, bb = split_decision(decs[BUYER][i])
+            o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
+                        f_beliefs=fb, b_beliefs=bb)
+            outcomes.append(o)
+            f_rew[i] = o.farmer_reward
+            b_rew[i] = o.buyer_reward
+        f_rew, b_rew = f_rew.to(device), b_rew.to(device)
 
     return BatchRollout(
-        scenarios=list(scenarios), tokens=tokens, active=active,
+        scenarios=[] if tensor_in else list(scenarios), tokens=tokens, active=active,
         f_obs=f_obs, b_obs=b_obs, f_idx=f_idx, b_idx=b_idx,
         f_dec=decs[FARMER], b_dec=decs[BUYER],
-        f_reward=f_rew.to(device), b_reward=b_rew.to(device),
-        outcomes=outcomes, f_emitted=f_emitted, b_emitted=b_emitted)
+        f_reward=f_rew, b_reward=b_rew,
+        outcomes=outcomes, f_emitted=f_emitted, b_emitted=b_emitted,
+        res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg)
 
 
 # --------------------------------------------------------------------------

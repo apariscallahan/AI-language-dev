@@ -40,6 +40,8 @@ from .config import Config
 from .env import (BUYER, FARMER, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, resolve, speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
+from .curriculum import (H_CHOICE, N_HEADS, Phase, ReferentialBatch, ladder,
+                         phase_schema, resolve_referential)
 from .rollout import (BatchRollout, UpdateStats, anneal, group_by_agent,
                       n_outputs, split_decision)
 from .world import Scenario
@@ -54,7 +56,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                           farmers: Sequence[Agent], buyers: Sequence[Agent],
                           f_idx: torch.Tensor, b_idx: torch.Tensor, *,
                           frac_done: float = 0.0, device: str = "cpu",
-                          train: bool = True,
+                          train: bool = True, phase: Optional[Phase] = None,
                           generator: Optional[torch.Generator] = None
                           ) -> tuple[BatchRollout, UpdateStats]:
     """Play a batch with a reparameterised message channel, then learn from it.
@@ -65,7 +67,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     """
     c = cfg.channel
     t = cfg.train
-    batched = isinstance(scenarios, ScenarioBatch)
+    if phase is None:
+        phase = ladder(cfg)[-1]              # the full market task
+    referential = isinstance(scenarios, ReferentialBatch)
+    batched = referential or isinstance(scenarios, ScenarioBatch)
+    schema_of = {FARMER: phase_schema(cfg, FARMER, phase),
+                 BUYER: phase_schema(cfg, BUYER, phase)}
     B = len(scenarios)
     D = c.dialogue_len
     NT = c.n_token_ids
@@ -92,8 +99,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         FARMER: [], BUYER: []}
 
     # ---- the conversation ------------------------------------------------
-    for turn in range(c.n_turns):
-        role = speaker_of_turn(turn)
+    # Phases that use fewer turns simply leave the later dialogue slots empty,
+    # which keeps one sequence layout -- and therefore one set of weights -- valid
+    # across every rung of the curriculum.
+    for turn in range(min(phase.n_turns, c.n_turns)):
+        role = phase.speaker_of_turn(turn)
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         alive = torch.ones(B, dtype=torch.bool, device=device)
 
@@ -106,7 +116,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
             for a_i, ep in group_by_agent(idx):
-                h = pool[a_i].net.encode(obs[ep], soft[ep], upto=seq_pos)[:, -1]
+                h = pool[a_i].net.encode(obs[ep], soft[ep], upto=seq_pos,
+                                         schema=schema_of[role])[:, -1]
                 logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))
 
             y = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
@@ -132,15 +143,15 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     dec_value: dict[int, torch.Tensor] = {}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
-        n_out = n_outputs(cfg)
-        out = torch.zeros((B, n_out), dtype=torch.long, device=device)
+        scored = set(phase.active_heads(role, cfg))
+        out = torch.zeros((B, N_HEADS), dtype=torch.long, device=device)
         logp_sum = torch.zeros(B, device=device)
         ent_sum = torch.zeros(B, device=device)
         val = torch.zeros(B, device=device)
         for a_i, ep in group_by_agent(idx):
             net = pool[a_i].net
-            h = net.encode(obs[ep], soft[ep])[:, -1]
-            heads = (net.decision_heads(h) + net.belief_heads(h))[:n_out]
+            h = net.encode(obs[ep], soft[ep], schema=schema_of[role])[:, -1]
+            heads = net.all_heads(h, obs[ep])
             val = val.index_copy(0, ep, net.value_head(h).squeeze(-1))
             lps = torch.zeros(ep.shape[0], device=device)
             ents = torch.zeros(ep.shape[0], device=device)
@@ -149,15 +160,17 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 with torch.no_grad():
                     a = torch.multinomial(lp.exp(), 1, generator=generator).squeeze(-1)
                 out[ep, col] = a
+                if col not in scored:
+                    continue          # sampled for shape, not scored: no gradient
                 # The belief heads are what make "were you understood" scoreable,
                 # but they are also four more sampled actions; weighting them
                 # keeps the loop without doubling the noise on the deal decision.
                 wgt = 1.0 if col < 4 else cfg.reward.belief_grad_weight
                 lps = lps + wgt * lp.gather(-1, a.unsqueeze(-1)).squeeze(-1)
                 ents = ents + (-(lp.exp() * lp).sum(-1))
-            # Entropy is averaged over heads, not summed: adding heads must not
-            # silently raise the exploration bonus and keep agents random longer.
-            ents = ents / max(1, len(heads))
+            # Entropy is averaged over the heads in play, not summed: adding heads
+            # must not silently raise the exploration bonus.
+            ents = ents / max(1, len(scored))
             logp_sum = logp_sum.index_copy(0, ep, lps)
             ent_sum = ent_sum.index_copy(0, ep, ents)
         dec_sampled[role] = out
@@ -171,7 +184,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     b_emitted = content[:, own_dialogue_positions(cfg, BUYER)].sum(dim=1)
     outcomes: list[Outcome] = []
     res = None
-    if batched:
+    if referential:
+        res = resolve_referential(cfg, scenarios,
+                                  dec_sampled[BUYER][:, H_CHOICE],
+                                  f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif batched:
         # One pass over the batch instead of B trips through the interpreter.
         use_bel = cfg.reward.belief_heads
         res = resolve_batch(

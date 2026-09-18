@@ -239,6 +239,11 @@ class RewardConfig:
     # the score-function term over them is high-variance; below 1 keeps the loop
     # without letting it drown the deal-decision signal.
     belief_grad_weight: float = 1.0
+    # The lineup game pays both sides for the same event, because there being
+    # understood and understanding are the same thing.
+    refer_success: float = 1.0
+    refer_miss: float = -0.1
+
     decode: float = 0.45            # I worked out your situation
     understood: float = 0.45        # you worked out mine
     belief_qty_tol: int = 1         # counts as read correctly if within this
@@ -282,6 +287,36 @@ class EconomyConfig:
 
 
 # --------------------------------------------------------------------------
+# Curriculum
+# --------------------------------------------------------------------------
+@dataclass
+class CurriculumConfig:
+    """Learn to refer before learning to haggle.
+
+    The full trading task is too conjunctive to bootstrap from random weights --
+    measured: success 0.000 at every checkpoint of a 10k-episode run, with the
+    channel carrying nothing.  The ladder in orchard/curriculum.py starts with a
+    lineup game whose chance rate is 1/K rather than ~0, and only moves on when a
+    phase has demonstrably worked.
+    """
+    enabled: bool = True
+    n_candidates: int = 4            # lineup size in the referential phase
+
+    # ---- promotion, on evidence rather than on a schedule -----------------
+    min_episodes_per_phase: int = 20_000
+    max_episodes_per_phase: int = 400_000
+    refer_min_success: float = 0.55    # vs 1/n_candidates by chance
+    trade_min_success: float = 0.15
+    min_success_over_chance: float = 2.0
+    min_topsim_over_null: float = 0.10
+    min_channel_transfer: float = 0.25
+    # If a phase never hits threshold inside its budget, advancing anyway would
+    # just rebuild the same failure one rung up.  "hold" keeps training and flags
+    # it loudly; "stop" ends the run so a rented box is not burned for nothing.
+    on_stall: str = "hold"
+
+
+# --------------------------------------------------------------------------
 # Population / lifecycle  (spec 3)
 # --------------------------------------------------------------------------
 @dataclass
@@ -302,11 +337,21 @@ class PopulationConfig:
 @dataclass
 class BottleneckConfig:
     enabled: bool = True                  # master switch (spec 9)
-    n_samples: int = 600                  # *limited* sample -- this is the bottleneck
-    epochs: int = 12
-    batch_size: int = 64
+    # How much of the parent generation a newborn gets to see, as a fraction of
+    # everything in the store.  Real children acquire essentially all of the
+    # vocabulary that adults around them use regularly; loss is a marginal
+    # phenomenon at the rare end, not a broad one.  A small fixed sample gets that
+    # backwards -- it puts common forms at risk too.  At full coverage a form used
+    # in 1% of trades still appears hundreds of times and transmits reliably,
+    # while one used in 0.01% may genuinely not appear at all.  That asymmetry is
+    # the thing worth modelling, and it falls out of coverage rather than a cap.
+    coverage: float = 1.0
+    max_samples: int = 40_000             # a ceiling for tractability, not a squeeze
+    n_samples: int = 0                    # 0 = derive from coverage; >0 forces a cap
+    epochs: int = 3
+    batch_size: int = 256
     lr: float = 1e-3
-    store_capacity: int = 4000            # ring buffer of recent successful episodes
+    store_capacity: int = 40_000          # ring buffer of recent successful episodes
     only_successful: bool = True          # learn from trades that worked
     # How strongly the newborn's sample favours common meanings (addendum 2.3).
     #   1.0 = whatever the parent generation actually did, in proportion
@@ -347,8 +392,11 @@ class TrainConfig:
     lr: float = 3e-4
     grad_clip: float = 1.0
     value_coef: float = 0.5
-    entropy_coef: float = 0.05            # on message tokens; annealed
-    entropy_coef_final: float = 0.005
+    # Measured on the lineup game, everything else held fixed: 0.05 reached 0.473
+    # against a 0.25 chance rate, 0.01 reached 0.618.  A large exploration bonus
+    # keeps the symbol policy near-uniform long after it should have committed.
+    entropy_coef: float = 0.01            # on message tokens; annealed
+    entropy_coef_final: float = 0.002
     entropy_anneal_frac: float = 0.5      # fraction of the run over which it anneals
     decision_entropy_coef: float = 0.02
     decision_entropy_coef_final: float = 0.002
@@ -408,6 +456,7 @@ class Config:
     name: str = "default"
     world: WorldConfig = field(default_factory=WorldConfig)
     economy: EconomyConfig = field(default_factory=EconomyConfig)
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
@@ -485,6 +534,10 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--lifespan-min", type=int, default=None)
     p.add_argument("--lifespan-max", type=int, default=None)
     p.add_argument("--bottleneck-samples", type=int, default=None)
+    p.add_argument("--bottleneck-coverage", type=float, default=None)
+    p.add_argument("--curriculum", type=_tobool, default=None,
+                   help="on/off: the referential-then-trading curriculum")
+    p.add_argument("--on-stall", type=str, default=None, choices=["hold", "stop"])
     p.add_argument("--checkpoint-every", type=int, default=None)
     p.add_argument("--summary-every", type=int, default=None)
     p.add_argument("--ledger-stride", type=int, default=None)
@@ -539,6 +592,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ("lifespan_min", cfg.population, "lifespan_min"),
         ("lifespan_max", cfg.population, "lifespan_max"),
         ("bottleneck_samples", cfg.bottleneck, "n_samples"),
+        ("bottleneck_coverage", cfg.bottleneck, "coverage"),
+        ("curriculum", cfg.curriculum, "enabled"),
+        ("on_stall", cfg.curriculum, "on_stall"),
         ("checkpoint_every", cfg.log, "checkpoint_every"),
         ("summary_every", cfg.log, "summary_every"),
         ("ledger_stride", cfg.log, "ledger_stride"),
@@ -582,6 +638,9 @@ def validate(cfg: Config) -> None:
     assert cfg.world.zipf_alpha >= 0.0
     assert cfg.world.zipf_alpha_variety >= 0.0
     assert cfg.bottleneck.frequency_skew >= 0.0
+    assert cfg.curriculum.n_candidates >= 2
+    assert cfg.curriculum.on_stall in ("hold", "stop")
+    assert 0.0 < cfg.bottleneck.coverage <= 1.0
     assert cfg.model.d_model % cfg.model.n_heads == 0
     w = cfg.world
     assert w.n_varieties >= 2 and w.n_quality >= 2 and w.max_qty >= 2

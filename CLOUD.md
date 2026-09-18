@@ -91,6 +91,9 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 
 | setting | what it does |
 |---|---|
+| `--curriculum on\|off` | the referential-then-trading ladder. Off means the full task from random weights, which has not been made to work. |
+| `--on-stall hold\|stop` | what to do if a phase never converges. |
+| `bottleneck.coverage` | how much of the parent generation a newborn sees. 1.0 means essentially all of it; lowering it puts common forms back at risk. |
 | `--n-farmers`, `--n-buyers` | population size per role. More agents means a code that has to work for strangers, not a private pair. |
 | `--episodes` | run length. Generations fall out of this — see §4. |
 | `--batch-size` | episodes per optimiser step. The main speed/memory dial. |
@@ -104,6 +107,43 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 | `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
 
 ---
+
+## 3b. The curriculum
+
+Runs start on a lineup game and work up to the full market. Nothing is
+reinitialised between phases; the same population carries its weights forward.
+
+```bash
+--curriculum off                          # straight to the full trading task
+--set curriculum.n_candidates=6           # a harder lineup (chance 1/6)
+--set curriculum.min_episodes_per_phase=100000
+--set curriculum.max_episodes_per_phase=2000000
+--on-stall stop                           # end the run instead of holding
+```
+
+Promotion needs success clear of chance, topsim clear of its shuffled null, *and*
+the channel-scramble control showing a real drop — all at one checkpoint. Thresholds:
+
+```bash
+--set curriculum.refer_min_success=0.55   # lineup phase
+--set curriculum.trade_min_success=0.15   # trading phases
+--set curriculum.min_topsim_over_null=0.10
+--set curriculum.min_channel_transfer=0.25
+```
+
+**On a rented box use `--on-stall stop`.** If a phase runs past its budget without
+converging, holding just burns money on a phase that is not working; stopping
+leaves you a report saying exactly which criteria were unmet.
+
+Watch the phase in the log or the metrics:
+
+```bash
+grep -E "PHASE|phase " runs/x/run.log
+python -c "import json;[print(r['episode'],r['phase'],round(r['eval_success'],3)) for r in map(json.loads,open('runs/x/metrics.jsonl'))]"
+```
+
+Phase 1 rounds go to `lineups.jsonl` rather than the trade ledger — there are no
+trades in it.
 
 ## 4. Generations are derived, not set
 

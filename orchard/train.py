@@ -33,8 +33,10 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       channel_ablation, compositionality, detect_degenerate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
-from .lexicon import (FormTracker, bucketed_analysis, length_frequency,
-                      word_stats)
+from .curriculum import (CurriculumState, ReferentialWorld, ladder,
+                         promotion_for)
+from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
+                      length_frequency, word_stats)
 from .population import BirthEvent, Population
 from .render import render_transcript
 from .world import World
@@ -125,6 +127,9 @@ class Trainer:
         self.ledger = Ledger(cfg, out_dir, stride=cfg.log.ledger_stride)
         self.metrics_log = JsonlLog(out_dir, "metrics.jsonl")
         self.birth_log = JsonlLog(out_dir, "births.jsonl")
+        # Phase 1 has no trades to put in the trade ledger, but its rounds are
+        # still the record of how the language started, so they get their own.
+        self.lineup_log = JsonlLog(out_dir, "lineups.jsonl")
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # The fast path.  Same distributions, drawn on device in one go; the
@@ -142,6 +147,17 @@ class Trainer:
         self.stability = StabilityTracker(cfg, self.world, cfg.log.stability_probes,
                                           seed=cfg.train.seed + 4)
         self.forms = FormTracker(cfg, self.world) if cfg.log.track_form_survival else None
+        self.provenance = WordProvenance()
+
+        # ---- the curriculum -------------------------------------------------
+        self.curriculum = CurriculumState(ladder(cfg))
+        if not cfg.curriculum.enabled:
+            self.curriculum.index = len(self.curriculum.phases) - 1
+        self.referential_world = None
+        if cfg.curriculum.enabled:
+            g = torch.Generator(device=dev)
+            g.manual_seed(cfg.train.seed + 13)
+            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g)
         self.bottleneck_rng = random.Random(cfg.train.seed + 5)
         self.eval_rng = random.Random(cfg.train.seed + 6)
 
@@ -156,11 +172,148 @@ class Trainer:
         self.failure_counts: dict[str, int] = {}
         self.chance = chance_success_rate(cfg, self.world)
         self.newborn_reports: list[dict[str, Any]] = []
+        self._stop_requested = False
         self.resume_note = resume_note
         self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
         self._headline: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    def curriculum_report(self) -> dict[str, Any]:
+        """Where the run got to on the ladder, and what vocabulary came from where."""
+        cur = self.curriculum
+        names = [p.name for p in cur.phases]
+        out: dict[str, Any] = {
+            "enabled": self.cfg.curriculum.enabled,
+            "phases": names,
+            "reached": cur.phase.name,
+            "reached_index": cur.phase.index,
+            "episodes_in_current_phase": cur.episodes_in_phase,
+            "stalled": cur.stalled,
+            "transitions": cur.transitions,
+            "last_promotion_check": cur.last_report,
+            "provenance": self.provenance.summary(names),
+        }
+        reached = cur.phase.index
+        for p in cur.phases[1:reached + 1]:
+            out.setdefault("inherited", {})[p.name] = self.provenance.inherited(p.name)
+            out.setdefault("new_words", {})[p.name] = self.provenance.new_in_phase(p.name)
+        # what each newborn was actually shown, which is what decides transmission
+        cov = [r.get("bottleneck", {}).get("word_coverage") or {}
+               for r in self.newborn_reports]
+        cov = [c for c in cov if c]
+        if cov:
+            def avg(k):
+                vals = [c[k] for c in cov if k in c]
+                return sum(vals) / len(vals) if vals else float("nan")
+            out["bottleneck_coverage"] = {
+                "births_measured": len(cov),
+                "common_form_coverage": avg("common_coverage"),
+                "rare_form_coverage": avg("rare_coverage"),
+                "mean_sample_size": avg("vocabulary_shown"),
+            }
+        return out
+
+    # ------------------------------------------------------------------
+    def write_lineups(self, batch, rb, episode0: int) -> None:
+        """One row per lineup round: what was shown, what was said, what was picked."""
+        from .render import render_message
+        w = self.cfg.world
+        stride = max(1, self.cfg.log.ledger_stride)
+        L = self.cfg.channel.max_symbols
+        for i in range(len(batch)):
+            ep = episode0 + i
+            if ep % stride:
+                continue
+
+            def tup(t):
+                return {"variety": w.variety_names[int(t[0])], "quantity": int(t[1]),
+                        "quality": w.quality_names[int(t[2])]}
+
+            cands = [tup(rb.meanings[i, k]) for k in range(rb.meanings.shape[1])]
+            msg = [int(x) for x in batch.tokens[i, :L]]
+            self.lineup_log.write({
+                "episode": ep,
+                "phase": "refer",
+                "informer_id": self.pop.farmers[int(batch.f_idx[i])].agent_id,
+                "guesser_id": self.pop.buyers[int(batch.b_idx[i])].agent_id,
+                "true_meaning": tup(rb.true_meaning[i]),
+                "candidates": cands,
+                "target_index": int(rb.target[i]),
+                "chosen_index": int(batch.b_dec[i, 8]),
+                "correct": bool(batch.res["success"][i]),
+                "msg_symbols": msg,
+                "msg_text": render_message(self.cfg, msg),
+            })
+
+    # ------------------------------------------------------------------
+    def phase_sampler(self, phase):
+        """How this phase draws evaluation rounds -- lineups, or trades."""
+        if phase.referential and self.referential_world is not None:
+            return lambda n, held_out=False: self.referential_world.sample(n)
+        if self.tensor_world is not None:
+            return lambda n, held_out=False: self.tensor_world.sample(
+                n, held_out=bool(held_out))
+        return None
+
+    def chance_for(self, phase) -> float:
+        """The floor this phase has to clear."""
+        if phase.referential:
+            return 1.0 / max(2, self.cfg.curriculum.n_candidates)
+        return self.chance
+
+    def consider_promotion(self, row: dict[str, Any]) -> None:
+        """Move up a rung only if this one demonstrably worked."""
+        cur = self.curriculum
+        if not self.cfg.curriculum.enabled or cur.finished:
+            return
+        phase = cur.phase
+        rule = promotion_for(self.cfg, phase)
+        comp = row.get("compositionality", {}) or {}
+        abl = row.get("channel_ablation", {}) or {}
+        buyer = comp.get("buyer", {}) if isinstance(comp.get("buyer"), dict) else {}
+        passed, checks = rule.evaluate(
+            success=row.get("eval_success", float("nan")),
+            chance=self.chance_for(phase),
+            topsim=comp.get("mean", float("nan")),
+            null=buyer.get("null_mean", float("nan")),
+            transfer=abl.get("information_transfer", float("nan")),
+            episodes_in_phase=cur.episodes_in_phase)
+        cur.last_report = {"phase": phase.name, "passed": passed, "checks": checks}
+
+        L = self.log
+        if passed:
+            done_in = cur.episodes_in_phase
+            nxt = cur.advance(self.episode, checks)
+            cur.transitions[-1]["episodes_in_previous_phase"] = done_in
+            L("")
+            L("*** PHASE %s -> %s at episode %d ***" % (phase.name, nxt.name, self.episode))
+            L("    %s" % nxt.blurb)
+            L("    promoted because, after %s episodes in %s:" % ("{:,}".format(done_in), phase.name))
+            for name, c in checks.items():
+                L("      met: %-24s %s" % (name, c["detail"]))
+            L("    the population carries its weights forward; nothing is reinitialised.")
+            L("")
+            return
+
+        if cur.episodes_in_phase >= rule.max_episodes:
+            unmet = [k for k, c in checks.items() if not c["met"]]
+            if not cur.stalled:
+                cur.stalled = True
+                L("")
+                L("!!! PHASE %s HAS STALLED at episode %d !!!" % (phase.name, self.episode))
+                L("    %s episodes in this phase without meeting:"
+                  % "{:,}".format(cur.episodes_in_phase))
+                for k in unmet:
+                    L("      unmet: %-24s %s" % (k, checks[k]["detail"]))
+                L("    Not advancing. Building the next phase on top of a phase that")
+                L("    never converged would only reproduce this failure one rung up.")
+                if self.cfg.curriculum.on_stall == "stop":
+                    L("    on_stall=stop: ending the run here.")
+                L("")
+            if self.cfg.curriculum.on_stall == "stop":
+                self._stop_requested = True
 
     # ------------------------------------------------------------------
     def write_progress(self, state: str = "running") -> None:
@@ -290,9 +443,12 @@ class Trainer:
                 return self.metrics_log.rows[-1]
         self._last_checkpoint_episode = self.episode
         t0 = time.time()
+        phase = self.curriculum.phase
+        sampler = self.phase_sampler(phase)
         ev = evaluate_success(cfg, self.pop, self.world,
                               max(200, cfg.log.intelligibility_episodes),
-                              device=self.device, rng=self.eval_rng)
+                              device=self.device, rng=self.eval_rng,
+                              phase=phase, sampler=sampler)
         comp = compositionality(cfg, self.pop, self.world,
                                 n_samples=cfg.log.topsim_samples,
                                 device=self.device, rng=self.eval_rng)
@@ -301,7 +457,8 @@ class Trainer:
         zs = zero_shot(cfg, self.pop, self.world, cfg.log.zeroshot_episodes,
                        device=self.device, rng=self.eval_rng)
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
-                               device=self.device, rng=self.eval_rng)
+                               device=self.device, rng=self.eval_rng,
+                               phase=phase, sampler=sampler)
         newborn_age = max(200, cfg.population.lifespan_min // 6)
         intel = intelligibility(cfg, self.pop, self.world,
                                 cfg.log.intelligibility_episodes,
@@ -321,6 +478,10 @@ class Trainer:
 
         row = {
             "episode": self.episode,
+            "phase": phase.name,
+            "phase_index": phase.index,
+            "episodes_in_phase": self.curriculum.episodes_in_phase,
+            "chance_for_phase": self.chance_for(phase),
             "day": self.economy.day,
             "season": self.economy.season,
             "wall_seconds": round(self.log.elapsed(), 1),
@@ -357,6 +518,9 @@ class Trainer:
             "degenerate_flags": flags,
             "final": final,
         }
+        self.provenance.observe(phase.name, self.episode, words.get("word_counts", {}))
+        row["vocabulary_provenance"] = self.provenance.summary(
+            [p.name for p in self.curriculum.phases])
         self.metrics_log.write(row)
 
         h = self.history
@@ -415,6 +579,7 @@ class Trainer:
         self.print_summary(row, ev, comp, vocab, stab, zs, intel, comp_pop, flags,
                            time.time() - t0, abl, words, lenfreq, buckets, forms)
         self.archive_examples(ev["batch"])
+        self.consider_promotion(row)
         return row
 
     # ------------------------------------------------------------------
@@ -425,15 +590,19 @@ class Trainer:
         cfg = self.cfg
         pct = 100.0 * self.episode / max(1, cfg.train.episodes)
         L("")
-        L.rule("CHECKPOINT  episode %d / %d  (%.1f%%)  day %d  season %d"
-               % (self.episode, cfg.train.episodes, pct, self.economy.day,
-                  self.economy.season))
+        L.rule("CHECKPOINT  episode %d / %d  (%.1f%%)  phase %s"
+               % (self.episode, cfg.train.episodes, pct, self.curriculum.phase.name))
+        L("phase %d of %d: %s  (%s episodes in this phase)"
+          % (self.curriculum.phase.index + 1, len(self.curriculum.phases),
+             self.curriculum.phase.blurb,
+             "{:,}".format(self.curriculum.episodes_in_phase)))
         L("elapsed %.1f min   (metrics took %.1fs)" % (self.log.elapsed() / 60.0, secs))
 
         L("")
         L("TRADE PERFORMANCE")
         L("  success rate      : %.3f eval   %.3f rolling-train   (chance %.4f)"
-          % (ev["success_rate"], self.train_success.mean, self.chance))
+          % (ev["success_rate"], self.train_success.mean,
+             self.chance_for(self.curriculum.phase)))
         L("  on viable deals   : %.3f   (%.0f%% of encounters are viable)"
           % (ev["success_rate_on_viable"], 100 * ev["viable_frac"]))
         L("  reading each other : farmer reads buyer %.3f | buyer reads farmer %.3f"
@@ -615,10 +784,18 @@ class Trainer:
         B = cfg.train.batch_size
         next_ckpt = cfg.log.checkpoint_every
 
-        while self.episode < cfg.train.episodes:
+        while self.episode < cfg.train.episodes and not self._stop_requested:
             n = min(B, cfg.train.episodes - self.episode)
-            if self.tensor_world is not None:
-                f_idx, b_idx = self.pop.pair(n, device=self.device)
+            phase = self.curriculum.phase
+            f_idx, b_idx = self.pop.pair(n, device=self.device)
+            if phase.referential:
+                # The lineup game: no market, no stock, no price -- just meanings.
+                scen = self.referential_world.sample(n)
+            elif not phase.use_market:
+                # Price and budget, but scenarios drawn fresh rather than held as
+                # depleting inventory; the economy is the last thing introduced.
+                scen = self.tensor_world.sample(n)
+            elif self.tensor_world is not None:
                 scen = self.economy.make_batch_tensor(
                     n, len(self.pop.farmers), len(self.pop.buyers),
                     self.tensor_world, f_idx, b_idx)
@@ -630,21 +807,24 @@ class Trainer:
                 from .gumbel import run_and_update_gumbel
                 batch, _ = run_and_update_gumbel(
                     cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
-                    frac_done=frac, device=self.device)
+                    frac_done=frac, device=self.device, phase=phase)
             else:
                 from .rollout import run_episodes
                 batch = run_episodes(cfg, scen, self.pop.farmers, self.pop.buyers,
-                                     f_idx, b_idx, device=self.device)
+                                     f_idx, b_idx, device=self.device, phase=phase)
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
-            settle = (self.economy.settle_tensor(f_idx, batch.res)
-                      if batch.res is not None
-                      else self.economy.settle(f_idx, batch.outcomes))
+            if phase.use_market and batch.res is not None:
+                settle = self.economy.settle_tensor(f_idx, batch.res)
+            elif phase.use_market:
+                settle = self.economy.settle(f_idx, batch.outcomes)
+            else:
+                settle = {"apples_sold": 0, "value": 0.0, "profit": 0.0, "soldout": 0}
             self.totals["apples_sold"] += settle["apples_sold"]
             self.totals["value"] += settle["value"]
             self.totals["profit"] += settle["profit"]
             self.totals["episodes"] += n
-            if batch.res is not None:
+            if batch.res is not None and not phase.referential:
                 from .batched import failure_modes
                 for mode in failure_modes(batch.res):
                     self.failure_counts[mode] = self.failure_counts.get(mode, 0) + 1
@@ -652,6 +832,16 @@ class Trainer:
                 self.totals["trades"] += int(succ.sum())
                 self.train_success.extend(succ.float().tolist())
                 self.train_comprehension.extend(batch.comprehended_t.float().tolist())
+            elif batch.res is not None:
+                # The lineup game has one outcome that matters: did the guess land.
+                succ = batch.success_t
+                hits = int(succ.sum())
+                self.failure_counts["lineup_hit"] = (
+                    self.failure_counts.get("lineup_hit", 0) + hits)
+                self.failure_counts["lineup_miss"] = (
+                    self.failure_counts.get("lineup_miss", 0) + (len(batch) - hits))
+                self.train_success.extend(succ.float().tolist())
+                self.train_comprehension.extend(succ.float().tolist())
             else:
                 for o in batch.outcomes:
                     self.failure_counts[o.failure_mode] = (
@@ -663,7 +853,11 @@ class Trainer:
             self.train_reward.extend(
                 (o.farmer_reward + o.buyer_reward) / 2 for o in batch.outcomes)
 
-            self.ledger.write_batch(batch, self.pop, self.episode, self.economy.season)
+            if phase.referential:
+                self.write_lineups(batch, scen, self.episode)
+            else:
+                self.ledger.write_batch(batch, self.pop, self.episode,
+                                        self.economy.season)
             self.store.add_batch(batch, self.pop.farmers, self.pop.buyers, self.episode)
 
             if cfg.train.algo != "gumbel":
@@ -672,6 +866,7 @@ class Trainer:
                               frac_done=frac, device=self.device)
 
             self.episode += n
+            self.curriculum.episodes_in_phase += n
             self.pop.turn_over(self.episode, on_birth=self.on_birth)
             self.write_progress()
 
@@ -711,6 +906,7 @@ class Trainer:
             if self.forms is not None:
                 row["form_events"] = self.forms.report_rows()
                 row["form_timeline"] = self.forms.timeline()
+            row["curriculum"] = self.curriculum_report()
             write_report(self.cfg, self.out_dir, final=row, chance=self.chance, sem=sem,
                          archive=self.archive, totals=self.totals,
                          history=self.history.to_dict(),
@@ -740,6 +936,7 @@ class Trainer:
         self.ledger.close()
         self.metrics_log.close()
         self.birth_log.close()
+        self.lineup_log.close()
         with open(os.path.join(self.out_dir, "history.json"), "w", encoding="utf-8") as fh:
             json.dump(self.history.to_dict(), fh, indent=1)
         self.log.close()

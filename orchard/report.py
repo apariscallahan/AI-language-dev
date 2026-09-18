@@ -322,6 +322,58 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     L.extend(_position_lines(sem))
     A("")
 
+    A("## 3a. The curriculum")
+    A("")
+    cur = final.get("curriculum", {}) or {}
+    if not cur.get("enabled", False):
+        A("The curriculum was off: agents faced the full trading task from random "
+          "weights.")
+        A("")
+    else:
+        phases = cur.get("phases", [])
+        reached = cur.get("reached", "?")
+        A("Agents work up a ladder, and only leave a rung once it has demonstrably "
+          "worked -- success clear of chance, topological similarity clear of its "
+          "shuffled null, and muting the channel actually costing something. "
+          "Weights carry across every transition; nothing is reinitialised.")
+        A("")
+        A("| rung | phase | reached |")
+        A("|---|---|---|")
+        for i, name in enumerate(phases):
+            mark = ("**yes**" if i <= cur.get("reached_index", 0) else "no")
+            A("| %d | `%s` | %s |" % (i + 1, name, mark))
+        A("")
+        A("Furthest rung reached: **%s** (%s episodes in it at the end)."
+          % (reached, "{:,}".format(int(g(cur, "episodes_in_current_phase", 0)))))
+        A("")
+        trans = cur.get("transitions") or []
+        if trans:
+            A("### Transitions, and why each one happened")
+            A("")
+            for t in trans:
+                A("**%s -> %s** at episode %s, after %s episodes in `%s`:"
+                  % (t.get("from"), t.get("to"), "{:,}".format(t.get("episode", 0)),
+                     "{:,}".format(t.get("episodes_in_previous_phase") or 0),
+                     t.get("from")))
+                A("")
+                for k, c in (t.get("criteria") or {}).items():
+                    A("- %s: %s" % (k, c.get("detail")))
+                A("")
+        else:
+            A("No transition happened during this run.")
+            A("")
+        if cur.get("stalled"):
+            last = cur.get("last_promotion_check") or {}
+            A("> **This phase stalled.** It ran past its episode budget without "
+              "meeting the promotion criteria, so the run did not advance -- "
+              "building the next phase on top of one that never converged would "
+              "only reproduce the failure a rung higher. Unmet at the last check:")
+            A(">")
+            for k, c in (last.get("checks") or {}).items():
+                if not c.get("met"):
+                    A("> - %s: %s" % (k, c.get("detail")))
+            A("")
+
     A("## 3b. The vocabulary that emerged")
     A("")
     words = final.get("words", {}) or {}
@@ -365,6 +417,53 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
                   % (k, rec["dimension"], rec["typical"], rec["score"],
                      100 * rec.get("usage", 0.0)))
             A("")
+
+    A("### Where the vocabulary came from")
+    A("")
+    A("Some of the structure visible at the end was inherited from the lineup "
+      "game rather than caused by negotiation. Claiming otherwise without "
+      "checking would be crediting a pressure that was not responsible, so every "
+      "word is stamped with the phase it first appeared in.")
+    A("")
+    prov = (cur.get("provenance") or {}) if cur else {}
+    if prov.get("n_words"):
+        A("| phase | words first seen here | words that settled here | word tokens |")
+        A("|---|---|---|---|")
+        for name in prov.get("phases", []):
+            d = prov.get(name) or {}
+            A("| `%s` | %d | %d | %s |"
+              % (name, int(d.get("first_appeared", 0)),
+                 int(d.get("settled_here", 0)),
+                 "{:,}".format(int(d.get("word_tokens", 0)))))
+        A("")
+        inh = cur.get("inherited") or {}
+        if inh:
+            A("| later phase | words in use | inherited from `refer` | new here | inherited share |")
+            A("|---|---|---|---|---|")
+            for name, d in inh.items():
+                A("| `%s` | %d | %d | %d | %.0f%% |"
+                  % (name, int(d.get("words_in_use", 0)),
+                     int(d.get("inherited_from_refer", 0)), int(d.get("new_here", 0)),
+                     100 * float(d.get("inherited_share", 0.0))))
+            A("")
+        new_words = cur.get("new_words") or {}
+        for name, rows in new_words.items():
+            if not rows:
+                continue
+            A("Words that first appeared in `%s` -- this is where to look for "
+              "anything the lineup game had no reason to invent, such as offer, "
+              "counter-offer, accept or refuse:" % name)
+            A("")
+            A("| word | uses in this phase | settled here | first seen |")
+            A("|---|---|---|---|")
+            for r in rows[:10]:
+                A("| `%s` | %d | %s | episode %s |"
+                  % (r["word"], r["count"], "yes" if r["settled"] else "no",
+                     "{:,}".format(r["first_episode"])))
+            A("")
+    else:
+        A("No vocabulary was recorded.")
+        A("")
 
     A("## 3c. Do common meanings get short words?")
     A("")
@@ -439,6 +538,24 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
           % (g(fs, "changed_frequent"), g(fs, "changed_rare")))
         A("| outright replacements logged | %d | %d |"
           % (int(g(fs, "n_events_frequent", 0)), int(g(fs, "n_events_rare", 0))))
+        A("")
+        A("| retention | frequent meanings | rare meanings |")
+        A("|---|---|---|")
+        A("| form kept between checkpoints | %.0f%% | %.0f%% |"
+          % (100 * (1 - g(fs, "changed_frequent", 0.0)),
+             100 * (1 - g(fs, "changed_rare", 0.0))))
+        bc = (cur.get("bottleneck_coverage") or {}) if cur else {}
+        if bc:
+            A("| shown to newborns often enough to learn | %.0f%% | %.0f%% |"
+              % (100 * float(bc.get("common_form_coverage", 0.0)),
+                 100 * float(bc.get("rare_form_coverage", 0.0))))
+        A("")
+        A("A newborn now sees essentially the whole parent generation rather than a "
+          "few hundred transcripts, so a form used with any regularity is shown to "
+          "it hundreds of times and transmits reliably. Only genuinely rare forms "
+          "are at real risk of being absent from the sample -- which is the "
+          "asymmetry real vocabularies show, and the reverse of what a small fixed "
+          "sample produces.")
         A("")
         A("Replacements observed: %d, of which %d rebuilt from commoner parts. "
           "Drift at the final checkpoint alone was %.3f (frequent) and %.3f (rare)."
