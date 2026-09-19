@@ -69,8 +69,12 @@ more episodes into each update.
   remain the readable definition of the rules.
 - **Fixed-stride pairings**, so each agent's slice of the batch is a constant and
   the rollout never stalls the device to ask who plays what.
-- **bf16 autocast** on the transformer layers (CUDA only; no loss scaling) and
-  TF32 matmuls.
+- **Full precision, on purpose.** bf16 autocast and TF32 exist (`train.amp`,
+  `train.tf32`) but are off, and a preset cannot turn them on without it being
+  reported as a method change: the GPU then does the CPU's arithmetic, so a CPU
+  check says something about a GPU run. The code forms from very small signals
+  and the models are small enough that the GPU is launch-bound, not
+  arithmetic-bound -- fp32 ran as fast as bf16 on an RTX 4090.
 - **Gradient checkpointing** of each agent's embedding and encoder: memory at a
   4,096 batch went from 56-365 GB to 0.7-9.8 GB depending on the rung.
   `tests/test_config.py` asserts it gives the same update as without it.
@@ -427,6 +431,18 @@ variety and 0.01-0.05 bits of quantity or quality in live messages, e.g.
 `a13-a13-a13-a13` -- because a listener that only ever hears "right" or "wrong"
 never learns what it should have read, and a speaker whose every slot is read
 as variety gets no gradient towards anything else.
+
+**It starts at `refer-mutual`** (`train.hindsight_from_rung`), not before. While
+no code exists yet, a listener told the answer learns -- correctly -- that the
+messages carry nothing: it spreads its guesses evenly (the spread of its choice
+logits fell from 0.5 to 0.17 in 100 updates) and the speaker's gradient, which
+runs through the listener, dies with it. With hindsight on from the first rung
+the lineup code never formed, on the CPU and on the GPU (still at chance after
+2,500 updates); without it, it formed at ~550 updates. So the two rungs where a
+code has to form from nothing -- `refer`, and `refer-swap`, where the buyer
+describes for the first time -- run without it, and it joins where it was meant
+to help: drawing quantity and quality out of a code that already carries
+variety.
 
 Structure is judged by **field coverage** (how much of each field the messages
 carry, chance-corrected), not just positional structure, which that

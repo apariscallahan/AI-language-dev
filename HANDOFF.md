@@ -75,7 +75,8 @@ transmission bottleneck (newborns learn from transcripts, never weights).
 | per-role promotion in swap/mutual, incl. **field coverage** and **per-field decode** checks | `curriculum.evaluate_rung` | a pooled average let a thin code pass |
 | **hard lineup rounds**: an anchor plus one-field near misses, target uniform | `ReferentialWorld._cluster` | random distractors let variety+quality pick the target 69% of the time |
 | **held-out tuple combinations** in lineups | `ReferentialWorld.holdout` | the productivity (zero-shot) test |
-| **hindsight feedback**: scored heads trained towards the outcome; gradient reaches the speaker through the straight-through channel | `curriculum.hindsight_targets`, `gumbel.py` | without it the code locked into variety only (see section 4) |
+| **hindsight feedback**: scored heads trained towards the outcome; gradient reaches the speaker through the straight-through channel. **From `refer-mutual` up only** (`train.hindsight_from_rung`) | `curriculum.hindsight_targets`, `hindsight_applies`, `gumbel.py` | without it the code locked into variety only (see section 4); with it from the start, no code formed at all (item 11) |
+| **full precision** on the GPU (`train.amp`, `train.tf32` off; not preset keys) | `config.py` | the GPU does the CPU's arithmetic; the code forms from ~0.02-logit signals |
 | speaker costs (symbol, coining) **off for the first rung**, on after it | `Trainer.update_cost_gate` | costs during rung 1 capped it |
 | contrastive, symbol-level **convention bonus** | `conventions.py` | coherence across the community |
 | community **founded at 2 + 2**, newcomers join after rung 1 | `Population.add_newcomer`, `Trainer.maybe_grow` | 6 + 6 from scratch never left chance |
@@ -149,6 +150,30 @@ transmission bottleneck (newborns learn from transcripts, never weights).
     replacement; `--checkpoint-every` is now `--checkpoint-every-updates`.
     Snapshots written before this still resume (episode counts are converted
     through that run's batch size).
+
+11. **Hindsight feedback stopped the lineup code forming** (found 2026-09-19).
+    A CPU-scale run on the GPU (6 + 6, d48, batch 256) sat at chance for all
+    2,500 updates of `refer`. Diagnostics, all at batch 256, 2 + 2:
+    | run | result |
+    |---|---|
+    | GPU, old 4-symbol channel, no hindsight, fp32 (arm A) | verdict "beat chance" by 1,000 updates |
+    | GPU, current channel, no hindsight, fp32 (arm C) | verdict "beat chance" by 1,000 updates |
+    | GPU, current channel, hindsight, bf16 (main run) | chance at 2,500 updates |
+    | CPU core loop, old channel, no hindsight | 0.25 until ~500, **0.39 at 600** and rising |
+    | CPU core loop, old channel, hindsight | 0.25 at 600, speaker entropy flat at maximum |
+    Mechanism (measured): in both cases the listener stops reacting to the
+    still-random messages within ~25 updates (message sensitivity 0.15 ->
+    0.02 in logits). Without hindsight it still forms confident, arbitrary
+    preferences (choice-logit spread 0.5 -> 0.9), and REINFORCE's feedback
+    through it eventually breaks the symmetry. With hindsight the supervised
+    loss correctly teaches it that the messages are uninformative, so it goes
+    near-uniform (spread 0.5 -> 0.17) and the speaker's gradient dies with it.
+    Fix: hindsight only from `refer-mutual` up. Also found by the same runs:
+    a `NameError` in `detect_degenerate` (a leftover of the updates rename) that
+    crashed two arms at their first settled checkpoint -- fixed and now tested.
+    Also: the GPU now runs in full precision (bf16/TF32 off), so CPU checks and
+    GPU runs compute the same thing. **Lift-off takes ~550 updates: do not read
+    "chance at update 200" as failure.**
 
 ## 5. What is NOT validated yet -- your first job
 
@@ -256,7 +281,8 @@ estimate for `gpu_community`; treat `gpu_full` as blocked on priority 1.
 
 ## 7. Known risks and ideas, if things stall
 
-- **Code stays variety-only despite hindsight**: raise `train.hindsight_coef`;
+- **Code stays variety-only despite hindsight** (it now starts at
+  `refer-mutual`): raise `train.hindsight_coef`;
   check the listener's candidate embedding (`CommNet.choice_logits`) actually
   gets gradient for quantity/quality; consider more hard rounds
   (`curriculum.hard_distractor_frac`).

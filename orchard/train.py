@@ -753,6 +753,9 @@ class Trainer:
         L("algorithm          : straight-through Gumbel-softmax on message tokens + "
           "REINFORCE on the decisions; temperature %.1f->%.1f over %d updates"
           % (c.train.gumbel_tau, c.train.gumbel_tau_final, c.train.tau_anneal_updates))
+        L("hindsight feedback : %s" % (
+            "off" if c.train.hindsight_coef <= 0 else
+            "from `%s` up (off while the first codes form)" % c.train.hindsight_from_rung))
         L("agent brain        : %d-layer transformer, d=%d, %d params, RANDOMLY INITIALISED"
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))

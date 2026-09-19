@@ -179,5 +179,63 @@ class TestGradientCheckpointingChangesNothing(unittest.TestCase):
                 self.assertTrue(torch.allclose(p0, p1, atol=1e-5), name)
 
 
+class TestTheCodeCanForm(unittest.TestCase):
+    """Guards for what stopped the lineup code forming on the GPU."""
+
+    def test_no_hindsight_while_a_code_has_to_form(self):
+        # A listener told the answer learns that the (still random) messages
+        # carry nothing, and the speaker's gradient dies with it: with hindsight
+        # from the start the lineup never left chance.
+        from orchard import gumbel
+        from orchard.agents import make_agent
+        from orchard.curriculum import ReferentialWorld, ladder, phase_named
+        from orchard.env import BUYER, FARMER
+        cfg = method_at_test_scale()
+        cfg.model.d_model, cfg.model.d_ff = 32, 64
+        cfg.channel.max_symbols = 4
+        names = [p.name for p in ladder(cfg)]
+        self.assertLess(names.index("refer-swap"), names.index(cfg.train.hindsight_from_rung))
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
+        f = [make_agent(cfg, agent_id=0, role=FARMER, slot=0, generation=0,
+                        birth_episode=0, lifespan=10 ** 9)]
+        b = [make_agent(cfg, agent_id=1, role=BUYER, slot=0, generation=0,
+                        birth_episode=0, lifespan=10 ** 9)]
+        z = torch.zeros(16, dtype=torch.long)
+        calls = []
+        real = gumbel.hindsight_targets
+        gumbel.hindsight_targets = lambda *a, **k: calls.append(a[1].name) or real(*a, **k)
+        try:
+            for name in ("refer", "refer-swap", "refer-mutual"):
+                ph = phase_named(cfg, name)
+                for view in ph.views():
+                    scen = (rw.sample_mutual(16) if ph.mutual
+                            else rw.sample(16, informer=view.informer))
+                    gumbel.run_and_update_gumbel(cfg, scen, f, b, z, z, phase=view)
+        finally:
+            gumbel.hindsight_targets = real
+        self.assertEqual(calls, ["refer-mutual"])
+
+    def test_the_gpu_does_the_cpus_arithmetic(self):
+        cfg = Config()
+        self.assertFalse(cfg.train.amp)
+        self.assertFalse(cfg.train.tf32)
+        self.assertNotIn("train.amp", PRESET_KEYS)
+        self.assertNotIn("train.tf32", PRESET_KEYS)
+
+    def test_degenerate_flags_after_the_run_has_settled(self):
+        # this branch only runs at a settled checkpoint and once crashed a run
+        from orchard.metrics import detect_degenerate
+        cfg = method_at_test_scale()
+        vocab = {"token_entropy_norm": 0.5, "tokens_used": 10, "silent_frac": 0.0,
+                 "mean_msg_len": 2.0}
+        flags = detect_degenerate(cfg, 0.25, 0.25, vocab, {"mean": 0.0},
+                                  10 * cfg.log.checkpoint_every_updates,
+                                  ablation={"information_transfer": 0.0})
+        self.assertTrue(any("NO COMPOSITIONAL STRUCTURE" in f for f in flags))
+        self.assertTrue(any("CHANCE" in f for f in flags))
+        self.assertEqual(detect_degenerate(cfg, 0.2, float("nan"), vocab, {"mean": 0.5}, 10 ** 6),
+                         [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

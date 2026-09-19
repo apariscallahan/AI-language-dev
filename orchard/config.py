@@ -509,6 +509,17 @@ class TrainConfig:
     # towards the outcome (the target, the partner's meaning, the order), and the
     # gradient reaches the speaker through the straight-through channel.
     hindsight_coef: float = 1.0
+    # ...but only from this rung up. While no code exists yet, a listener told
+    # the answer learns, correctly, that the messages carry nothing: it spreads
+    # its guesses evenly (choice-logit spread 0.5 -> 0.17 in 100 updates) and
+    # the speaker's gradient through it dies with it. Measured on the lineup,
+    # CPU and GPU alike: with hindsight on from the start the code never formed
+    # (chance after 2,500 updates); without it, it formed at ~550 updates. So the
+    # rungs where a code has to form from nothing -- `refer`, and `refer-swap`,
+    # where the buyer describes for the first time -- run without it, and it
+    # joins at `refer-mutual`, the rung it was added for (drawing quantity and
+    # quality out of a code that already carries variety).
+    hindsight_from_rung: str = "refer-mutual"
     episodes: int = 60_000_000            # the run's ceiling; rung budgets stop it earlier
     batch_size: int = 4096                # episodes per update (x rung_batch_scale)
     lr: float = 3e-4
@@ -531,15 +542,20 @@ class TrainConfig:
     device: str = "auto"
     torch_threads: int = 4
     # bfloat16 autocast on the transformer layers, CUDA only (ignored on CPU).
-    # bf16 rather than fp16: no loss scaling needed.
-    amp: bool = True
+    # Off: the GPU then does the CPU's arithmetic exactly, so a CPU check says
+    # something about a GPU run. A code forms here from very small signals (the
+    # listener's sensitivity to a message is ~0.02 in logits before lift-off),
+    # and bf16 keeps 8 bits of mantissa. The models are small enough that the
+    # GPU is limited by the number of kernel launches, not arithmetic: fp32 ran
+    # as fast as bf16 in the RTX 4090 diagnostics.
+    amp: bool = False
     # Recompute encoder activations in the backward pass instead of keeping them.
     # The Gumbel path builds one graph spanning every symbol step of an episode,
     # so activation memory grows as batch x sequence x width x symbol-steps and is
     # what limits big configurations long before parameter count does.  Costs
     # roughly 30% more compute and buys back most of that memory.
     grad_checkpoint: bool = True
-    tf32: bool = True               # allow TF32 matmuls on Ampere and later
+    tf32: bool = False              # TF32 matmuls on Ampere+: off for the same reason as amp
 
 
 # --------------------------------------------------------------------------
@@ -658,14 +674,15 @@ LEGACY_KEYS = {
 # --------------------------------------------------------------------------
 # Scale, hardware and output. Everything else is the method and lives in the
 # defaults above; tests/test_config.py fails if a preset in configs/ sets
-# anything outside this list (plus its entry in PRESET_EXTRA_KEYS).
+# anything outside this list (plus its entry in PRESET_EXTRA_KEYS). Lower-
+# precision arithmetic (train.amp, train.tf32) is deliberately *not* here: it
+# would make a GPU run compute something a CPU check does not.
 PRESET_KEYS = frozenset({
     "name",
     "population.n_farmers", "population.n_buyers",
     "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
     "train.episodes", "train.batch_size", "train.rung_batch_scale", "train.seed",
-    "train.device", "train.torch_threads", "train.amp", "train.grad_checkpoint",
-    "train.tf32",
+    "train.device", "train.torch_threads", "train.grad_checkpoint",
     "bottleneck.batch_size",
     "curriculum.on_stall", "curriculum.start_phase",
 }) | frozenset("log." + f.name for f in dataclasses.fields(LogConfig))
@@ -862,6 +879,8 @@ def validate(cfg: Config) -> None:
     p = cfg.population
     assert p.n_farmers >= 1 and p.n_buyers >= 1
     assert p.lifespan_min <= p.lifespan_max
+    from .curriculum import phase_named
+    phase_named(cfg, cfg.train.hindsight_from_rung)          # must name a rung
     for name, (lo, hi) in dict(cfg.curriculum.rung_budget_updates).items():
         assert 0 <= int(lo) <= int(hi), "rung %s: budget must be (min, max) updates" % name
     assert cfg.curriculum.check_every_updates >= 1

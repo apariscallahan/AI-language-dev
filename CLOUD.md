@@ -32,7 +32,7 @@ bash cloud_run.sh                               # the full pipeline, timestamped
 **The method is the code defaults in `orchard/config.py`; a preset only changes
 scale.** Every preset runs the seven-rung ladder (`refer`, `refer-swap`,
 `refer-mutual`, `order`, `haggle`, `bargain`, `market`), per-role promotion, hard
-lineup rounds, held-out combinations, hindsight feedback, the word grammar,
+lineup rounds, held-out combinations, hindsight feedback (from `refer-mutual`), the word grammar,
 speaker pressures, and a community **founded by 2 farmers and 2 buyers that
 grows** to full size once the first rung is passed. A preset may set only the
 keys in `PRESET_KEYS` (community size, brain size, batch, run length, hardware
@@ -136,6 +136,11 @@ slowed its learning -- a 2.4M-episode run was still at temperature 1.36 after
   (variety / quantity / quality), coherence, cross-role overlap, word counts;
 - **rung transitions** and **budget stops** with every criterion;
 - the **final verdict** and the report path.
+
+**Expect chance for a while.** The lineup code forms suddenly, and late: the
+CPU runs that worked sat at 0.25 (chance) until ~300-550 updates, then climbed
+past 0.4 within about 50 updates. Chance at update 200 is normal; chance at
+update 1,500 is not.
 
 Everything else goes to the run folder:
 

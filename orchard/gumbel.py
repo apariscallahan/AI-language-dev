@@ -41,8 +41,9 @@ from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, grammar_allowed, resolve, speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
 from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch, Phase,
-                         ReferentialBatch, hindsight_targets, ladder, phase_schema,
-                         resolve_mutual, resolve_order, resolve_referential)
+                         ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
+                         phase_schema, resolve_mutual, resolve_order,
+                         resolve_referential)
 from .rollout import (BatchRollout, UpdateStats, anneal, group_by_agent,
                       n_outputs, split_decision)
 from .world import Scenario
@@ -183,8 +184,9 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     dec_logp: dict[int, torch.Tensor] = {}
     dec_ent: dict[int, torch.Tensor] = {}
     dec_value: dict[int, torch.Tensor] = {}
+    use_hindsight = train and batched and hindsight_applies(cfg, phase)
     targets = (hindsight_targets(cfg, phase, scenarios)
-               if train and batched and t.hindsight_coef > 0 else {FARMER: {}, BUYER: {}})
+               if use_hindsight else {FARMER: {}, BUYER: {}})
     head_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
@@ -364,7 +366,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                         -(adv_c * chosen * mask).sum() / denom)
 
     # hindsight feedback: every scored head is pulled towards the outcome
-    if t.hindsight_coef > 0:
+    if use_hindsight:
         for role in (FARMER, BUYER):
             for col, tgt in targets[role].items():
                 lp = head_lp[role].get(col)

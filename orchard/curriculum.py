@@ -243,6 +243,13 @@ def phase_named(cfg: Config, name: str) -> Phase:
     raise KeyError("no phase called %r" % (name,))
 
 
+def hindsight_applies(cfg: Config, phase: Phase) -> bool:
+    """Is hindsight feedback on in this rung? (``train.hindsight_from_rung``)"""
+    if cfg.train.hindsight_coef <= 0:
+        return False
+    return phase.index >= phase_named(cfg, cfg.train.hindsight_from_rung).index
+
+
 def rung_budget(cfg: Config, phase: Phase) -> tuple[int, int]:
     """(minimum, maximum) training updates this rung may take."""
     c = cfg.curriculum

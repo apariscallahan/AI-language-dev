@@ -1338,8 +1338,8 @@ def detect_degenerate(cfg: Config, success_rate: float, chance_rate: float,
                      % (vocab["mean_msg_len"], cfg.channel.max_msg_len))
     m = comp.get("mean", float("nan"))
     if settled and m == m and m < 0.05:
-        flags.append("NO COMPOSITIONAL STRUCTURE: topsim %.3f after %d episodes"
-                     % (m, episodes_done))
+        flags.append("NO COMPOSITIONAL STRUCTURE: topsim %.3f after %d updates"
+                     % (m, updates_done))
     if settled and ablation:
         t = ablation.get("information_transfer")
         if isinstance(t, float) and t == t and t < 0.05:

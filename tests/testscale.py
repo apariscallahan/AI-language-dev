@@ -21,7 +21,6 @@ def method_at_test_scale() -> Config:
     cfg.train.batch_size = 64
     cfg.train.episodes = 200_000
     cfg.train.rung_batch_scale = {}
-    cfg.train.amp = False                 # CUDA-only anyway
     cfg.train.grad_checkpoint = False     # same numbers, slower on CPU (tested separately)
     cfg.bottleneck.batch_size = 256
     cfg.log.ledger_stride = 1
