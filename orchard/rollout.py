@@ -405,10 +405,11 @@ def read_positions_for(cfg: Config, role: int, device: str = "cpu") -> torch.Ten
                         dtype=torch.long, device=device)
 
 
-def anneal(start: float, end: float, frac_done: float, anneal_frac: float) -> float:
-    if anneal_frac <= 0:
+def anneal(start: float, end: float, done: float, over: float) -> float:
+    """Linear from ``start`` to ``end`` over the first ``over`` units (updates)."""
+    if over <= 0:
         return end
-    t = min(1.0, max(0.0, frac_done / anneal_frac))
+    t = min(1.0, max(0.0, done / over))
     return start + (end - start) * t
 
 
@@ -421,98 +422,3 @@ class UpdateStats:
     grad_norm: float = 0.0
     n_agents: int = 0
     n_actions: int = 0
-
-
-def update_agents(cfg: Config, batch: BatchRollout, farmers: Sequence[Agent],
-                  buyers: Sequence[Agent], *, frac_done: float = 0.0,
-                  device: str = "cpu") -> UpdateStats:
-    """One REINFORCE-with-baseline step for every agent that appeared in the batch."""
-    t = cfg.train
-    ent_tok_coef = anneal(t.entropy_coef, t.entropy_coef_final, frac_done, t.entropy_anneal_frac)
-    ent_dec_coef = anneal(t.decision_entropy_coef, t.decision_entropy_coef_final,
-                          frac_done, t.entropy_anneal_frac)
-    stats = UpdateStats()
-
-    for role in (FARMER, BUYER):
-        pool = farmers if role == FARMER else buyers
-        idx = batch.idx_for_role(role)
-        obs_all = batch.obs_for_role(role)
-        rew_all = batch.reward_for_role(role).to(device).float()
-        dec_all = batch.dec_for_role(role)
-        own_pos = own_dialogue_positions(cfg, role)
-        read_pos = read_positions_for(cfg, role, device)
-
-        # Standardise returns across the whole batch (not per agent -- per-agent
-        # slices are tiny and their std is noise).
-        if t.normalise_adv and rew_all.numel() > 1:
-            ret = (rew_all - rew_all.mean()) / (rew_all.std(unbiased=False) + 1e-6)
-        else:
-            ret = rew_all
-
-        for a_i, ep in group_by_agent(idx):
-            agent = pool[a_i]
-            obs = obs_all[ep]
-            toks = batch.tokens[ep]
-            own_toks = toks[:, own_pos]                       # (n, K)
-            own_mask = batch.active[ep][:, own_pos].float()   # (n, K)
-            R = ret[ep]                                       # (n,)
-
-            tok_logits, tok_values, dec_logits, dec_value = agent.net.full_pass(
-                obs, toks, read_pos)
-            from .env import MASKED, grammar_mask_for_positions
-            tok_logits = tok_logits.masked_fill(
-                ~grammar_mask_for_positions(cfg, toks, own_pos), MASKED)
-
-            logp_all = F.log_softmax(tok_logits, dim=-1)
-            # Slots the agent never actually spoke hold PAD, which is not an
-            # emittable id; index them at 0 and zero them out via own_mask.
-            safe_toks = torch.where(own_mask.bool(), own_toks,
-                                    torch.zeros_like(own_toks))
-            logp = logp_all.gather(-1, safe_toks.unsqueeze(-1)).squeeze(-1)   # (n, K)
-            ent = -(logp_all.exp() * logp_all).sum(-1)                        # (n, K)
-
-            adv_tok = (R.unsqueeze(1) - tok_values).detach()
-            denom = own_mask.sum().clamp(min=1.0)
-            pl_tok = -(adv_tok * logp * own_mask).sum() / denom
-            ent_tok = (ent * own_mask).sum() / denom
-            vl_tok = (((tok_values - R.unsqueeze(1)) ** 2) * own_mask).sum() / denom
-
-            dec_logp = torch.zeros_like(R)
-            dec_ent = torch.zeros_like(R)
-            for col, lg in enumerate(dec_logits):
-                lp = F.log_softmax(lg, dim=-1)
-                wgt = 1.0 if col < 4 else cfg.reward.belief_grad_weight
-                dec_logp = dec_logp + wgt * lp.gather(
-                    -1, dec_all[ep][:, col:col + 1]).squeeze(-1)
-                dec_ent = dec_ent + (-(lp.exp() * lp).sum(-1))
-            dec_ent = dec_ent / max(1, len(dec_logits))
-            adv_dec = (R - dec_value).detach()
-            pl_dec = -(adv_dec * dec_logp).mean()
-            vl_dec = ((dec_value - R) ** 2).mean()
-
-            loss = (pl_tok + pl_dec
-                    + t.value_coef * (vl_tok + vl_dec)
-                    - ent_tok_coef * ent_tok
-                    - ent_dec_coef * dec_ent.mean())
-
-            agent.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            gn = torch.nn.utils.clip_grad_norm_(agent.net.parameters(), t.grad_clip)
-            agent.opt.step()
-
-            stats.policy_loss += float(pl_tok.detach() + pl_dec.detach())
-            stats.value_loss += float((vl_tok + vl_dec).detach())
-            stats.token_entropy += float(ent_tok.detach())
-            stats.decision_entropy += float(dec_ent.mean().detach())
-            stats.grad_norm += float(gn)
-            stats.n_agents += 1
-            stats.n_actions += int(own_mask.sum())
-
-    if stats.n_agents:
-        n = stats.n_agents
-        stats.policy_loss /= n
-        stats.value_loss /= n
-        stats.token_entropy /= n
-        stats.decision_entropy /= n
-        stats.grad_norm /= n
-    return stats

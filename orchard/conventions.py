@@ -35,7 +35,9 @@ anything:
   so a word-level bonus was zero nearly everywhere and six farmers stayed on six
   private codes (coherence 0.05).
 
-"Recent" is an exponentially-decayed count with a half-life in episodes, so a
+"Recent" is an exponentially-decayed count with a half-life in training updates
+(``reward.usage_half_life_updates``: the same span of learning at any batch
+size), so a
 convention can still change -- it just has to win over the population to do it.
 
 Conventions are pooled by *meaning kind*, not by role: in the lineup rungs a
@@ -100,9 +102,9 @@ class PopulationUsage:
         self._rng = random.Random(cfg.train.seed + 31)
 
     # ---- bookkeeping -----------------------------------------------------
-    def _decay(self, n_episodes: int) -> None:
-        hl = max(1, self.cfg.reward.usage_half_life)
-        self.scale *= 0.5 ** (n_episodes / hl)
+    def _decay(self, n_updates: int = 1) -> None:
+        hl = max(1, self.cfg.reward.usage_half_life_updates)
+        self.scale *= 0.5 ** (n_updates / hl)
         if self.scale < 1e-6:
             self._renormalise()
 
@@ -274,8 +276,8 @@ class PopulationUsage:
         return out
 
     def observe(self, terms: dict[int, dict[str, Any]], n_episodes: int) -> None:
-        """Fold a batch that was just played into recent usage."""
-        self._decay(n_episodes)
+        """Fold a batch that was just played -- one training update -- into recent usage."""
+        self._decay(1)
         inc = 1.0 / self.scale
         for role, d in terms.items():
             for ws in d["_words"]:

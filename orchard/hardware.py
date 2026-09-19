@@ -6,7 +6,6 @@ same command works unchanged on a laptop and on a cloud GPU box.
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import torch
 
@@ -54,15 +53,6 @@ def autocast(cfg: Config, dev: torch.device):
     return torch.autocast(device_type=dev.type, enabled=False)
 
 
-def maybe_compile(cfg: Config, module: Any) -> Any:
-    if not cfg.train.compile:
-        return module
-    try:
-        return torch.compile(module, dynamic=True)
-    except Exception:
-        return module
-
-
 def describe(dev: torch.device, cfg: Config) -> str:
     bits = ["device %s" % dev]
     if dev.type == "cuda":
@@ -77,7 +67,6 @@ def describe(dev: torch.device, cfg: Config) -> str:
     if cfg.train.amp:
         bits.append("bf16 autocast on the transformer layers" if dev.type == "cuda"
                     else "amp requested but ignored on CPU (fp32)")
-    if cfg.train.compile:
-        bits.append("compile requested but not wired in (see HANDOFF.md)")
-    bits.append("vectorised world+reward" if cfg.train.vectorised else "scalar world+reward")
+    if cfg.train.grad_checkpoint:
+        bits.append("gradient checkpointing")
     return ", ".join(bits)

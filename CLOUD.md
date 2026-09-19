@@ -1,8 +1,7 @@
 # Running Orchard on a cloud GPU
 
-Everything here is the CLI. The GUI (`Orchard.bat`) is a convenience for a laptop
-and is not needed — and not wanted — on a rented box, where you want to start a
-run over SSH, close the laptop, and come back to a report.
+Orchard runs on a GPU. Start a run over SSH, close the laptop, and come back to
+a report.
 
 ---
 
@@ -30,20 +29,29 @@ bash cloud_run.sh                               # the full pipeline, timestamped
 
 ## 2. The presets
 
-Every preset uses the same method, validated on a CPU at 2 + 2 agents before
-being scaled: the seven-rung ladder (`refer`, `refer-swap`, `refer-mutual`,
-`order`, `haggle`, `bargain`, `market`), per-role promotion, hard lineup rounds,
-held-out combinations, speaker pressures, and a community **founded by 2 farmers
-and 2 buyers that grows** to full size once the first rung is passed. Only the
-scale differs.
+**The method is the code defaults in `orchard/config.py`; a preset only changes
+scale.** Every preset runs the seven-rung ladder (`refer`, `refer-swap`,
+`refer-mutual`, `order`, `haggle`, `bargain`, `market`), per-role promotion, hard
+lineup rounds, held-out combinations, hindsight feedback, the word grammar,
+speaker pressures, and a community **founded by 2 farmers and 2 buyers that
+grows** to full size once the first rung is passed. A preset may set only the
+keys in `PRESET_KEYS` (community size, brain size, batch, run length, hardware
+switches, output) and `tests/test_config.py` fails otherwise. `gpu_community.json`
+is exactly the defaults. The run header's `method` line, and the same row in the
+report's summary statistics, say "the code defaults" or list every setting that
+differs -- `gpu_smoke` (short lives, a plumbing check) and `gpu_duality` (a
+different world, the experiment) are the only presets that list any.
 
-| preset | community | brain | params / agent | episodes | batch | ~generations |
-|---|---|---|---|---|---|---|
-| `gpu_smoke` | 2+2 -> 8+8 | d=64, 2 layers | 87k | 0.5M | 1,024 | 2 |
-| `gpu_small` | 2+2 -> 16+16 | d=64, 2 layers | 87k | 8M | 2,048 | 6 |
-| `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 60M | 4,096 | 12 |
-| `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 4,096 | 6 |
-| `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 2,048 | 6 |
+| preset | community | brain | params / agent | episodes | batch | ~updates | ~generations |
+|---|---|---|---|---|---|---|---|
+| `gpu_smoke` | 2+2 -> 8+8 | d=64, 2 layers | 87k | 0.5M | 1,024 | 490 | 3 |
+| `gpu_small` | 2+2 -> 16+16 | d=64, 2 layers | 87k | 8M | 2,048 | 3,900 | 3 |
+| `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 60M | 4,096 | 14,600 | 12 |
+| `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 4,096 | 19,500 | 16 |
+| `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 2,048 | 19,500 | 16 |
+
+(Updates at the base batch; the lineup rungs run at twice the batch, so they
+take half as many. A run usually ends earlier, at a rung's budget.)
 
 **Memory (24 GB card).** Training backpropagates through every symbol step,
 and each step re-encodes the conversation so far, so activation memory is the
@@ -54,21 +62,25 @@ pass, per 1,000 episodes: lineup rung ~0.2 GB, mutual ~0.7 GB, full market
 rung stays under ~10 GB on a 24 GB card; on a 40-80 GB card they can be doubled
 (`--batch-size`). Without checkpointing the same batch needed 56-365 GB.
 
-**Lifespans are counted in training updates** (`population.lifespan_unit =
-"updates"`, 900-1,600 per agent in the community presets), so an agent's life
-is the same amount of learning whatever the batch size or community size. The
-first GPU run counted episodes: a 4,096-episode batch shared by the 2 + 2
-founders aged each founder 2,048 episodes per update, 16x the CPU runs, so
-founders lived ~50 updates, reached their 8th generation in 1.6M episodes, and
-the lineup never left chance (the CPU runs needed ~550 updates).
+**Everything that means an amount of learning is counted in training updates**
+(one update = one batch): rung budgets (`curriculum.rung_budget_updates`),
+promotion checks (`check_every_updates`, 25), checkpoints
+(`log.checkpoint_every_updates`, 100), the temperature and entropy anneals
+(`train.tau_anneal_updates` 1,000, `entropy_anneal_updates` 800), growth
+(`population.grow_every_updates`, 20), lifespans (900-1,600 updates), and how
+long the population remembers what it has been saying
+(`reward.usage_half_life_updates`, 80). An episode count is a different amount
+of learning at every batch size. The first GPU run counted lifespans in episodes:
+a 4,096-episode batch shared by the 2 + 2 founders aged each founder 2,048
+episodes per update, 16x the CPU runs, so founders lived ~50 updates and the
+lineup never left chance (the CPU runs needed ~550 updates). The usage memory
+had the same problem: 20,000 episodes was ~80 updates on the CPU but ~5 on the
+GPU.
 
 Brains are deliberately small and communities large. A supervised check showed
 the 48k-parameter CPU brain already learns a full compositional code for every
 meaning (100% on combinations it never saw), so capacity is not what limits
-these runs; agent count is what makes "a community" mean something. Rung
-budgets, checkpoint cadence and annealing are all set in optimiser *updates*
-(e.g. a lineup rung may take up to 2,500 updates) and converted to episodes by
-the preset's batch size, so they mean the same thing at every scale.
+these runs; agent count is what makes "a community" mean something.
 
 ```bash
 CONFIG=configs/gpu_community.json bash cloud_run.sh
@@ -79,9 +91,11 @@ never got the lineup game off chance in 200k episodes: each farmer kept its own
 drifting code (coherence 0.04-0.09), so no buyer could learn to read any of them.
 Two and two invent a code in ~80-140k episodes. So every preset founds the
 community at 2 + 2, and after the first rung a newcomer of each role joins every
-`population.grow_every` episodes -- random weights, then the transmission
-bottleneck on the community's transcripts -- until it reaches full size. Every
-rung after the first waits for, and is judged on, the full community.
+20 updates (`population.grow_every_updates`) -- random weights, then the
+transmission bottleneck on the community's transcripts -- until it reaches full
+size. Every rung after the first waits for, and is judged on, the full
+community, and its budget only starts counting once the community is full
+(48 + 48 takes ~900 updates to grow, 128 + 128 ~2,500).
 
 **`gpu_smoke`** -- minutes. Proves the box works end to end and writes every
 artefact. It will usually stop at the first rung's budget: that is the machinery
@@ -105,18 +119,18 @@ nothing pushes towards *duality of patterning* -- meaningless units combining
 into meaningful words. This preset makes that pressure real. It is harder and
 has not been validated on a CPU; treat it as the experiment, not the baseline.
 
-**Anneal schedules are in updates, not run fractions.** The Gumbel temperature
-and the entropy bonus anneal over ~1,000 and ~800 optimiser updates, as in the
-CPU runs that worked. An earlier version annealed over a fraction of the whole
-run, so giving a run more episodes silently slowed its learning -- a 2.4M-episode
-run was still at temperature 1.36 after 200k episodes and never left chance.
+**Anneal schedules are in updates, not run fractions.** An earlier version
+annealed over a fraction of the whole run, so giving a run more episodes silently
+slowed its learning -- a 2.4M-episode run was still at temperature 1.36 after
+200k episodes and never left chance.
 
 ## 2a. What you see while it runs
 
 `cloud_run.sh` keeps the terminal quiet except for:
 
-- one **status line a minute**: time (UTC), episodes done / total, rung, episodes
-  per second, ETA, rolling success, community size, births, peak GPU memory;
+- one **status line a minute**: time (UTC), episodes done / total, the update
+  count, rung and how many of its maximum updates it has used, episodes per
+  second, ETA, rolling success, community size, births, peak GPU memory;
 - a **two-line headline at every checkpoint**: success against the muted
   channel, share of headroom the channel carries, each role's field coverage
   (variety / quantity / quality), coherence, cross-role overlap, word counts;
@@ -194,9 +208,10 @@ python -m orchard.run --config configs/gpu_community.json --out runs/x \
 --set train.grad_checkpoint=true --set log.ledger_stride=500
 ```
 
-**Edit a config file.** The presets are plain JSON; copy one and change it. Every
-run also writes the exact config it used to `<out>/config.json`, so a run is
-always reproducible from its own directory:
+**Edit a config file.** The presets are plain JSON holding only scale; copy one
+and change it. Anything you set beyond scale is printed as a method change in
+the run header and the report. Every run also writes the exact config it used to
+`<out>/config.json`, so a run is always reproducible from its own directory:
 
 ```bash
 python -m orchard.run --config runs/community/config.json --out runs/community_rerun --seed 9
@@ -207,7 +222,7 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 | setting | what it does |
 |---|---|
 | `--curriculum on\|off` | the referential-then-trading ladder. Off means the full task from random weights, which has not been made to work. |
-| `population.founders_farmers/_buyers`, `population.grow_every` | found the community small and grow it after the first rung. 0 founders = start at full size. |
+| `population.founders_farmers/_buyers`, `population.grow_every_updates` | found the community small and grow it after the first rung. 0 founders = start at full size. |
 | `curriculum.hard_distractor_frac` | share of lineup rounds built as one-field near misses, so every field (quantity included) has to be named. |
 | `curriculum.holdout_tuple_frac` | share of (variety, quantity, quality) combinations never trained on: the productivity test. |
 | `curriculum.min_field_transfer`, `curriculum.mutual_qty_tol` | the mutual rung checks every field for every role, quantity exactly. |
@@ -233,16 +248,21 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 Runs start on a lineup game and work up to the full market. Nothing is
 reinitialised between phases; the same population carries its weights forward.
 
-The rungs are `refer`, `refer-swap`, `refer-mutual`, `haggle`, `bargain`,
-`market`. Each has its own (min, max) episode budget:
+The rungs are `refer`, `refer-swap`, `refer-mutual`, `order`, `haggle`,
+`bargain`, `market`. Each has its own (min, max) budget in training updates --
+80 to 2,500 for the lineup rungs and `order`, 80 to 3,500 for `refer-mutual`,
+`haggle` and `bargain`, open for `market`:
 
 ```bash
 --curriculum off                          # straight to the full trading task
 --set curriculum.n_candidates=6           # a harder lineup (chance 1/6)
---set 'curriculum.rung_budgets={"refer":[20000,600000],"refer-swap":[20000,600000],"refer-mutual":[20000,800000],"haggle":[20000,600000],"bargain":[20000,600000],"market":[20000,1000000000000]}'
---set curriculum.check_every=5000         # how often promotion is probed
+--set 'curriculum.rung_budget_updates={"refer":[80,4000],"refer-swap":[80,2500],"refer-mutual":[80,3500],"order":[80,2500],"haggle":[80,3500],"bargain":[80,3500],"market":[80,1000000000]}'
+--set curriculum.check_every_updates=25   # how often promotion is probed
 --on-stall stop                           # end the run on a blown budget (the default)
 ```
+
+(`--set` replaces the whole dict, so name every rung; ones left out fall back to
+`curriculum.default_rung_updates`.)
 
 Promotion needs success clear of chance, topsim clear of its shuffled null, *and*
 the muted-channel control showing a real drop. In `refer-swap` and
@@ -250,7 +270,7 @@ the muted-channel control showing a real drop. In `refer-swap` and
 Thresholds:
 
 ```bash
---set curriculum.refer_min_success=0.55   # lineup rungs
+--set curriculum.refer_min_success=0.45   # lineup rungs
 --set curriculum.trade_min_success=0.15   # trading rungs
 --set curriculum.min_topsim_over_null=0.10
 --set curriculum.min_channel_transfer=0.25
@@ -263,7 +283,7 @@ Speaker pressures (see the README's section on them):
 
 ```bash
 --symbol-cost 0.03
---set reward.rarity_cost=0.05 --set reward.convention=0.15
+--set reward.rarity_cost=0.05 --set reward.convention=0.3
 --set train.shaping_reinforce=0.2
 ```
 
@@ -283,12 +303,12 @@ trades in it.
 
 ## 4. Generations are derived, not set
 
-You cannot ask for N generations directly. An agent ages by the episodes **it
-personally plays**, and dies at its lifespan, so turnover falls out of three
-things together:
+You cannot ask for N generations directly. An agent ages by the training updates
+it takes part in -- nearly every update -- and dies at its lifespan, so turnover
+falls out of run length and lifespan together:
 
 ```
-generations  =  (episodes / n_farmers) / mean_lifespan
+generations  ~  (episodes / batch_size) / mean_lifespan_in_updates
 ```
 
 To get more turnover, either run longer or shorten `population.lifespan_min` and
@@ -300,8 +320,9 @@ python -m orchard.run --config configs/gpu_full.json --benchmark | grep generati
 ```
 
 Lifespans want to stay long enough that an agent can actually learn the language
-before it dies — somewhere north of 20,000 episodes of its own experience — and
-short enough that the population turns over often. The presets sit at 20k–30k.
+before it dies -- the CPU runs needed ~550 updates to invent the lineup code --
+and short enough that the population turns over often. The method uses 900-1,600
+updates.
 
 ---
 
@@ -319,17 +340,17 @@ At `gpu_full`'s shape that is tens of gigabytes before a single parameter is
 counted. `train.grad_checkpoint=true` recomputes encoder activations in the
 backward pass instead of storing them, which cuts that by roughly an order of
 magnitude and costs about 2× compute (measured on CPU; less on a GPU, where the
-recompute is cheaper relative to memory traffic). It is on for `gpu_full` and
-`gpu_community`.
+recompute is cheaper relative to memory traffic). It is on by default and
+`tests/test_config.py` checks it gives the same update as without it.
 
 If you hit an out-of-memory error, in this order:
 
-1. turn on `--set train.grad_checkpoint=true`
-2. halve `--batch-size`
-3. reduce `channel.n_turns` or `channel.max_symbols` — these multiply memory
-   *and* are the hardest thing for the agents to learn over, so shortening them
-   often helps twice
-4. only then shrink `model.d_model`
+1. halve `--batch-size` (a scale setting: the method is unchanged, because
+   every schedule counts updates)
+2. only then shrink `model.d_model`
+
+(`channel.n_turns` and `channel.max_symbols` also multiply memory, but they are
+part of the method: changing them is reported as a method change.)
 
 ---
 
@@ -426,7 +447,7 @@ you kill early still leaves a readable `report.md`, full metrics and a ledger.
 ## 10. Sanity checks before a long run
 
 ```bash
-python -m unittest discover -s tests        # 71 tests, about 25 seconds
+python -m unittest discover -s tests        # 152 tests, one to two minutes
 ```
 
 Worth doing on the cloud box, not just locally — `tests/test_batched.py` asserts

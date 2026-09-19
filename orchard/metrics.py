@@ -1018,14 +1018,11 @@ def intelligibility(cfg: Config, pop: Population, world: World, n: int,
     private cipher that newcomers cannot acquire.
     """
     rng = rng or random.Random(0)
-    by_updates = cfg.population.lifespan_unit == "updates"
-
-    def age(a):
-        return a.updates if by_updates else a.age
-    new_f = [i for i, a in enumerate(pop.farmers) if age(a) <= newborn_age]
-    new_b = [i for i, a in enumerate(pop.buyers) if age(a) <= newborn_age]
-    vet_f = [i for i, a in enumerate(pop.farmers) if age(a) > newborn_age]
-    vet_b = [i for i, a in enumerate(pop.buyers) if age(a) > newborn_age]
+    # ``newborn_age`` is in training updates, like lifespans
+    new_f = [i for i, a in enumerate(pop.farmers) if a.updates <= newborn_age]
+    new_b = [i for i, a in enumerate(pop.buyers) if a.updates <= newborn_age]
+    vet_f = [i for i, a in enumerate(pop.farmers) if a.updates > newborn_age]
+    vet_b = [i for i, a in enumerate(pop.buyers) if a.updates > newborn_age]
 
     res: dict[str, Any] = {"n_newborn_farmers": len(new_f), "n_newborn_buyers": len(new_b),
                            "n_veteran_farmers": len(vet_f), "n_veteran_buyers": len(vet_b)}
@@ -1320,11 +1317,12 @@ def _describe_value(cfg: Config, kind: int, vals: Sequence[int]) -> str:
 # ==========================================================================
 def detect_degenerate(cfg: Config, success_rate: float, chance_rate: float,
                       vocab: dict[str, Any], comp: dict[str, Any],
-                      episodes_done: int, words: Optional[dict[str, Any]] = None,
+                      updates_done: int, words: Optional[dict[str, Any]] = None,
                       ablation: Optional[dict[str, Any]] = None) -> list[str]:
+    """``chance_rate`` is the current rung's (NaN where it has none: no flag)."""
     flags: list[str] = []
-    settled = episodes_done >= max(2000, cfg.log.checkpoint_every * 2)
-    if settled and success_rate <= chance_rate * 1.5:
+    settled = updates_done >= 2 * cfg.log.checkpoint_every_updates
+    if settled and chance_rate == chance_rate and success_rate <= chance_rate * 1.5:
         flags.append("SUCCESS RATE AT OR NEAR CHANCE (%.3f vs chance %.3f)"
                      % (success_rate, chance_rate))
     if vocab["token_entropy_norm"] < 0.15:

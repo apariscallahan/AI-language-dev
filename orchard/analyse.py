@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     from .train import Trainer
 
     st = torch.load(args.snapshot, map_location="cpu", weights_only=False)
-    cfg = Config.from_json(args.config) if args.config else Config.from_dict(st["config"])
+    cfg = Config.from_json(args.config) if args.config else Config.from_dict(st["config"], allow_legacy=True)
     cfg.train.device = args.device
     cfg.log.plot = False
     tag = os.path.splitext(os.path.basename(args.snapshot))[0]

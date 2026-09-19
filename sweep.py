@@ -1,7 +1,7 @@
 """Run one configuration across several seeds and report the spread.
 
-    python sweep.py --config configs/gpu.json --out runs/sweep --seeds 5
-    python sweep.py --config configs/gpu.json --out runs/ablate --seeds 5 \\
+    python sweep.py --config configs/gpu_small.json --out runs/sweep --seeds 5
+    python sweep.py --config configs/gpu_small.json --out runs/ablate --seeds 5 \\
         --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
 
 Why this exists

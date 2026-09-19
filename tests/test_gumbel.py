@@ -20,13 +20,14 @@ import torch.nn.functional as F
 
 from orchard.agents import CommNet, make_agent
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import gumbel_tau, run_and_update_gumbel
 from orchard.world import World
 
 
 def tiny_cfg() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 6
     cfg.world.n_price_bins = 6
@@ -67,7 +68,9 @@ class TestStraightThrough(unittest.TestCase):
 
     def test_tau_anneals(self):
         cfg = tiny_cfg()
-        self.assertGreater(gumbel_tau(cfg, 0.0), gumbel_tau(cfg, 1.0))
+        self.assertGreater(gumbel_tau(cfg, 0), gumbel_tau(cfg, cfg.train.tau_anneal_updates))
+        self.assertEqual(gumbel_tau(cfg, 10 * cfg.train.tau_anneal_updates),
+                         cfg.train.gumbel_tau_final)
 
 
 class TestSpeakerGetsGradientFromListener(unittest.TestCase):
@@ -97,7 +100,7 @@ class TestSpeakerGetsGradientFromListener(unittest.TestCase):
             return orig_step()
         buyers[0].opt.step = capture
 
-        run_and_update_gumbel(cfg, scen, farmers, buyers, f_idx, b_idx, frac_done=0.0)
+        run_and_update_gumbel(cfg, scen, farmers, buyers, f_idx, b_idx, update=0)
         self.assertGreater(grads.get("buyer_token_head", 0.0), 0.0,
                            "no gradient reached the buyer's message head -- the "
                            "speaker->listener path is broken")
@@ -113,7 +116,7 @@ class TestSpeakerGetsGradientFromListener(unittest.TestCase):
             scen = w.sample_batch(32, held_out=False)
             run_and_update_gumbel(cfg, scen, farmers, buyers,
                                   torch.zeros(32, dtype=torch.long),
-                                  torch.zeros(32, dtype=torch.long), frac_done=0.1)
+                                  torch.zeros(32, dtype=torch.long), update=100)
         after = buyers[0].net.token_head.weight.detach()
         self.assertFalse(torch.allclose(before, after))
         self.assertTrue(torch.isfinite(after).all())
@@ -126,7 +129,7 @@ class TestSpeakerGetsGradientFromListener(unittest.TestCase):
         scen = w.sample_batch(24, held_out=False)
         batch, _ = run_and_update_gumbel(
             cfg, scen, farmers, buyers,
-            torch.randint(0, 2, (24,)), torch.randint(0, 2, (24,)), frac_done=0.5)
+            torch.randint(0, 2, (24,)), torch.randint(0, 2, (24,)), update=500)
         c = cfg.channel
         self.assertTrue(bool(((batch.tokens >= 0) & (batch.tokens <= c.pad_id)).all()))
         # nothing may follow END within a turn
@@ -149,7 +152,7 @@ class TestSpeakerGetsGradientFromListener(unittest.TestCase):
         scen = w.sample_batch(32, held_out=False)
         batch, stats = run_and_update_gumbel(
             cfg, scen, farmers, buyers, torch.zeros(32, dtype=torch.long),
-            torch.zeros(32, dtype=torch.long), frac_done=0.0)
+            torch.zeros(32, dtype=torch.long), update=0)
         self.assertEqual(stats.policy_loss, stats.policy_loss)  # finite
         self.assertTrue(torch.isfinite(buyers[0].net.token_head.weight).all())
 

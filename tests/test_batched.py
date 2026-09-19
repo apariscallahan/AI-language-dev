@@ -18,12 +18,13 @@ import torch
 
 from orchard.batched import ScenarioBatch, TensorWorld, resolve_batch
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER, Beliefs, Decision, buyer_obs, farmer_obs, resolve
 from orchard.world import World
 
 
 def cfg_small() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -174,7 +175,10 @@ class TestResolveAgreement(unittest.TestCase):
         self._compare(cfg, n=800, seed=2)
 
     def test_matches_scalar_on_a_bigger_world(self):
-        cfg = Config()          # the spec-scale defaults
+        cfg = method_at_test_scale()      # the original spec's bigger world
+        cfg.world.n_varieties, cfg.world.max_qty = 4, 20
+        cfg.world.n_price_bins, cfg.world.reservation_max_bin = 12, 9
+        cfg.world.zipf_alpha = 0.9
         self._compare(cfg, n=600, seed=3)
 
 

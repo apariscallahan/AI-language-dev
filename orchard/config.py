@@ -5,6 +5,20 @@ population size, vocabulary size, message length, lifespan, etc. -- the whole
 scientific point of the project (spec section 7) is running the *same* code with
 different settings and comparing, so all of it is config-driven and serialisable
 to JSON.
+
+**These defaults are the method.** They are what every run uses unless a preset
+says otherwise, and the presets in ``configs/`` may only change *scale* -- how
+many agents, how big a brain, how large a batch, how long a run, how much
+output (see ``PRESET_KEYS`` and ``tests/test_config.py``). That is what keeps the
+runs from drifting apart: there is one place where the method is written down,
+and it is here. The defaults themselves are the ``gpu_community`` scale.
+
+Anything whose meaning is "an amount of learning" -- rung budgets, how often
+promotion is checked, checkpoints, annealing, community growth, lifespans -- is
+counted in **training updates**, never episodes. An episode count means a
+different amount of learning at every batch size and every population size;
+counting lifespans in episodes once killed each founder after ~50 updates on a
+GPU because 2 founders shared a 4,096-episode batch.
 """
 from __future__ import annotations
 
@@ -20,17 +34,16 @@ from typing import Any
 # --------------------------------------------------------------------------
 @dataclass
 class WorldConfig:
-    n_varieties: int = 4              # RED / GREEN / GOLD / RUSSET
+    n_varieties: int = 3              # RED / GREEN / GOLD
     n_quality: int = 3                # LOW / MED / HIGH
-    max_qty: int = 20                 # quantities 1..max_qty  (spec 1.4: big enough that
-                                      # memorising whole scenarios is infeasible)
-    n_price_bins: int = 12            # "continuous-ish" price discretised onto a fine grid
+    max_qty: int = 8                  # quantities 1..max_qty
+    n_price_bins: int = 6             # price discretised onto a grid
     price_min: float = 1.0
     price_step: float = 0.5
 
     # Farmer stock is sampled uniformly in [1, max_qty].
     # Farmer reservation (cost) price bin sampled in [0, reservation_max_bin].
-    reservation_max_bin: int = 9
+    reservation_max_bin: int = 4
     # Buyer budget ceiling bin sampled in [budget_min_bin, n_price_bins-1].
     budget_min_bin: int = 1
 
@@ -71,7 +84,7 @@ class WorldConfig:
     # variety marginal, 0% at alpha 0.8.  Default is therefore a strong skew on
     # quantity and none on variety.  Both remain tunable, and setting
     # zipf_alpha_variety above 0 is a good way to reproduce that finding.
-    zipf_alpha: float = 0.9            # over requested quantities
+    zipf_alpha: float = 0.3            # over requested quantities
     zipf_alpha_variety: float = 0.0    # over requested varieties
 
     @property
@@ -129,13 +142,13 @@ class ChannelConfig:
     (``RewardConfig.symbol_cost``), and the report flags it if utterances ever
     actually reach the buffer's end.
     """
-    atomic_vocab: int = 36     # meaningless atoms; ids 0 .. atomic_vocab-1
+    atomic_vocab: int = 16     # meaningless atoms; ids 0 .. atomic_vocab-1
                                # HYPHEN = atomic_vocab       joins atoms into a word
                                # SPACE  = atomic_vocab + 1   separates words
                                # END    = atomic_vocab + 2   ends the utterance
                                # PAD    = atomic_vocab + 3   never emitted; fills the slot
     max_symbols: int = 24      # buffer per turn; generous on purpose (the cost sets length)
-    n_turns: int = 6           # alternating turns per negotiation; buyer speaks first
+    n_turns: int = 4           # alternating turns per negotiation; buyer speaks first
     enforce_word_grammar: bool = True   # atoms and HYPHEN/SPACE must alternate
 
     # ---- symbol ids ----------------------------------------------------
@@ -208,10 +221,10 @@ class ChannelConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    d_model: int = 64
-    n_layers: int = 2
+    d_model: int = 96
+    n_layers: int = 3
     n_heads: int = 4
-    d_ff: int = 128
+    d_ff: int = 256
     dropout: float = 0.0
 
 
@@ -266,9 +279,7 @@ class RewardConfig:
     success: float = 1.5            # viable deal, both accept, beliefs agree, feasible
     correct_no_deal: float = 0.25   # not viable, both reject  (the right answer)
     agree_per_dim: float = 0.05     # the two agents' beliefs match, per dimension
-    correct_per_dim: float = 0.10   # this agent's deal decision is right, per dimension
-                                    # (halved when decode/understood arrived: the
-                                    # comprehension signal now lives there instead)
+    correct_per_dim: float = 0.20   # this agent's deal decision is right, per dimension
     judgement: float = 0.25         # this agent's accept/reject matches whether a deal
                                     # was actually possible -- the fourth comprehension
                                     # dimension, and the one that trains the accept head
@@ -304,7 +315,7 @@ class RewardConfig:
     # meaning (1 - normalised edit distance to the modal utterance), not just
     # for being understood by this one partner. Only counts once the
     # convention has ``convention_min_support`` recent uses behind it.
-    convention: float = 0.15
+    convention: float = 0.30
     convention_min_support: int = 12
     # Whether the convention bonus waits for a working channel like the costs do.
     # Measured: ungated, even strongly weighted, it raised coherence among six
@@ -312,7 +323,11 @@ class RewardConfig:
     # chance -- a population that size needs founding small (see
     # population.founders_*), after which the bonus is fully on anyway.
     convention_gated: bool = True
-    usage_half_life: int = 20_000    # episodes; how "recent" recent usage is
+    # How "recent" the population's recent usage is, in training updates. (It
+    # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
+    # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
+    # chasing a 16x shorter memory of the language on the GPU.)
+    usage_half_life_updates: int = 80
 
 
 # --------------------------------------------------------------------------
@@ -342,28 +357,28 @@ class CurriculumConfig:
     n_candidates: int = 4            # lineup size in the referential phase
 
     # ---- promotion, on evidence rather than on a schedule -----------------
-    # Fallback budget for a rung not named in ``rung_budgets``.
-    min_episodes_per_phase: int = 20_000
-    max_episodes_per_phase: int = 400_000
-    # (minimum, maximum) episodes per rung. A rung that meets its criteria after
-    # its minimum is left at the next check; one that reaches its maximum
-    # without meeting them ends the run with a report (see ``on_stall``).
-    rung_budgets: dict = field(default_factory=lambda: {
-        "refer": [20_000, 250_000],
-        "refer-swap": [20_000, 250_000],
-        "refer-mutual": [20_000, 300_000],
-        "order": [20_000, 300_000],
-        "haggle": [20_000, 300_000],
-        "bargain": [20_000, 300_000],
-        "market": [20_000, 10**12],
+    # (minimum, maximum) training updates per rung. A rung that meets its
+    # criteria after its minimum is left at the next check; one that reaches its
+    # maximum without meeting them ends the run with a report (``on_stall``).
+    # The CPU runs took the lineup off at ~550 updates. Rungs not named use
+    # ``default_rung_updates``.
+    rung_budget_updates: dict = field(default_factory=lambda: {
+        "refer": [80, 2500],
+        "refer-swap": [80, 2500],
+        "refer-mutual": [80, 3500],
+        "order": [80, 2500],
+        "haggle": [80, 3500],
+        "bargain": [80, 3500],
+        "market": [80, 10**9],
     })
+    default_rung_updates: list = field(default_factory=lambda: [80, 2500])
     # Promotion is checked this often -- a light probe of just the evidence the
     # rung needs -- rather than only at the (much heavier) full checkpoints.
-    check_every: int = 5_000
+    check_every_updates: int = 25
     # Start partway up the ladder (a rung name), e.g. to exercise later rungs.
     # Empty = the bottom rung, which is what every real run should use.
     start_phase: str = ""
-    refer_min_success: float = 0.55    # vs 1/n_candidates by chance
+    refer_min_success: float = 0.45    # vs 1/n_candidates by chance
     trade_min_success: float = 0.15
     min_success_over_chance: float = 2.0
     min_topsim_over_null: float = 0.10
@@ -399,29 +414,25 @@ class CurriculumConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class PopulationConfig:
-    n_farmers: int = 8
-    n_buyers: int = 8
+    n_farmers: int = 48
+    n_buyers: int = 48
     # A community can be founded small and grow to n_farmers / n_buyers. With
     # founders > 0 the run starts with that many of each, and once the first
     # curriculum rung has been passed a newcomer of each role joins every
-    # ``grow_every`` episodes. Newcomers are born like any newborn -- random
+    # ``grow_every_updates`` updates. Newcomers are born like any newborn -- random
     # weights, then the transmission bottleneck on the community's transcripts --
     # so they learn the existing language rather than inventing one. Measured:
     # six speakers and six listeners from random weights kept six private,
     # drifting codes and the lineup never left chance in 200k episodes, where two
     # and two invent one in ~80k. 0 = start at full size.
-    founders_farmers: int = 0
-    founders_buyers: int = 0
-    grow_every: int = 10_000
+    founders_farmers: int = 2
+    founders_buyers: int = 2
+    grow_every_updates: int = 20
     turnover: bool = True                 # master switch for birth/death (spec 9)
-    lifespan_min: int = 6000              # in lifespan_unit (below)
-    lifespan_max: int = 12000
-    # What an agent's age counts. "episodes": episodes it played. "updates":
-    # training updates it took part in -- how much it has actually learned, the
-    # same at any batch size or population size. With "episodes", a 4,096-episode
-    # batch shared by 2 founders ages each founder 2,048 episodes per update, 16x
-    # the CPU runs': founders lived ~50 updates and never learned the lineup.
-    lifespan_unit: str = "episodes"
+    # In training updates the agent took part in: how much it has learned, the
+    # same at any batch size or population size.
+    lifespan_min: int = 900
+    lifespan_max: int = 1600
     # At t=0 every agent would otherwise die at the same time; stagger the first
     # cohort's lifespans so deaths are spread out rather than synchronised.
     initial_stagger: bool = True
@@ -445,7 +456,7 @@ class BottleneckConfig:
     max_samples: int = 40_000             # a ceiling for tractability, not a squeeze
     n_samples: int = 0                    # 0 = derive from coverage; >0 forces a cap
     epochs: int = 3
-    batch_size: int = 256
+    batch_size: int = 1024
     lr: float = 1e-3
     store_capacity: int = 40_000          # ring buffer of recent successful episodes
     only_successful: bool = True          # learn from trades that worked
@@ -466,32 +477,30 @@ class BottleneckConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    # "gumbel" -- straight-through Gumbel-softmax on the message tokens, with
-    #             REINFORCE retained for the (genuinely discrete, un-relaxable)
-    #             trade decision.  Spec 2.3 permits this and it is the default
-    #             because pure REINFORCE could not get information across the
-    #             channel at this scale: see the scrambled-channel ablation.
-    # "reinforce" -- score-function estimator for message tokens too.  Kept, and
-    #             runnable, because the comparison is informative.
-    algo: str = "gumbel"
+    # Training is straight-through Gumbel-softmax on the message tokens with
+    # REINFORCE on the (genuinely discrete) decisions -- orchard/gumbel.py, the
+    # only training path. Pure REINFORCE could not get information across the
+    # channel at this scale (see the scrambled-channel ablation) and was removed
+    # rather than left to drift out of date.
     gumbel_tau: float = 1.5
     gumbel_tau_final: float = 0.5
-    gumbel_tau_anneal_frac: float = 0.6
+    tau_anneal_updates: int = 1000        # temperature reaches its final value here
     # Straight-through Gumbel gives the symbol policy a gradient from the
     # listener, but *not* from the episode return -- so the per-symbol length cost
     # never reaches it and utterances run to the cap.  This mixes a score-function
     # term back in over the symbols, which is the direct path for "shorter is
     # better".  0 disables it and reproduces the babbling.
-    gumbel_mix_reinforce: float = 1.0
+    gumbel_mix_reinforce: float = 0.1
     # Speaker-only terms (symbol cost, coining cost, convention) reach the
     # speaker's token choices through this score-function term, in the same
     # units as the task advantage. Through the Gumbel path they have no route at
     # all -- the straight-through gradient only carries what the listener did.
-    shaping_reinforce: float = 0.5
+    shaping_reinforce: float = 0.2
     # Batch multiplier per rung, e.g. {"refer": 2}. Rungs with one short turn use
     # little memory, so a larger batch there buys lower-noise updates for almost
     # no extra time per update. Absent rungs use 1.
-    rung_batch_scale: dict = field(default_factory=dict)
+    rung_batch_scale: dict = field(default_factory=lambda: {
+        "refer": 2, "refer-swap": 2, "order": 2})
     # The convention bonus gets its own coefficient on the same route: it has to
     # be strong enough to seed a shared code before the task pays anything,
     # whereas the costs have to be weak enough not to silence a young channel.
@@ -500,8 +509,8 @@ class TrainConfig:
     # towards the outcome (the target, the partner's meaning, the order), and the
     # gradient reaches the speaker through the straight-through channel.
     hindsight_coef: float = 1.0
-    episodes: int = 200_000
-    batch_size: int = 64                  # episodes per policy-gradient update
+    episodes: int = 60_000_000            # the run's ceiling; rung budgets stop it earlier
+    batch_size: int = 4096                # episodes per update (x rung_batch_scale)
     lr: float = 3e-4
     grad_clip: float = 1.0
     value_coef: float = 0.5
@@ -510,7 +519,7 @@ class TrainConfig:
     # keeps the symbol policy near-uniform long after it should have committed.
     entropy_coef: float = 0.01            # on message tokens; annealed
     entropy_coef_final: float = 0.002
-    entropy_anneal_frac: float = 0.5      # fraction of the run over which it anneals
+    entropy_anneal_updates: int = 800     # entropy bonuses reach their final value here
     decision_entropy_coef: float = 0.02
     decision_entropy_coef_final: float = 0.002
     normalise_adv: bool = True
@@ -521,26 +530,16 @@ class TrainConfig:
     # want for a script that has to run on a laptop and on a cloud box unchanged.
     device: str = "auto"
     torch_threads: int = 4
-    # Sample scenarios and score trades as whole batches of tensors rather than
-    # one Python call per episode.  On a GPU the scalar path is the entire
-    # bottleneck -- a batch of 4096 costs 4096 interpreter round trips before a
-    # kernel launches.  tests/test_batched.py asserts the two agree exactly.
-    vectorised: bool = True
-    # bfloat16 autocast for the forward passes.  bf16 rather than fp16 because it
-    # needs no loss scaling and these are tiny models where range matters more
-    # than precision.  Ignored on CPU without bf16 support.
-    amp: bool = False
-    compile: bool = False           # torch.compile the agent networks
+    # bfloat16 autocast on the transformer layers, CUDA only (ignored on CPU).
+    # bf16 rather than fp16: no loss scaling needed.
+    amp: bool = True
     # Recompute encoder activations in the backward pass instead of keeping them.
     # The Gumbel path builds one graph spanning every symbol step of an episode,
     # so activation memory grows as batch x sequence x width x symbol-steps and is
     # what limits big configurations long before parameter count does.  Costs
     # roughly 30% more compute and buys back most of that memory.
-    grad_checkpoint: bool = False
+    grad_checkpoint: bool = True
     tf32: bool = True               # allow TF32 matmuls on Ampere and later
-    # Episodes generated per optimiser step.  A GPU wants this an order of
-    # magnitude larger than a CPU does; see configs/gpu.json.
-    log_every_batches: int = 0      # 0 = quiet between checkpoints
 
 
 # --------------------------------------------------------------------------
@@ -548,18 +547,17 @@ class TrainConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class LogConfig:
-    ledger_stride: int = 1           # write every Nth episode to the trade ledger
-    checkpoint_every: int = 5_000    # episodes between metric checkpoints
-    summary_every: int = 5_000       # episodes between human-readable console summaries
+    ledger_stride: int = 500         # write every Nth episode to the trade ledger
+    checkpoint_every_updates: int = 100   # full metric checkpoint + report + snapshot
     n_example_transcripts: int = 3
     topsim_samples: int = 200        # scenarios sampled for topological similarity
     # Topsim is O(samples^2) per agent; with a large community, probe a fixed
     # random sample of agents per role instead of every one.
     max_agents_probed: int = 8
     stability_probes: int = 32       # fixed probe meanings re-queried each checkpoint
-    intelligibility_episodes: int = 400
-    zeroshot_episodes: int = 600
-    ablation_episodes: int = 600
+    intelligibility_episodes: int = 4096
+    zeroshot_episodes: int = 4096
+    ablation_episodes: int = 4096
     word_analysis_samples: int = 400   # messages sampled for word-unit statistics
     rare_frequent_split: float = 0.5   # quantile splitting rare from frequent meanings
     track_form_survival: bool = True   # follow specific meanings across generations
@@ -570,7 +568,7 @@ class LogConfig:
     snapshot_every_checkpoint: bool = True
     # Every Nth episode is written to transcripts.txt as expected / dialogue /
     # outcome lines. 0 turns the file off.
-    transcript_stride: int = 50
+    transcript_stride: int = 2000
     # With --quiet (as cloud_run.sh runs), print one status line this often, plus
     # rung transitions, checkpoint headlines and the verdict. 0 = never.
     heartbeat_seconds: int = 60
@@ -578,7 +576,7 @@ class LogConfig:
 
 @dataclass
 class Config:
-    name: str = "default"
+    name: str = "gpu_community"
     world: WorldConfig = field(default_factory=WorldConfig)
     economy: EconomyConfig = field(default_factory=EconomyConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
@@ -599,7 +597,14 @@ class Config:
             json.dump(self.to_dict(), fh, indent=2)
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> "Config":
+    def from_dict(d: dict[str, Any], allow_legacy: bool = False) -> "Config":
+        """Build a config from (a subset of) its dict form.
+
+        ``allow_legacy`` skips keys that older versions wrote (see
+        ``LEGACY_KEYS``) -- for reading an old run's snapshot. Otherwise such a
+        key is an error that names its replacement, so an old config file cannot
+        silently lose a setting.
+        """
         cfg = Config()
         for f in dataclasses.fields(Config):
             if f.name not in d:
@@ -608,17 +613,108 @@ class Config:
             cur = getattr(cfg, f.name)
             if dataclasses.is_dataclass(cur) and isinstance(val, dict):
                 for k, v in val.items():
+                    key = "%s.%s" % (f.name, k)
+                    if key in LEGACY_KEYS:
+                        if allow_legacy:
+                            continue
+                        raise KeyError("%s is no longer a setting: %s" % (key, LEGACY_KEYS[key]))
                     if not hasattr(cur, k):
-                        raise KeyError("unknown config key %s.%s" % (f.name, k))
+                        raise KeyError("unknown config key %s" % key)
                     setattr(cur, k, v)
             else:
                 setattr(cfg, f.name, val)
         return cfg
 
     @staticmethod
-    def from_json(path: str) -> "Config":
+    def from_json(path: str, allow_legacy: bool = False) -> "Config":
         with open(path, "r", encoding="utf-8") as fh:
-            return Config.from_dict(json.load(fh))
+            return Config.from_dict(json.load(fh), allow_legacy=allow_legacy)
+
+
+# Settings older versions had, and what replaced them. Everything that means an
+# amount of learning moved from episodes to training updates.
+_UPDATES = "counted in training updates now; use %s"
+LEGACY_KEYS = {
+    "curriculum.rung_budgets": _UPDATES % "curriculum.rung_budget_updates",
+    "curriculum.min_episodes_per_phase": _UPDATES % "curriculum.default_rung_updates",
+    "curriculum.max_episodes_per_phase": _UPDATES % "curriculum.default_rung_updates",
+    "curriculum.check_every": _UPDATES % "curriculum.check_every_updates",
+    "population.grow_every": _UPDATES % "population.grow_every_updates",
+    "population.lifespan_unit": "lifespans are always in training updates",
+    "reward.usage_half_life": _UPDATES % "reward.usage_half_life_updates",
+    "train.gumbel_tau_anneal_frac": _UPDATES % "train.tau_anneal_updates",
+    "train.entropy_anneal_frac": _UPDATES % "train.entropy_anneal_updates",
+    "log.checkpoint_every": _UPDATES % "log.checkpoint_every_updates",
+    "log.summary_every": "the console summary comes with each checkpoint",
+    "train.log_every_batches": "the heartbeat (log.heartbeat_seconds) replaced it",
+    "train.algo": "Gumbel-softmax is the only training path",
+    "train.vectorised": "the tensor world is the only training path",
+    "train.compile": "torch.compile was never wired in",
+}
+
+
+# --------------------------------------------------------------------------
+# What a preset may change
+# --------------------------------------------------------------------------
+# Scale, hardware and output. Everything else is the method and lives in the
+# defaults above; tests/test_config.py fails if a preset in configs/ sets
+# anything outside this list (plus its entry in PRESET_EXTRA_KEYS).
+PRESET_KEYS = frozenset({
+    "name",
+    "population.n_farmers", "population.n_buyers",
+    "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
+    "train.episodes", "train.batch_size", "train.rung_batch_scale", "train.seed",
+    "train.device", "train.torch_threads", "train.amp", "train.grad_checkpoint",
+    "train.tf32",
+    "bottleneck.batch_size",
+    "curriculum.on_stall", "curriculum.start_phase",
+}) | frozenset("log." + f.name for f in dataclasses.fields(LogConfig))
+
+# The few presets that are deliberately a different experiment, and what they
+# may change beyond scale. Anything here is printed as a method change in the
+# run header and the report.
+PRESET_EXTRA_KEYS = {
+    # a plumbing check: short lifespans and fast growth so a ~500-update run
+    # exercises deaths, births and the bottleneck
+    "gpu_smoke": frozenset({"population.lifespan_min", "population.lifespan_max",
+                            "population.grow_every_updates"}),
+    # more meanings than atoms, so an atom cannot stand for a whole meaning
+    "gpu_duality": frozenset({"world.n_varieties", "channel.atomic_vocab",
+                              "channel.max_symbols"}),
+}
+
+
+def flat_keys(d: dict[str, Any], prefix: str = "") -> list[str]:
+    """``{"train": {"lr": 1}}`` -> ``["train.lr"]`` (dict-valued fields stay whole)."""
+    out = []
+    for k, v in d.items():
+        key = prefix + k
+        sect = getattr(Config(), k, None) if not prefix else None
+        if isinstance(v, dict) and dataclasses.is_dataclass(sect):
+            out.extend(flat_keys(v, key + "."))
+        else:
+            out.append(key)
+    return out
+
+
+def method_changes(cfg: "Config") -> dict[str, tuple[Any, Any]]:
+    """Every setting outside ``PRESET_KEYS`` that differs from the method.
+
+    ``{"reward.symbol_cost": (default, this run's)}``. Empty for every scale-only
+    preset; the run header and the report print whatever is here, so a run that
+    changed the method cannot be mistaken for one that did not.
+    """
+    base, mine = Config().to_dict(), cfg.to_dict()
+    out = {}
+    for key in flat_keys(mine):
+        if key in PRESET_KEYS:
+            continue
+        a, b = base, mine
+        for part in key.split("."):
+            a, b = a[part], b[part]
+        if a != b:
+            out[key] = (a, b)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -663,19 +759,13 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--curriculum", type=_tobool, default=None,
                    help="on/off: the referential-then-trading curriculum")
     p.add_argument("--on-stall", type=str, default=None, choices=["hold", "stop"])
-    p.add_argument("--checkpoint-every", type=int, default=None)
-    p.add_argument("--summary-every", type=int, default=None)
+    p.add_argument("--checkpoint-every-updates", type=int, default=None)
     p.add_argument("--ledger-stride", type=int, default=None)
     p.add_argument("--threads", type=int, default=None)
     p.add_argument("--device", type=str, default=None,
                    help="auto (default), cpu, cuda, or cuda:N")
     p.add_argument("--amp", type=_tobool, default=None,
                    help="on/off: bfloat16 autocast")
-    p.add_argument("--compile", type=_tobool, default=None,
-                   help="on/off: torch.compile the agent networks")
-    p.add_argument("--vectorised", type=_tobool, default=None,
-                   help="on/off: tensor world and reward (leave on for GPU)")
-    p.add_argument("--algo", type=str, default=None, choices=["gumbel", "reinforce"])
     p.add_argument("--persistent-inventory", type=_tobool, default=None,
                    help="on/off: farms hold a depleting lot across market days")
     p.add_argument("--no-plot", action="store_true")
@@ -685,7 +775,7 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
 
 def _coerce(cur: Any, raw: str) -> Any:
     if isinstance(cur, (dict, list)):
-        return json.loads(raw)            # e.g. --set 'curriculum.rung_budgets={"refer": [0, 50000]}'
+        return json.loads(raw)   # e.g. --set 'curriculum.rung_budget_updates={"refer": [80, 4000]}'
     if isinstance(cur, bool):
         return _tobool(raw)
     if isinstance(cur, int):
@@ -722,15 +812,11 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ("bottleneck_coverage", cfg.bottleneck, "coverage"),
         ("curriculum", cfg.curriculum, "enabled"),
         ("on_stall", cfg.curriculum, "on_stall"),
-        ("checkpoint_every", cfg.log, "checkpoint_every"),
-        ("summary_every", cfg.log, "summary_every"),
+        ("checkpoint_every_updates", cfg.log, "checkpoint_every_updates"),
         ("ledger_stride", cfg.log, "ledger_stride"),
         ("threads", cfg.train, "torch_threads"),
         ("device", cfg.train, "device"),
         ("amp", cfg.train, "amp"),
-        ("compile", cfg.train, "compile"),
-        ("vectorised", cfg.train, "vectorised"),
-        ("algo", cfg.train, "algo"),
         ("persistent_inventory", cfg.economy, "persistent_inventory"),
     ]
     for arg_name, section, key in simple:
@@ -767,7 +853,6 @@ def validate(cfg: Config) -> None:
     assert cfg.bottleneck.frequency_skew >= 0.0
     assert cfg.curriculum.n_candidates >= 2
     assert cfg.curriculum.on_stall in ("hold", "stop")
-    assert cfg.population.lifespan_unit in ("episodes", "updates")
     assert 0.0 < cfg.bottleneck.coverage <= 1.0
     assert cfg.model.d_model % cfg.model.n_heads == 0
     w = cfg.world
@@ -777,7 +862,11 @@ def validate(cfg: Config) -> None:
     p = cfg.population
     assert p.n_farmers >= 1 and p.n_buyers >= 1
     assert p.lifespan_min <= p.lifespan_max
-    assert cfg.train.algo in ("gumbel", "reinforce")
+    for name, (lo, hi) in dict(cfg.curriculum.rung_budget_updates).items():
+        assert 0 <= int(lo) <= int(hi), "rung %s: budget must be (min, max) updates" % name
+    assert cfg.curriculum.check_every_updates >= 1
+    assert cfg.log.checkpoint_every_updates >= 1
+    assert cfg.population.grow_every_updates >= 1
     assert cfg.train.device == "auto" or cfg.train.device.split(":")[0] in ("cpu", "cuda")
     assert cfg.economy.episodes_per_day >= 1
     assert cfg.economy.season_days >= 1

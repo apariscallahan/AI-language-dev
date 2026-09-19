@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import (BUYER, FARMER, Decision, HonestScriptedAgent,
                          RandomScriptedAgent, buyer_obs, farmer_obs, resolve,
                          run_scripted_episode, speaker_of_turn)
@@ -24,7 +25,7 @@ from orchard.world import K_EMPTY, World, n_obs_slots, obs_schema
 
 
 def small_cfg() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.max_qty = 8
     cfg.world.n_varieties = 3
     cfg.world.n_price_bins = 8
@@ -113,6 +114,7 @@ class TestObservationSeparation(unittest.TestCase):
     def test_requests_are_skewed_so_length_pressure_has_something_to_act_on(self):
         """Addendum 2.2: a uniform world gives word length nothing to track."""
         cfg = small_cfg()
+        cfg.world.zipf_alpha = 0.9          # the skew is a setting; check it bites
         w = World(cfg.world, random.Random(3))
         table = w.meaning_table()
         self.assertGreater(len(table), 8)

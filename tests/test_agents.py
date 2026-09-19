@@ -19,13 +19,14 @@ import torch
 from orchard.agents import (CommNet, count_parameters, dialogue_offset, make_agent,
                             own_dialogue_positions, sequence_len)
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER
-from orchard.rollout import (read_positions_for, run_episodes, update_agents)
+from orchard.rollout import read_positions_for, run_episodes
 from orchard.world import World
 
 
 def tiny_cfg() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.max_qty = 6
     cfg.world.n_varieties = 3
     cfg.world.n_price_bins = 6
@@ -164,22 +165,6 @@ class TestRollout(unittest.TestCase):
         got_b = {tuple(int(v) for v in row) for t in seen[BUYER] for row in t}
         self.assertTrue(got_f <= expect_f, "farmer network saw a tuple that is not its own")
         self.assertTrue(got_b <= expect_b, "buyer network saw a tuple that is not its own")
-
-    def test_update_changes_weights_and_is_finite(self):
-        cfg = tiny_cfg()
-        torch.manual_seed(4)
-        farmers, buyers = build(cfg)
-        w = World(cfg.world, random.Random(4))
-        scen = w.sample_batch(16, held_out=False)
-        f_idx = torch.randint(0, len(farmers), (16,))
-        b_idx = torch.randint(0, len(buyers), (16,))
-        batch = run_episodes(cfg, scen, farmers, buyers, f_idx, b_idx)
-        before = farmers[0].net.token_head.weight.detach().clone()
-        stats = update_agents(cfg, batch, farmers, buyers, frac_done=0.0)
-        after = farmers[0].net.token_head.weight.detach()
-        self.assertFalse(torch.allclose(before, after))
-        for v in (stats.policy_loss, stats.value_loss, stats.token_entropy):
-            self.assertEqual(v, v)  # not NaN
 
     def test_muted_control_really_silences_the_other_party(self):
         """The three channel controls must differ in exactly the intended way.

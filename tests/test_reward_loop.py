@@ -17,13 +17,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import (BUYER, FARMER, Beliefs, Decision, decode_hits,
                          decode_score, resolve)
 from orchard.world import World
 
 
 def cfg_small() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -237,7 +238,7 @@ class TestCheckpointing(unittest.TestCase):
         cfg.bottleneck.enabled = False
         cfg.train.episodes = 128
         cfg.train.batch_size = 64
-        cfg.log.checkpoint_every = 64
+        cfg.log.checkpoint_every_updates = 1
         cfg.log.topsim_samples = 20
         cfg.log.intelligibility_episodes = 40
         cfg.log.zeroshot_episodes = 40

@@ -13,17 +13,25 @@ what is proven, what is not, and what to do next**.
 git clone https://github.com/apariscallahan/AI-language-dev.git && cd AI-language-dev
 pip install torch --index-url https://download.pytorch.org/whl/cu121   # match the driver
 pip install -r requirements.txt
-python -m unittest discover -s tests -q        # expect: all tests OK (141 at handoff)
+python -m unittest discover -s tests -q        # expect: all tests OK (152 at handoff)
 python -m orchard.run --config configs/gpu_smoke.json --benchmark      # episodes/sec on CUDA
 CONFIG=configs/gpu_smoke.json bash cloud_run.sh                        # minutes; proves the pipeline
 ```
 
-The GPU code path (bf16 autocast on the transformer layers, TF32, the batched
-rollout) has **never been executed on a CUDA device** -- the previous session only
-had a 4-core Windows CPU. Every preset was dry-run on CPU on every rung (a
-training batch, a newborn apprenticeship, promotion evidence, a snapshot
-round-trip), but the first real CUDA run is the first real test of the GPU path.
-If anything device-related breaks, that is the likely place.
+The GPU path has run on an RTX 4090 (`gpu_community`): it first ran out of
+memory (fixed with gradient checkpointing, section 5b), then sat at chance
+because lifespans counted episodes (fixed, section 4 item 9). The user now runs
+**GPU only**.
+
+**There is one method and it lives in the code defaults** (`orchard/config.py`).
+The presets in `configs/` change only scale -- community size, brain size,
+batch, run length, hardware switches, output -- and `tests/test_config.py` fails
+if one sets anything else (`PRESET_KEYS`; `PRESET_EXTRA_KEYS` names the two
+deliberate exceptions, `gpu_smoke`'s short lives and `gpu_duality`'s world).
+`gpu_community.json` is exactly the defaults. The run header and the report's
+summary statistics print `method: the code defaults` or list every difference.
+**Do not tune the method in a preset**: change the default, and say so. Every
+schedule is counted in training updates (section 4 item 10).
 
 ---
 
@@ -73,7 +81,9 @@ transmission bottleneck (newborns learn from transcripts, never weights).
 | community **founded at 2 + 2**, newcomers join after rung 1 | `Population.add_newcomer`, `Trainer.maybe_grow` | 6 + 6 from scratch never left chance |
 | phase-aware speaker order everywhere (costs, bottleneck targets, "me" embedding, probes) | `Phase.own_positions` / `self_mask` | the old buyer-opens order broke farmer newborns (token accuracy 0.000) |
 | **snapshots** at every promotion and checkpoint; `--resume`; auto-resume in `cloud_run.sh` | `Trainer.save_snapshot` | iterate on a rung without replaying the ones below; survive pre-emption |
-| `python -m orchard.analyse --snapshot ...` | `analyse.py` | full metric suite + properties scorecard on any snapshot |
+| `python -m orchard.analyse --snapshot ...` | `analyse.py` | full metric suite + properties scorecard on any snapshot (old snapshots load: `Config.from_dict(allow_legacy=True)`) |
+| one training path: straight-through Gumbel on symbols + REINFORCE on decisions, tensor world | `gumbel.py`, `batched.py` | the pure-REINFORCE and scalar-world training paths were removed (git history has them) |
+| every schedule in **training updates**; rung budget counts from full community size | `config.py`, `Trainer.run` | episode counts meant different learning at every batch size |
 
 ## 4. What happened, with the evidence (so you do not repeat it)
 
@@ -119,6 +129,26 @@ transmission bottleneck (newborns learn from transcripts, never weights).
    (~0) and called it "far above chance"; it now uses the rung's own chance.
    **Rule of thumb: anything counted in episodes must be checked against the
    batch size and the number of agents sharing it.**
+
+10. **Consolidation to one GPU version** (after the user saw CPU/GPU
+    inconsistency). Every schedule now counts training updates:
+    `curriculum.rung_budget_updates` (refer/swap/order 80-2,500,
+    mutual/haggle/bargain 80-3,500), `check_every_updates` 25,
+    `log.checkpoint_every_updates` 100, `train.tau_anneal_updates` 1,000,
+    `entropy_anneal_updates` 800, `population.grow_every_updates` 20, lifespans
+    900-1,600, `reward.usage_half_life_updates` 80. The GPU presets already
+    had equivalent update-based values except two things found in the audit:
+    the population-usage half-life (20,000 *episodes* = ~80 updates on the CPU
+    runs but **~5 updates on the GPU**, so the coining cost and convention bonus
+    tracked a 16x shorter memory), and community growth eating rung budgets
+    (128 + 128 takes ~2,500 updates to grow, as long as the swap rung's whole
+    budget) -- a rung's budget now counts only once the community is full. The
+    Windows GUI (its own presets: 4-symbol cap, no founders, old costs), the
+    legacy CPU configs, the REINFORCE and scalar training paths and the unused
+    `compile` switch were removed. Old config keys raise an error naming their
+    replacement; `--checkpoint-every` is now `--checkpoint-every-updates`.
+    Snapshots written before this still resume (episode counts are converted
+    through that run's batch size).
 
 ## 5. What is NOT validated yet -- your first job
 
@@ -248,8 +278,11 @@ order), `orchard/conventions.py` (coining cost, convention), `orchard/properties
 `orchard/train.py` (growth, snapshots, cost gate, evidence), `orchard/gumbel.py`
 (hindsight, grammar, grouping), `orchard/env.py` (grammar), `orchard/bottleneck.py`
 (phase-aware apprenticeship), `orchard/metrics.py` (phase-aware probes, evidence),
-`configs/gpu_*.json`, `cloud_run.sh`, `tests/test_rungs.py`.
+`configs/gpu_*.json`, `cloud_run.sh`, `tests/test_rungs.py`, `tests/test_config.py`
+(presets are scale only; schedules are in updates; checkpointing changes
+nothing), `tests/testscale.py` (the method at a CPU test size).
 
-`configs/validate.json` is the 2 + 2 CPU validation config; `configs/ladder3.json`
-is the growing-community CPU run. Old run folders stay on the Windows machine
+The CPU validation configs (`validate`, `ladder3`) were removed with the rest of
+the CPU presets; they are in git history. Their method is the code defaults at
+2 + 2 / 6 + 6 with batch 256. Old run folders stay on the Windows machine
 (`runs/` is git-ignored); the numbers above are the parts that matter.

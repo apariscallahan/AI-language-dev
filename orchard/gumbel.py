@@ -54,15 +54,16 @@ def _count(content: torch.Tensor, positions: list[int]) -> torch.Tensor:
     return content[:, positions].sum(dim=1)
 
 
-def gumbel_tau(cfg: Config, frac_done: float) -> float:
+def gumbel_tau(cfg: Config, update: int) -> float:
+    """Relaxation temperature after ``update`` training updates of the run."""
     t = cfg.train
-    return anneal(t.gumbel_tau, t.gumbel_tau_final, frac_done, t.gumbel_tau_anneal_frac)
+    return anneal(t.gumbel_tau, t.gumbel_tau_final, update, t.tau_anneal_updates)
 
 
 def run_and_update_gumbel(cfg: Config, scenarios,
                           farmers: Sequence[Agent], buyers: Sequence[Agent],
                           f_idx: torch.Tensor, b_idx: torch.Tensor, *,
-                          frac_done: float = 0.0, device: str = "cpu",
+                          update: int = 0, device: str = "cpu",
                           train: bool = True, phase: Optional[Phase] = None,
                           generator: Optional[torch.Generator] = None,
                           usage=None, cost_scale: float = 1.0
@@ -101,7 +102,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     B = len(scenarios)
     D = c.dialogue_len
     NT = c.n_token_ids
-    tau = gumbel_tau(cfg, frac_done)
+    tau = gumbel_tau(cfg, update)
 
     if batched:
         f_obs = scenarios.obs(cfg, FARMER)
@@ -321,10 +322,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         return batch, stats
 
     # ---- one joint objective ---------------------------------------------
-    ent_tok_coef = anneal(t.entropy_coef, t.entropy_coef_final, frac_done,
-                          t.entropy_anneal_frac)
+    ent_tok_coef = anneal(t.entropy_coef, t.entropy_coef_final, update,
+                          t.entropy_anneal_updates)
     ent_dec_coef = anneal(t.decision_entropy_coef, t.decision_entropy_coef_final,
-                          frac_done, t.entropy_anneal_frac)
+                          update, t.entropy_anneal_updates)
     rew_of = {FARMER: f_rew, BUYER: b_rew}
     loss = torch.zeros((), device=device)
     value_loss_total = 0.0

@@ -21,6 +21,7 @@ from orchard.agents import make_agent, sequence_len
 from orchard.bottleneck import StoredEpisode, TranscriptStore
 from orchard.batched import TensorWorld
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.curriculum import (H_CHOICE, N_HEADS, CurriculumState, Phase,
                                 ReferentialWorld, ladder, phase_named, phase_schema,
                                 promotion_for, resolve_referential)
@@ -30,7 +31,7 @@ from orchard.world import K_EMPTY, n_obs_slots
 
 
 def cfg_small() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -125,7 +126,7 @@ class TestOneArchitectureEveryPhase(unittest.TestCase):
             else:
                 scen = tw.sample(B)
             batch, stats = run_and_update_gumbel(cfg, scen, f, b, fi, bi,
-                                                 frac_done=0.2, phase=phase)
+                                                 update=200, phase=phase)
             self.assertEqual(stats.policy_loss, stats.policy_loss)   # finite
             self.assertEqual(tuple(batch.f_dec.shape), (B, N_HEADS))
 
@@ -143,7 +144,7 @@ class TestOneArchitectureEveryPhase(unittest.TestCase):
         i = torch.arange(B)
         batch, _ = run_and_update_gumbel(
             cfg, rw.sample(B), f, b, i % 2, torch.div(i, 2, rounding_mode="floor") % 2,
-            frac_done=0.0, phase=ladder(cfg)[0])
+            update=0, phase=ladder(cfg)[0])
         L = cfg.channel.max_symbols
         for turn in range(1, cfg.channel.n_turns):
             seg = batch.tokens[:, turn * L:(turn + 1) * L]
@@ -285,7 +286,7 @@ class TestTheGuesserActuallyListens(unittest.TestCase):
         B = 128
         i = torch.arange(B)
         run_and_update_gumbel(cfg, rw.sample(B), f, b, i * 0, i * 0,
-                              frac_done=0.0, phase=ladder(cfg)[0])
+                              update=0, phase=ladder(cfg)[0])
         self.assertGreater(grads.get("informer", 0.0), 0.0,
                            "no gradient reached the informer's message head")
 
@@ -298,11 +299,11 @@ class TestPromotion(unittest.TestCase):
     def test_all_criteria_must_hold(self):
         rule = self._rule()
         good = dict(success=0.9, chance=0.25, topsim=0.4, null=0.0, transfer=0.5,
-                    episodes_in_phase=10 ** 6)
+                    updates_in_phase=10 ** 6)
         passed, _ = rule.evaluate(**good)
         self.assertTrue(passed)
         for spoil, val in (("success", 0.26), ("topsim", 0.0), ("transfer", 0.0),
-                           ("episodes_in_phase", 0)):
+                           ("updates_in_phase", 0)):
             bad = dict(good)
             bad[spoil] = val
             passed, checks = rule.evaluate(**bad)
@@ -312,7 +313,7 @@ class TestPromotion(unittest.TestCase):
         rule = self._rule()
         passed, checks = rule.evaluate(
             success=float("nan"), chance=0.25, topsim=float("nan"),
-            null=float("nan"), transfer=float("nan"), episodes_in_phase=10 ** 6)
+            null=float("nan"), transfer=float("nan"), updates_in_phase=10 ** 6)
         self.assertFalse(passed)
         self.assertFalse(checks["success above floor"]["met"])
         self.assertFalse(checks["channel actually carries"]["met"])
@@ -321,7 +322,7 @@ class TestPromotion(unittest.TestCase):
         """A pair can score on base rates without saying anything."""
         rule = self._rule()
         passed, _ = rule.evaluate(success=0.95, chance=0.25, topsim=0.0, null=0.0,
-                                  transfer=0.0, episodes_in_phase=10 ** 6)
+                                  transfer=0.0, updates_in_phase=10 ** 6)
         self.assertFalse(passed)
 
     def test_state_advances_and_records_why(self):
@@ -329,9 +330,11 @@ class TestPromotion(unittest.TestCase):
         st = CurriculumState(ladder(cfg))
         self.assertEqual(st.phase.name, "refer")
         st.episodes_in_phase = 999
+        st.updates_in_phase = 99
         st.advance(1234, {"success above floor": {"met": True, "detail": "0.9"}})
         self.assertEqual(st.phase.name, "refer-swap")
         self.assertEqual(st.episodes_in_phase, 0)
+        self.assertEqual(st.updates_in_phase, 0)
         self.assertEqual(len(st.transitions), 1)
         self.assertEqual(st.transitions[0]["from"], "refer")
         self.assertEqual(st.transitions[0]["episode"], 1234)
@@ -366,7 +369,7 @@ class TestTheStoreActuallyFills(unittest.TestCase):
         fi, bi = i % 2, torch.div(i, 2, rounding_mode="floor") % 2
         for _ in range(3):
             batch, _ = run_and_update_gumbel(cfg, scen_fn(B), f, b, fi, bi,
-                                             frac_done=0.5, phase=phase)
+                                             update=500, phase=phase)
             store.add_batch(batch, f, b, 0)
         return store, batch
 
@@ -407,7 +410,7 @@ class TestTheStoreActuallyFills(unittest.TestCase):
         rb = rw.sample(B)
         batch, _ = run_and_update_gumbel(
             cfg, rb, f, b, i % 2, torch.div(i, 2, rounding_mode="floor") % 2,
-            frac_done=0.5, phase=ladder(cfg)[0])
+            update=500, phase=ladder(cfg)[0])
         for j in (0, 5, 40):
             got = store.meaning_of(batch, j)
             want = (int(rb.true_meaning[j][0]), int(rb.true_meaning[j][1]))

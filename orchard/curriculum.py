@@ -244,12 +244,10 @@ def phase_named(cfg: Config, name: str) -> Phase:
 
 
 def rung_budget(cfg: Config, phase: Phase) -> tuple[int, int]:
-    """(minimum, maximum) episodes this rung may take."""
+    """(minimum, maximum) training updates this rung may take."""
     c = cfg.curriculum
-    b = (c.rung_budgets or {}).get(phase.name)
-    if b:
-        return int(b[0]), int(b[1])
-    return c.min_episodes_per_phase, c.max_episodes_per_phase
+    b = (c.rung_budget_updates or {}).get(phase.name) or c.default_rung_updates
+    return int(b[0]), int(b[1])
 
 
 # ==========================================================================
@@ -266,19 +264,19 @@ class Promotion:
     min_success_over_chance: float
     min_topsim_over_null: float
     min_channel_transfer: float
-    min_episodes: int
-    max_episodes: int
+    min_updates: int
+    max_updates: int
 
     def evaluate(self, *, success: float, chance: float, topsim: float,
-                 null: float, transfer: float, episodes_in_phase: int
+                 null: float, transfer: float, updates_in_phase: int
                  ) -> tuple[bool, dict[str, Any]]:
         def ok(x) -> bool:
             return isinstance(x, float) and x == x
 
         checks = {
-            "long enough in phase": (episodes_in_phase >= self.min_episodes,
-                                     "%d of %d episodes" % (episodes_in_phase,
-                                                            self.min_episodes)),
+            "long enough in phase": (updates_in_phase >= self.min_updates,
+                                     "%d of %d updates" % (updates_in_phase,
+                                                           self.min_updates)),
             "success above floor": (ok(success) and success >= self.min_success,
                                     "%.3f, need %.3f" % (success if ok(success) else float("nan"),
                                                          self.min_success)),
@@ -315,27 +313,27 @@ def promotion_for(cfg: Config, phase: Phase) -> Promotion:
             min_success_over_chance=c.min_success_over_chance,
             min_topsim_over_null=c.min_topsim_over_null,
             min_channel_transfer=c.min_channel_transfer,
-            min_episodes=lo, max_episodes=hi)
+            min_updates=lo, max_updates=hi)
     if phase.order:
         return Promotion(
             min_success=c.order_min_success,
             min_success_over_chance=c.min_success_over_chance,
             min_topsim_over_null=c.min_topsim_over_null,
             min_channel_transfer=c.min_channel_transfer,
-            min_episodes=lo, max_episodes=hi)
+            min_updates=lo, max_updates=hi)
     if phase.mutual:
         return Promotion(
             min_success=c.mutual_min_success,
             min_success_over_chance=c.min_success_over_chance,
             min_topsim_over_null=c.min_topsim_over_null,
             min_channel_transfer=c.min_channel_transfer,
-            min_episodes=lo, max_episodes=hi)
+            min_updates=lo, max_updates=hi)
     return Promotion(
         min_success=c.trade_min_success,
         min_success_over_chance=c.min_success_over_chance,
         min_topsim_over_null=c.min_topsim_over_null,
         min_channel_transfer=c.min_channel_transfer,
-        min_episodes=lo, max_episodes=hi)
+        min_updates=lo, max_updates=hi)
 
 
 def _num(x) -> float:
@@ -347,7 +345,7 @@ def _fmt(x: float) -> str:
 
 
 def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
-                  episodes_in_phase: int) -> tuple[bool, dict[str, Any]]:
+                  updates_in_phase: int) -> tuple[bool, dict[str, Any]]:
     """Has this rung demonstrably worked?  Returns (passed, named checks).
 
     ``ev`` is :func:`orchard.metrics.phase_evidence`'s output. ``refer`` and the
@@ -371,12 +369,12 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         return rule.evaluate(success=_num(ev.get("success")), chance=_num(ev.get("chance")),
                              topsim=topsim, null=null,
                              transfer=_num(ev.get("transfer")),
-                             episodes_in_phase=episodes_in_phase)
+                             updates_in_phase=updates_in_phase)
 
     checks: dict[str, tuple[bool, str]] = {}
     checks["long enough in rung"] = (
-        episodes_in_phase >= rule.min_episodes,
-        "%d of %d episodes" % (episodes_in_phase, rule.min_episodes))
+        updates_in_phase >= rule.min_updates,
+        "%d of %d updates" % (updates_in_phase, rule.min_updates))
     k = c.min_success_over_chance
     for role, label in ((FARMER, "farmer"), (BUYER, "buyer")):
         d = ev.get("speakers", {}).get(label, {})
@@ -892,6 +890,7 @@ class CurriculumState:
     phases: list[Phase]
     index: int = 0
     episodes_in_phase: int = 0
+    updates_in_phase: int = 0             # what the rung budgets count
     transitions: list[dict[str, Any]] = field(default_factory=list)
     stalled: bool = False
     last_report: dict[str, Any] = field(default_factory=dict)
@@ -910,9 +909,11 @@ class CurriculumState:
         old = self.phase
         self.index = min(self.index + 1, len(self.phases) - 1)
         self.episodes_in_phase = 0
+        self.updates_in_phase = 0
         self.stalled = False
         self.transitions.append({
             "episode": episode, "from": old.name, "to": self.phase.name,
-            "episodes_in_previous_phase": None, "criteria": checks,
+            "episodes_in_previous_phase": None, "updates_in_previous_phase": None,
+            "criteria": checks,
         })
         return self.phase

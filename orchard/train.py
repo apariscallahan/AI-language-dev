@@ -27,6 +27,7 @@ from .agents import Agent, count_parameters
 from .bottleneck import TranscriptStore, train_newborn
 from .config import Config
 from .economy import Economy
+from .gumbel import run_and_update_gumbel
 from .env import BUYER, FARMER, ROLE_NAMES
 from .ledger import JsonlLog, Ledger, RunLogger
 from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
@@ -44,28 +45,21 @@ from .render import render_transcript
 from .world import World
 
 
+def _budget_str(n: int) -> str:
+    return "{:,}".format(n) if n < 10**8 else "open"
+
+
 def expected_generations(cfg: Config) -> float:
     """How many times each lineage slot will turn over in a run of this length.
 
-    Generations are not a direct knob: an agent ages by the episodes *it* plays,
-    which is the run length divided by how many agents share the work, and it dies
-    at its lifespan.  This is the inverse the GUI uses to turn "how many
-    generations do you want" into an episode budget.
+    Every agent takes part in (nearly) every update and dies after its lifespan
+    in updates, so this is the run's update count over the mean lifespan (at the
+    base batch size; rungs with a larger batch take fewer updates).
     """
     if not cfg.population.turnover:
         return 0.0
     mean_life = (cfg.population.lifespan_min + cfg.population.lifespan_max) / 2.0
-    if cfg.population.lifespan_unit == "updates":
-        # every agent takes part in (nearly) every update
-        return (cfg.train.episodes / max(1, cfg.train.batch_size)) / max(1.0, mean_life)
-    per_agent = cfg.train.episodes / max(1, cfg.population.n_farmers)
-    return per_agent / max(1.0, mean_life)
-
-
-def episodes_for_generations(generations: float, n_agents: int,
-                             mean_lifespan: float) -> int:
-    """The inverse of :func:`expected_generations`."""
-    return int(round(generations * n_agents * mean_lifespan))
+    return (cfg.train.episodes / max(1, cfg.train.batch_size)) / max(1.0, mean_life)
 
 
 @dataclass
@@ -147,14 +141,13 @@ class Trainer:
         self.promotion_log = JsonlLog(out_dir, "promotions.jsonl")
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
-        # The fast path.  Same distributions, drawn on device in one go; the
-        # scalar World stays for metrics probes and for the readable definition.
-        self.tensor_world = None
-        if cfg.train.vectorised:
-            from .batched import TensorWorld
-            g = torch.Generator(device=dev)
-            g.manual_seed(cfg.train.seed + 11)
-            self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
+        # Training scenarios are drawn on device, a whole batch at a time. The
+        # scalar World stays for metrics probes and as the readable definition;
+        # tests/test_batched.py asserts the two draw the same distributions.
+        from .batched import TensorWorld
+        g = torch.Generator(device=dev)
+        g.manual_seed(cfg.train.seed + 11)
+        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
         self.pop = Population(cfg, random.Random(cfg.train.seed + 2), device=self.device)
         self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
                                n_farms=cfg.population.n_farmers)
@@ -177,9 +170,11 @@ class Trainer:
         # ~0.42 with the costs 66% on, where a run with them ~off passed at 0.62.)
         self.cost_gate = 0.0 if cfg.curriculum.enabled else 1.0
         self.rung_success = RollingStat(window=2000)
-        self._batch_no = 0
-        self._next_check = cfg.curriculum.check_every
-        self._next_grow: Optional[int] = None
+        # Training updates so far: one per batch. Budgets, promotion checks,
+        # checkpoints, anneals, growth and lifespans all count these.
+        self.updates = 0
+        self._next_check = cfg.curriculum.check_every_updates
+        self._next_grow: Optional[int] = None         # in updates
         self.community_log: list[dict[str, Any]] = []
 
         # ---- the curriculum -------------------------------------------------
@@ -231,6 +226,8 @@ class Trainer:
             "reached": cur.phase.name,
             "reached_index": cur.phase.index,
             "episodes_in_current_phase": cur.episodes_in_phase,
+            "updates_in_current_phase": cur.updates_in_phase,
+            "updates": self.updates,
             "stalled": cur.stalled,
             "stop_report": cur.stop_report,
             "community_growth": self.community_log,
@@ -425,7 +422,7 @@ class Trainer:
             return
         phase = cur.phase
         lo, hi = rung_budget(self.cfg, phase)
-        passed, checks = evaluate_rung(self.cfg, phase, evidence, cur.episodes_in_phase)
+        passed, checks = evaluate_rung(self.cfg, phase, evidence, cur.updates_in_phase)
         if cur.index > 0 and not self.pop.full_size:
             # every rung after the first is judged on the whole community
             p = self.cfg.population
@@ -436,22 +433,27 @@ class Trainer:
             passed = False
         cur.checks_run += 1
         cur.last_report = {"phase": phase.name, "passed": passed, "checks": checks,
-                           "episode": self.episode, "source": source}
+                           "episode": self.episode, "update": self.updates,
+                           "source": source}
         slim = {k: v for k, v in evidence.items() if not k.startswith("_")}
         for sp in slim.get("speakers", {}).values():
             sp.pop("positional_rows", None)
-        self.promotion_log.write({"episode": self.episode, "phase": phase.name,
+        self.promotion_log.write({"episode": self.episode, "update": self.updates,
+                                  "phase": phase.name,
                                   "episodes_in_phase": cur.episodes_in_phase,
+                                  "updates_in_phase": cur.updates_in_phase,
                                   "source": source, "passed": passed,
                                   "checks": checks, "evidence": slim})
 
         L = self.log
         if passed:
-            done_in = cur.episodes_in_phase
+            done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
             self.rung_success = RollingStat(window=2000)
             self.cost_gate = 1.0
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
+            cur.transitions[-1]["updates_in_previous_phase"] = done_updates
+            cur.transitions[-1]["update"] = self.updates
             try:
                 cur.transitions[-1]["snapshot"] = self.save_snapshot("after-" + phase.name)
             except Exception as exc:          # a snapshot must never kill a run
@@ -459,32 +461,37 @@ class Trainer:
             cur.transitions[-1]["evidence"] = slim
             A = L.always
             A("")
-            A("*** PHASE %s -> %s at episode %d ***" % (phase.name, nxt.name, self.episode))
+            A("*** PHASE %s -> %s at update %s (episode %s) ***"
+              % (phase.name, nxt.name, "{:,}".format(self.updates), "{:,}".format(self.episode)))
             A("    %s" % nxt.blurb)
-            A("    promoted because, after %s episodes in %s (budget %s-%s):"
-              % ("{:,}".format(done_in), phase.name, "{:,}".format(lo), "{:,}".format(hi)))
+            A("    promoted because, after %s updates (%s episodes) in %s (budget %s-%s updates):"
+              % ("{:,}".format(done_updates), "{:,}".format(done_in), phase.name,
+                 "{:,}".format(lo), "{:,}".format(hi)))
             for name, c in checks.items():
                 A("      met: %-40s %s" % (name, c["detail"]))
             A("    the population carries its weights forward; nothing is reinitialised.")
             A("")
             return
 
-        if cur.episodes_in_phase >= hi:
+        if cur.updates_in_phase >= hi:
             unmet = [k for k, c in checks.items() if not c["met"]]
             if not cur.stalled:
                 cur.stalled = True
                 cur.stop_report = {
-                    "phase": phase.name, "episode": self.episode,
-                    "episodes_in_phase": cur.episodes_in_phase, "max_episodes": hi,
+                    "phase": phase.name, "episode": self.episode, "update": self.updates,
+                    "episodes_in_phase": cur.episodes_in_phase,
+                    "updates_in_phase": cur.updates_in_phase, "max_updates": hi,
                     "unmet": {k: checks[k]["detail"] for k in unmet},
                     "met": {k: c["detail"] for k, c in checks.items() if c["met"]},
                     "action": self.cfg.curriculum.on_stall,
                 }
                 A = L.always
                 A("")
-                A("!!! RUNG %s EXCEEDED ITS BUDGET at episode %d !!!" % (phase.name, self.episode))
-                A("    %s episodes in this rung (max %s) without meeting:"
-                  % ("{:,}".format(cur.episodes_in_phase), "{:,}".format(hi)))
+                A("!!! RUNG %s EXCEEDED ITS BUDGET at update %s (episode %s) !!!"
+                  % (phase.name, "{:,}".format(self.updates), "{:,}".format(self.episode)))
+                A("    %s updates (%s episodes) in this rung (max %s updates) without meeting:"
+                  % ("{:,}".format(cur.updates_in_phase), "{:,}".format(cur.episodes_in_phase),
+                     "{:,}".format(hi)))
                 for k in unmet:
                     A("      unmet: %-40s %s" % (k, checks[k]["detail"]))
                 for k, c in checks.items():
@@ -524,9 +531,10 @@ class Trainer:
             "version": 1, "episode": self.episode, "config": self.cfg.to_dict(),
             "curriculum": {"index": self.curriculum.index,
                            "episodes_in_phase": self.curriculum.episodes_in_phase,
+                           "updates_in_phase": self.curriculum.updates_in_phase,
                            "transitions": self.curriculum.transitions,
                            "checks_run": self.curriculum.checks_run},
-            "cost_gate": self.cost_gate, "batch_no": self._batch_no,
+            "cost_gate": self.cost_gate, "updates": self.updates,
             "next_grow": self._next_grow, "community_log": self.community_log,
             "farmers": [agent_state(a) for a in self.pop.farmers],
             "buyers": [agent_state(a) for a in self.pop.buyers],
@@ -560,11 +568,21 @@ class Trainer:
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])
         cur.episodes_in_phase = int(st["curriculum"]["episodes_in_phase"])
+        # Snapshots from before everything counted updates: one batch was one
+        # update, so the counts convert through that run's batch size.
+        old_train = (st.get("config") or {}).get("train", {})
+        old_batch = int(float(old_train.get("batch_size") or self.cfg.train.batch_size)
+                        * float((old_train.get("rung_batch_scale") or {}).get(cur.phase.name, 1)))
         cur.transitions = list(st["curriculum"]["transitions"])
         cur.checks_run = int(st["curriculum"]["checks_run"])
         self.cost_gate = float(st["cost_gate"])
-        self._batch_no = int(st["batch_no"])
-        self._next_grow = st["next_grow"]
+        self.updates = int(st.get("updates", st.get("batch_no", 0)))
+        cur.updates_in_phase = int(st["curriculum"].get(
+            "updates_in_phase", cur.episodes_in_phase // max(1, old_batch)))
+        if "updates" in st:
+            self._next_grow = st["next_grow"]
+        else:                   # an episode-counted schedule: restart it now
+            self._next_grow = None if st["next_grow"] is None else self.updates
         self.community_log = list(st["community_log"])
 
         def restore(rec):
@@ -601,9 +619,9 @@ class Trainer:
         self.newborn_reports = list(st["newborn_reports"])
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
-        self._next_check = self.episode + self.cfg.curriculum.check_every
-        self.resume_note = ("resumed from     : %s at episode %d, rung %s"
-                            % (path, self.episode, cur.phase.name))
+        self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s"
+                            % (path, self.updates, self.episode, cur.phase.name))
 
     def maybe_grow(self) -> None:
         """Newcomers join once the founders have a working language."""
@@ -612,21 +630,22 @@ class Trainer:
         if self._next_grow is None:
             if self.cfg.curriculum.enabled and self.curriculum.index == 0:
                 return                     # the founders are still inventing it
-            self._next_grow = self.episode
-        if self.episode < self._next_grow:
+            self._next_grow = self.updates
+        if self.updates < self._next_grow:
             return
         p = self.cfg.population
         for role, target in ((FARMER, p.n_farmers), (BUYER, p.n_buyers)):
             if len(self.pop.pool(role)) < target:
                 self.pop.add_newcomer(role, self.episode, on_birth=self.on_birth)
-        self._next_grow = self.episode + p.grow_every
-        self.community_log.append({"episode": self.episode, "phase": self.curriculum.phase.name,
+        self._next_grow = self.updates + p.grow_every_updates
+        self.community_log.append({"episode": self.episode, "update": self.updates,
+                                   "phase": self.curriculum.phase.name,
                                    "farmers": len(self.pop.farmers),
                                    "buyers": len(self.pop.buyers)})
         if self.pop.full_size:
-            self.log.always("  [community] full size: %d farmers, %d buyers at episode %s"
+            self.log.always("  [community] full size: %d farmers, %d buyers at update %s"
                             % (len(self.pop.farmers), len(self.pop.buyers),
-                               "{:,}".format(self.episode)))
+                               "{:,}".format(self.updates)))
 
     def update_cost_gate(self, succ: torch.Tensor) -> None:
         """Speaker costs: off through the first rung, on once it has been passed."""
@@ -638,11 +657,11 @@ class Trainer:
         """The light, frequent check -- so a rung that has worked is left promptly."""
         cur = self.curriculum
         if (not self.cfg.curriculum.enabled or cur.finished
-                or self.episode < self._next_check):
+                or self.updates < self._next_check):
             return
-        self._next_check = self.episode + self.cfg.curriculum.check_every
+        self._next_check = self.updates + self.cfg.curriculum.check_every_updates
         lo, hi = rung_budget(self.cfg, cur.phase)
-        if cur.episodes_in_phase < lo and cur.episodes_in_phase < hi:
+        if cur.updates_in_phase < lo and cur.updates_in_phase < hi:
             return                      # cannot pass yet; do not pay for the probe
         ev = self.gather_evidence(cur.phase, light=True)
         self.consider_promotion(ev, source="check")
@@ -666,6 +685,7 @@ class Trainer:
         payload = {
             "state": state,
             "episode": self.episode,
+            "update": self.updates,
             "total_episodes": total,
             "fraction": min(1.0, self.episode / total),
             "elapsed_seconds": round(elapsed, 1),
@@ -700,16 +720,16 @@ class Trainer:
              c.train.episodes // max(1, c.train.batch_size)))
         if c.population.founders_farmers or c.population.founders_buyers:
             L("population         : founded by %d farmers, %d buyers; grows to %d + %d "
-              "after the first rung (one of each every %s episodes)"
+              "after the first rung (one of each every %d updates)"
               % (len(self.pop.farmers), len(self.pop.buyers), c.population.n_farmers,
-                 c.population.n_buyers, "{:,}".format(c.population.grow_every)))
+                 c.population.n_buyers, c.population.grow_every_updates))
         else:
             L("population         : %d farmers, %d buyers"
               % (c.population.n_farmers, c.population.n_buyers))
         L("turnover           : %s%s" % (
             "ON" if c.population.turnover else "OFF",
-            "  (lifespan %d-%d %s)" % (c.population.lifespan_min, c.population.lifespan_max,
-                                       c.population.lifespan_unit)
+            "  (lifespan %d-%d training updates)" % (c.population.lifespan_min,
+                                                     c.population.lifespan_max)
             if c.population.turnover else ""))
         bn = c.bottleneck
         regime = ("fixed cap of %d transcripts" % bn.n_samples if bn.n_samples > 0
@@ -730,10 +750,9 @@ class Trainer:
              c.economy.episodes_per_day, c.economy.season_days))
         L("held-out combos    : %d (variety, quantity) pairs reserved for zero-shot"
           % len(self.world.holdout))
-        L("algorithm          : %s" % (
-            "straight-through Gumbel-softmax on message tokens + REINFORCE on the "
-            "trade decision" if c.train.algo == "gumbel"
-            else "REINFORCE with a learned value baseline"))
+        L("algorithm          : straight-through Gumbel-softmax on message tokens + "
+          "REINFORCE on the decisions; temperature %.1f->%.1f over %d updates"
+          % (c.train.gumbel_tau, c.train.gumbel_tau_final, c.train.tau_anneal_updates))
         L("agent brain        : %d-layer transformer, d=%d, %d params, RANDOMLY INITIALISED"
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))
@@ -742,10 +761,11 @@ class Trainer:
             L("curriculum         : " + " -> ".join(
                 "%s [%s-%s]" % (p.name, "{:,}".format(rung_budget(c, p)[0]),
                                 "{:,}".format(rung_budget(c, p)[1])
-                                if rung_budget(c, p)[1] < 10**11 else "open")
+                                if rung_budget(c, p)[1] < 10**8 else "open")
                 for p in self.curriculum.phases))
-            L("                     (on a rung's max without meeting its criteria: %s)"
-              % c.curriculum.on_stall)
+            L("                     (budgets in training updates; promotion checked every "
+              "%d updates; on a rung's max without meeting its criteria: %s)"
+              % (c.curriculum.check_every_updates, c.curriculum.on_stall))
         L("speaker pressures  : %.3f per symbol, up to %.3f per novel word, %.3f for "
           "matching the population's convention" % (c.reward.symbol_cost,
                                                      c.reward.rarity_cost,
@@ -753,6 +773,13 @@ class Trainer:
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
+        from .config import method_changes
+        changes = method_changes(c)
+        L("method             : %s" % (
+            "the code defaults (this preset changes scale only)" if not changes else
+            "CHANGED from the code defaults: " + ", ".join(
+                "%s %s -> %s" % (k, json.dumps(a), json.dumps(b))
+                for k, (a, b) in sorted(changes.items()))))
         if self.resume_note:
             L(self.resume_note)
         L.rule()
@@ -843,9 +870,7 @@ class Trainer:
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
                                device=self.device, rng=self.eval_rng,
                                phase=views[0], sampler=sampler)
-        newborn_age = (max(20, cfg.population.lifespan_min // 6)
-                       if cfg.population.lifespan_unit == "updates"
-                       else max(200, cfg.population.lifespan_min // 6))
+        newborn_age = max(20, cfg.population.lifespan_min // 6)      # in updates
         intel = intelligibility(cfg, self.pop, self.world,
                                 cfg.log.intelligibility_episodes,
                                 newborn_age=newborn_age, device=self.device,
@@ -866,14 +891,16 @@ class Trainer:
                     for k, v in evidence.get("speakers", {}).items()}
 
         comp_pop = self.pop.composition()
-        flags = detect_degenerate(cfg, ev["success_rate"], self.chance, vocab, comp,
-                                  self.episode, words=words, ablation=abl)
+        flags = detect_degenerate(cfg, ev["success_rate"], self.chance_for(phase), vocab,
+                                  comp, self.updates, words=words, ablation=abl)
 
         row = {
             "episode": self.episode,
+            "update": self.updates,
             "phase": phase.name,
             "phase_index": phase.index,
             "episodes_in_phase": self.curriculum.episodes_in_phase,
+            "updates_in_phase": self.curriculum.updates_in_phase,
             "chance_for_phase": self.chance_for(phase),
             "day": self.economy.day,
             "season": self.economy.season,
@@ -999,7 +1026,7 @@ class Trainer:
         self.archive_examples(ev["batch"])
         if not final:
             self.consider_promotion(evidence, source="checkpoint")
-            self._next_check = self.episode + cfg.curriculum.check_every
+            self._next_check = self.updates + cfg.curriculum.check_every_updates
         return row
 
     # ------------------------------------------------------------------
@@ -1012,9 +1039,9 @@ class Trainer:
         L("")
         L.rule("CHECKPOINT  episode %d / %d  (%.1f%%)  phase %s"
                % (self.episode, cfg.train.episodes, pct, self.curriculum.phase.name))
-        L("phase %d of %d: %s  (%s episodes in this phase)"
+        L("phase %d of %d: %s  (%s updates, %s episodes in this phase)"
           % (self.curriculum.phase.index + 1, len(self.curriculum.phases),
-             self.curriculum.phase.blurb,
+             self.curriculum.phase.blurb, "{:,}".format(self.curriculum.updates_in_phase),
              "{:,}".format(self.curriculum.episodes_in_phase)))
         L("elapsed %.1f min   (metrics took %.1fs)" % (self.log.elapsed() / 60.0, secs))
 
@@ -1258,6 +1285,8 @@ class Trainer:
         total = self.cfg.train.episodes
         eta = (total - self.episode) / rate / 3600 if rate > 0 else float("nan")
         cur = self.curriculum
+        growing = ("" if self.pop.full_size or cur.index == 0 else
+                   ", budget waits for full size")
         gpu = ""
         if self.torch_device.type == "cuda":
             peak = torch.cuda.max_memory_allocated(self.torch_device) / 1e9
@@ -1265,11 +1294,13 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats(self.torch_device)
             gpu = " | GPU peak %.1f / %.0f GB" % (peak, cap)
         self.log.always(
-            "[%s] %s / %s episodes (%.1f%%) | rung %s (%d/%d, %s in rung) | %s eps/s | "
-            "ETA %.1f h | rolling success %.3f | community %d+%d | births %d%s"
+            "[%s] %s / %s episodes (%.1f%%), update %s | rung %s (%d/%d, %s of max %s updates%s) "
+            "| %s eps/s | ETA %.1f h | rolling success %.3f | community %d+%d | births %d%s"
             % (time.strftime("%H:%M:%S UTC", time.gmtime()), "{:,}".format(self.episode),
-               "{:,}".format(total), 100.0 * self.episode / max(1, total), cur.phase.name,
-               cur.phase.index + 1, len(cur.phases), "{:,}".format(cur.episodes_in_phase),
+               "{:,}".format(total), 100.0 * self.episode / max(1, total),
+               "{:,}".format(self.updates), cur.phase.name,
+               cur.phase.index + 1, len(cur.phases), "{:,}".format(cur.updates_in_phase),
+               _budget_str(rung_budget(self.cfg, cur.phase)[1]), growing,
                "{:,.0f}".format(rate), eta, self.train_success.mean,
                len(self.pop.farmers), len(self.pop.buyers), len(self.pop.births), gpu))
 
@@ -1310,8 +1341,8 @@ class Trainer:
     def run(self) -> dict[str, Any]:
         cfg, L = self.cfg, self.log
         self.banner()
-        every = max(1, cfg.log.checkpoint_every)
-        next_ckpt = (self.episode // every + 1) * every
+        every = max(1, cfg.log.checkpoint_every_updates)
+        next_ckpt = (self.updates // every + 1) * every
         L.always("run %s started %s -> %s  (full log: %s)"
                  % (cfg.name, self.started_utc, os.path.abspath(self.out_dir),
                     os.path.join(os.path.abspath(self.out_dir), "run.log")))
@@ -1322,9 +1353,8 @@ class Trainer:
             n = min(B, cfg.train.episodes - self.episode)
             # A swap rung alternates the describer batch by batch, so every agent
             # spends half its time describing and half decoding.
-            phase = (rung.with_informer(FARMER if self._batch_no % 2 == 0 else BUYER)
+            phase = (rung.with_informer(FARMER if self.updates % 2 == 0 else BUYER)
                      if rung.swaps else rung)
-            self._batch_no += 1
             f_idx, b_idx = self.pop.pair(n, device=self.device)
             if phase.referential:
                 # The lineup game: no market, no stock, no price -- just meanings.
@@ -1335,24 +1365,14 @@ class Trainer:
                 # Price and budget, but scenarios drawn fresh rather than held as
                 # depleting inventory; the economy is the last thing introduced.
                 scen = self.tensor_world.sample(n)
-            elif self.tensor_world is not None:
+            else:
                 scen = self.economy.make_batch_tensor(
                     n, len(self.pop.farmers), len(self.pop.buyers),
                     self.tensor_world, f_idx, b_idx)
-            else:
-                scen, f_idx, b_idx = self.economy.make_batch(
-                    n, len(self.pop.farmers), len(self.pop.buyers))
-            frac = self.episode / max(1, cfg.train.episodes)
-            if cfg.train.algo == "gumbel":
-                from .gumbel import run_and_update_gumbel
-                batch, _ = run_and_update_gumbel(
-                    cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
-                    frac_done=frac, device=self.device, phase=phase, usage=self.usage,
-                    cost_scale=self.cost_gate)
-            else:
-                from .rollout import run_episodes
-                batch = run_episodes(cfg, scen, self.pop.farmers, self.pop.buyers,
-                                     f_idx, b_idx, device=self.device, phase=phase)
+            batch, _ = run_and_update_gumbel(
+                cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
+                update=self.updates, device=self.device, phase=phase, usage=self.usage,
+                cost_scale=self.cost_gate)
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
             if batch.res is not None:
@@ -1406,19 +1426,21 @@ class Trainer:
             self.store.add_batch(batch, self.pop.farmers, self.pop.buyers, self.episode)
             self.transcripts.write_batch(batch, phase, self.episode, self.pop)
 
-            if cfg.train.algo != "gumbel":
-                from .rollout import update_agents
-                update_agents(cfg, batch, self.pop.farmers, self.pop.buyers,
-                              frac_done=frac, device=self.device)
-
+            self.updates += 1
             self.episode += n
             self.curriculum.episodes_in_phase += n
+            if self.curriculum.index == 0 or self.pop.full_size:
+                # A rung after the first cannot pass until the community is at
+                # full size, so the time spent growing does not come out of its
+                # budget -- otherwise a bigger community would stall on growth
+                # alone (128 + 128 takes ~2,500 updates to grow).
+                self.curriculum.updates_in_phase += 1
             self.pop.turn_over(self.episode, on_birth=self.on_birth)
             self.maybe_grow()
             self.write_progress()
             self.heartbeat()
 
-            if self.episode >= next_ckpt:
+            if self.updates >= next_ckpt:
                 row = self.checkpoint()
                 self.maybe_plot()
                 self.write_interim_report(row)
@@ -1427,7 +1449,7 @@ class Trainer:
                         self.save_snapshot("latest")
                     except Exception as exc:
                         self.log("  [snapshot] skipped: %s" % exc)
-                next_ckpt += cfg.log.checkpoint_every
+                next_ckpt += every
             else:
                 self.maybe_check_promotion()
 

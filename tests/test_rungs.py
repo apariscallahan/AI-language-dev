@@ -110,7 +110,7 @@ class TestBottleneckIsRoleCorrect(unittest.TestCase):
         fi, bi = pairing(128)
         for _ in range(n_batches):
             batch, _ = run_and_update_gumbel(cfg, sample(), f, b, fi, bi, phase=phase,
-                                             frac_done=0.5)
+                                             update=500)
             store.add_batch(batch, f, b, 0)
         return store, f, b
 
@@ -577,6 +577,7 @@ class TestCommunityGrowth(unittest.TestCase):
         from orchard.population import Population
         cfg = cfg_small()
         cfg.population.n_farmers = cfg.population.n_buyers = 3
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 0
         pop = Population(cfg, random.Random(0))
         self.assertTrue(pop.full_size)
 
@@ -730,7 +731,6 @@ class TestLifespanInUpdates(unittest.TestCase):
         for batch in (64, 4096):
             cfg = cfg_small()
             cfg.population.n_farmers = cfg.population.n_buyers = 2
-            cfg.population.lifespan_unit = "updates"
             cfg.population.lifespan_min = cfg.population.lifespan_max = 3
             cfg.population.initial_stagger = False
             pop = Population(cfg, random.Random(0))
@@ -742,16 +742,19 @@ class TestLifespanInUpdates(unittest.TestCase):
             batch_obj = SimpleNamespace(res=res, f_reward=torch.zeros(batch),
                                         b_reward=torch.zeros(batch))
             for step in range(3):
-                self.assertFalse(pop.farmers[0].is_expired("updates"), (batch, step))
+                self.assertFalse(pop.farmers[0].is_expired(), (batch, step))
                 pop.record_episode_participation(f_idx, b_idx, batch_obj)
             self.assertEqual(pop.farmers[0].updates, 3)
-            self.assertTrue(pop.farmers[0].is_expired("updates"))
+            self.assertTrue(pop.farmers[0].is_expired())
             self.assertEqual(pop.farmers[0].age, 3 * batch // 2)
 
-    def test_gpu_presets_count_lifespan_in_updates(self):
+    def test_presets_keep_the_method_lifespan(self):
+        # only the plumbing check may shorten lives; see PRESET_EXTRA_KEYS
         for name in ("gpu_small", "gpu_community", "gpu_full", "gpu_duality"):
             cfg = Config.from_json(str(Path(__file__).resolve().parents[1] / "configs" / ("%s.json" % name)))
-            self.assertEqual(cfg.population.lifespan_unit, "updates", name)
+            self.assertEqual((cfg.population.lifespan_min, cfg.population.lifespan_max),
+                             (Config().population.lifespan_min,
+                              Config().population.lifespan_max), name)
             self.assertGreaterEqual(cfg.population.lifespan_min, 500, name)
 
 

@@ -20,6 +20,7 @@ import torch
 from orchard.agents import make_agent
 from orchard.bottleneck import StoredEpisode, TranscriptStore
 from orchard.config import Config
+from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER, Decision, parse_words, resolve, word_text
 from orchard.lexicon import (FormTracker, bucketed_analysis, length_frequency,
                              reference_buyer_obs, split_meanings, word_stats,
@@ -30,7 +31,7 @@ from orchard.world import World
 
 
 def small_cfg() -> Config:
-    cfg = Config()
+    cfg = method_at_test_scale()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 6
@@ -158,6 +159,7 @@ class TestFrequencySkew(unittest.TestCase):
 
     def test_world_requests_are_zipfian(self):
         cfg = small_cfg()
+        cfg.world.zipf_alpha = 0.9
         w = World(cfg.world, random.Random(0))
         table = w.meaning_table()
         self.assertGreater(table[0][1] / table[-1][1], 3.0)

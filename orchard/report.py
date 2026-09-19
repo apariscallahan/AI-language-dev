@@ -298,6 +298,12 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
     rows: list[tuple[str, str]] = []
 
     rows.append(("started", str(final.get("started_utc", "n/a"))))
+    from .config import method_changes
+    changes = method_changes(cfg)
+    rows.append(("method", "the code defaults (preset changes scale only)" if not changes
+                 else "**changed**: " + ", ".join(
+                     "`%s` %s -> %s" % (k, json.dumps(a), json.dumps(b))
+                     for k, (a, b) in sorted(changes.items()))))
     rows.append(("episodes / wall time", "%s in %.1f h"
                  % ("{:,}".format(int(final.get("episode", 0))), wall_minutes / 60.0)))
     phases = cur.get("phases") or []
@@ -308,7 +314,8 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
     rows.append(("furthest rung", "**%s** (%s of %d) -- %s"
                  % (reached, (phases.index(reached) + 1) if reached in phases else "?",
                     len(phases), status)))
-    passed = ["%s (%s ep)" % (t.get("from"), "{:,}".format(int(t.get("episodes_in_previous_phase") or 0)))
+    passed = ["%s (%s updates)" % (t.get("from"),
+                                   "{:,}".format(int(t.get("updates_in_previous_phase") or 0)))
               for t in cur.get("transitions") or []]
     rows.append(("rungs passed", ", ".join(passed) or "none"))
     growth = cur.get("community_growth") or []
@@ -504,20 +511,23 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
           "Weights carry across every transition; nothing is reinitialised.")
         A("")
         budgets = cur.get("budgets") or {}
-        spent = {t.get("from"): t.get("episodes_in_previous_phase") for t in
-                 (cur.get("transitions") or [])}
-        A("| rung | phase | reached | budget (min - max episodes) | episodes spent |")
+        spent = {t.get("from"): (t.get("updates_in_previous_phase"),
+                                 t.get("episodes_in_previous_phase"))
+                 for t in (cur.get("transitions") or [])}
+        A("| rung | phase | reached | budget (min - max updates) | updates spent (episodes) |")
         A("|---|---|---|---|---|")
         for i, name in enumerate(phases):
             mark = ("**yes**" if i <= cur.get("reached_index", 0) else "no")
             b = budgets.get(name) or ["?", "?"]
-            hi = ("open" if isinstance(b[1], (int, float)) and b[1] >= 10**11
+            hi = ("open" if isinstance(b[1], (int, float)) and b[1] >= 10**8
                   else "{:,}".format(b[1]) if isinstance(b[1], (int, float)) else b[1])
             lo = "{:,}".format(b[0]) if isinstance(b[0], (int, float)) else b[0]
             if name in spent:
-                used = "{:,}".format(int(spent[name] or 0))
+                used = "{:,} ({:,})".format(int(spent[name][0] or 0), int(spent[name][1] or 0))
             elif i == cur.get("reached_index", -1):
-                used = "{:,} (current)".format(int(g(cur, "episodes_in_current_phase", 0)))
+                used = "{:,} ({:,}) (current)".format(
+                    int(g(cur, "updates_in_current_phase", 0)),
+                    int(g(cur, "episodes_in_current_phase", 0)))
             else:
                 used = "-"
             A("| %d | `%s` | %s | %s - %s | %s |" % (i + 1, name, mark, lo, hi, used))
@@ -526,27 +536,30 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
         if growth:
             A("The community was founded by %d farmers and %d buyers and grew by "
               "newcomers -- random weights, then the transmission bottleneck on the "
-              "community's transcripts -- to %d + %d, reached at episode %s during "
-              "`%s`. Every rung after the first was judged on the full community."
+              "community's transcripts -- to %d + %d, reached at update %s (episode %s) "
+              "during `%s`. Every rung after the first was judged on the full community."
               % (cfg.population.founders_farmers, cfg.population.founders_buyers,
                  growth[-1]["farmers"], growth[-1]["buyers"],
+                 "{:,}".format(growth[-1].get("update", 0)),
                  "{:,}".format(growth[-1]["episode"]), growth[-1]["phase"]))
             A("")
         A("`refer-swap` and `refer-mutual` are judged per role: each role has to clear "
           "every bar on its own, describing and decoding, rather than on a pooled "
           "average that a fluent partner could carry.")
         A("")
-        A("Furthest rung reached: **%s** (%s episodes in it at the end)."
-          % (reached, "{:,}".format(int(g(cur, "episodes_in_current_phase", 0)))))
+        A("Furthest rung reached: **%s** (%s updates, %s episodes in it at the end)."
+          % (reached, "{:,}".format(int(g(cur, "updates_in_current_phase", 0))),
+             "{:,}".format(int(g(cur, "episodes_in_current_phase", 0)))))
         A("")
         trans = cur.get("transitions") or []
         if trans:
             A("### Transitions, and why each one happened")
             A("")
             for t in trans:
-                A("**%s -> %s** at episode %s, after %s episodes in `%s`:"
-                  % (t.get("from"), t.get("to"), "{:,}".format(t.get("episode", 0)),
-                     "{:,}".format(t.get("episodes_in_previous_phase") or 0),
+                A("**%s -> %s** at update %s (episode %s), after %s updates in `%s`:"
+                  % (t.get("from"), t.get("to"), "{:,}".format(t.get("update", 0)),
+                     "{:,}".format(t.get("episode", 0)),
+                     "{:,}".format(t.get("updates_in_previous_phase") or 0),
                      t.get("from")))
                 A("")
                 for k, c in (t.get("criteria") or {}).items():
@@ -566,13 +579,13 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
         if cur.get("stalled"):
             sr = cur.get("stop_report") or {}
             last = cur.get("last_promotion_check") or {}
-            A("> **Rung `%s` exceeded its budget.** %s episodes in it (maximum %s) "
+            A("> **Rung `%s` exceeded its budget.** %s updates in it (maximum %s) "
               "without meeting its criteria, so the run %s rather than advance -- "
               "building the next rung on top of one that never converged would only "
               "reproduce the failure a rung higher."
               % (sr.get("phase", cur.get("reached")),
-                 "{:,}".format(int(sr.get("episodes_in_phase", 0) or 0)),
-                 "{:,}".format(int(sr.get("max_episodes", 0) or 0)),
+                 "{:,}".format(int(sr.get("updates_in_phase", 0) or 0)),
+                 "{:,}".format(int(sr.get("max_updates", 0) or 0)),
                  "stopped" if sr.get("action") == "stop" else "held"))
             A(">")
             A("> Unmet:")

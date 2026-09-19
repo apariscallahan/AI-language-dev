@@ -198,7 +198,7 @@ class Population:
         for role in (FARMER, BUYER):
             pool = self.pool(role)
             for slot, agent in enumerate(pool):
-                if not agent.is_expired(self.cfg.population.lifespan_unit):
+                if not agent.is_expired():
                     continue
                 newborn = self._spawn(role, slot, agent.generation + 1, episode)
                 ev = BirthEvent(

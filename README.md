@@ -19,109 +19,98 @@ which replaces the fixed-token channel with an open vocabulary.
 
 ## Quick start
 
-### The control panel
+This runs on a GPU. **[CLOUD.md](CLOUD.md) is the guide** -- presets, what the
+terminal shows, how to change a setting, memory sizing.
 
 ```bash
-python orchard_gui.py
+CONFIG=configs/gpu_community.json bash cloud_run.sh
 ```
 
-Or double-click `Orchard.bat`. A small Windows panel with presets, the settings
-worth changing, a progress bar and a live view of the last checkpoint. It is a
-front end for the command below and nothing more -- it writes a config, launches
-the trainer, and watches the `progress.json` the trainer drops beside its output,
-so the panel can never disagree with the CLI about what a setting means.
+`cloud_run.sh` checks a CUDA device is actually visible, writes to
+`runs/<UTC start time>_<preset>/`, and resumes from that folder's latest
+snapshot if it is run again. Everything after the script name is passed through
+to `python -m orchard.run`.
 
-One setting there is not what it looks like. **Generations cannot be set
-directly**: an agent ages by the episodes it personally plays and dies at its
-lifespan, so how many times a lineage turns over falls out of run length,
-population size and lifespan together. The panel asks for generations because
-that is what you actually want to choose, converts it to an episode budget, and
-always shows you the number it arrived at.
+### One method, several scales
 
-### On a cloud GPU
+**The method is the code defaults in `orchard/config.py`.** The presets in
+`configs/` change only scale -- how many agents, how big a brain, how large a
+batch, how long a run, how much output -- and `tests/test_config.py` fails if one
+changes anything else. The run header and the report's summary statistics print
+"method: the code defaults" or name every setting that differs, so a run that
+changed the method cannot be mistaken for one that did not.
 
-**[CLOUD.md](CLOUD.md) is the guide for this** — presets, how to change any
-setting from the CLI, memory sizing, and the two traps that will waste money.
+| preset | community | brain | batch | episodes | what it is for |
+|---|---|---|---|---|---|
+| `gpu_smoke` | 8 + 8 | d64, 2 layers | 1,024 | 0.5M | plumbing check: short lives so deaths, births and the bottleneck all run |
+| `gpu_small` | 16 + 16 | d64, 2 layers | 2,048 | 8M | a cheaper full run |
+| `gpu_community` | 48 + 48 | d96, 3 layers | 4,096 | 60M | the main run; identical to the code defaults |
+| `gpu_full` | 128 + 128 | d96, 3 layers | 4,096 | 80M | a bigger community |
+| `gpu_duality` | 48 + 48 | d96, 3 layers | 2,048 | 40M | experiment: 12 varieties, 8 atoms, so an atom cannot name a whole meaning |
 
-```bash
-bash cloud_run.sh
-```
+Every community is founded by 2 farmers and 2 buyers and grows after the first
+rung (see "The community" below).
 
-Checks a CUDA device is actually visible, then runs `configs/gpu.json` — two
-million episodes, batch 2048, sixteen agents — writing to a timestamped run
-directory. Everything after the script name is passed through, so
-`bash cloud_run.sh --bottleneck off --episodes 500000` works.
+**Everything that means an amount of learning is counted in training updates**
+(one update = one batch): rung budgets, how often promotion is checked,
+checkpoints, the temperature and entropy anneals, community growth, lifespans,
+and how long the population remembers what it has been saying. An episode count
+means a different amount of learning at every batch size -- counting lifespans in
+episodes once killed every founder after ~50 updates on a GPU. So the same
+settings mean the same thing at every scale, and a bigger batch just averages
+more episodes into each update.
 
-`--device auto` is the default everywhere: CUDA when a GPU is visible, CPU
-otherwise, so the same command works on a laptop and on a cloud box. Asking for
-`--device cuda` on a CPU-only torch build fails immediately with the reason
-rather than silently running on the CPU for six hours.
+### What makes it fast on a GPU
 
-**What makes it worth a GPU.** The simulation used to do one Python call and one
-dataclass construction *per episode* to sample the world and score the trade.
-That is invisible on a CPU, where the transformer forwards dominate, and fatal on
-a GPU, where they do not. Measured on a 4096-episode batch:
+- **Tensor world and reward.** Scenarios are sampled and trades scored as whole
+  batches of tensors (`orchard/batched.py`); per-episode Python used to cap a
+  4,096 batch at ~6,700 episodes/sec. `tests/test_batched.py` asserts the tensor
+  versions agree exactly with the scalar ones in `world.py` and `env.py`, which
+  remain the readable definition of the rules.
+- **Fixed-stride pairings**, so each agent's slice of the batch is a constant and
+  the rollout never stalls the device to ask who plays what.
+- **bf16 autocast** on the transformer layers (CUDA only; no loss scaling) and
+  TF32 matmuls.
+- **Gradient checkpointing** of each agent's embedding and encoder: memory at a
+  4,096 batch went from 56-365 GB to 0.7-9.8 GB depending on the rung.
+  `tests/test_config.py` asserts it gives the same update as without it.
+- **Prefix-only embedding**, slicing soft tokens before gathering, grouping
+  agents once per batch, and one host copy per batch for the bottleneck store.
+- Bigger batches on the cheap lineup rungs (`train.rung_batch_scale`).
 
-| host-side work per batch | before | after |
-|---|---|---|
-| world sampling | 105 ms | 5.3 ms |
-| trade scoring | 502 ms | 5.2 ms |
-| **total** | **607 ms** | **11 ms** |
-
-That was a hard ceiling of about 6,700 episodes/sec no matter how fast the GPU
-was; it is now around 390,000, so the GPU is the limit instead of the
-interpreter. `orchard/batched.py` holds the tensor world and tensor reward, and
-`tests/test_batched.py` asserts they agree with the scalar versions *exactly* —
-same rewards, same success flags — on random batches. The scalar code in
-`world.py` and `env.py` remains the readable definition of the rules; if the two
-ever disagree, it is right and the tensor one is wrong.
-
-Two smaller things also mattered: the rollout no longer reads a tensor on the
-host every symbol step to check whether anyone is still talking (that
-synchronises the device), and pairings are now fixed strides rather than random
-draws, which makes each agent's slice of the batch a constant instead of
-something to be derived from a tensor mid-loop. Because scenarios are i.i.d. the
-two pairings are the same marketplace, but the fixed one also gives every agent
-exactly its share of the batch instead of a multinomial count, which lowers
-gradient variance.
-
-Other GPU switches: `--amp on` for bfloat16 autocast (bf16 rather than fp16, so
-there is no loss scaling to get wrong), `--compile on` for `torch.compile`, and
-TF32 matmuls on by default.
+`python -m orchard.run --config configs/gpu_community.json --benchmark` times
+the light, middle and heaviest rungs at full community size and prints peak GPU
+memory and the hours the configured run will take.
 
 ### Comparing anything: use several seeds
 
 ```bash
-python sweep.py --config configs/gpu.json --out runs/ablation --seeds 5 \
-    --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
+python sweep.py --config configs/gpu_small.json --out runs/ablation --seeds 5     --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
 ```
 
 **Do not draw conclusions from single runs of this simulation.** It is bimodal: a
 population either finds a referential convention or it does not. Four
 neighbouring conditions at 40k episodes produced 76%, 0%, 92% and 6% of the
-channel headroom — a spread that swamps any effect worth measuring. `sweep.py`
+channel headroom -- a spread that swamps any effect worth measuring. `sweep.py`
 runs each arm across seeds and reports mean, spread and the per-seed values, so
 the bimodality is visible rather than averaged into a misleading single number.
-Use `--parallel 1` on a single GPU and a higher number on a CPU box with cores to
-spare.
+Use `--parallel 1` on a single GPU.
 
-### The command line
+### Other commands
 
 ```bash
 python -m orchard.run --smoke
 ```
 
-Runs the environment with scripted agents and no learning at all — the spec's
-build-order step 1. It prints the chance-level success rate (essentially zero),
-confirms an oracle pair can convert every viable scenario, and shows one rendered
-episode.
+Runs the environment with scripted agents and no learning at all. It prints the
+chance-level success rate (essentially zero), confirms an oracle pair can convert
+every viable scenario, and shows one rendered episode.
 
 ```bash
-python -m orchard.run --config configs/open.json --out runs/main
+python -m orchard.analyse --snapshot runs/<run>/snapshots/latest.pt
 ```
 
-A full run: trains, checkpoints the whole metric suite, writes a trade ledger of
-every episode, plots progress, and produces a final report with an honest verdict.
+Re-measures a snapshot after the fact (older snapshots load too).
 
 ```bash
 python -m unittest discover -s tests
@@ -408,9 +397,12 @@ average would let a fluent partner carry a role that never learned to speak.
 Success alone is not enough, because a pair can score on base rates without
 saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
-**Every rung has a budget** (`curriculum.rung_budgets`, min and max episodes).
-Promotion is checked every `curriculum.check_every` episodes with a light probe,
-so a rung that works is left promptly. A rung that reaches its maximum without
+**Every rung has a budget** (`curriculum.rung_budget_updates`, min and max
+training updates). Promotion is checked every `curriculum.check_every_updates`
+updates with a light probe, so a rung that works is left promptly. After the
+first rung, the budget only starts counting once the community is at full size
+-- the rung cannot pass before then, and a bigger community would otherwise stall
+on growth alone. A rung that reaches its maximum without
 meeting its criteria **stops the run** (`curriculum.on_stall`, default `stop`)
 and the report names every unmet criterion. Building the next rung on top of one
 that never converged would only reproduce the failure a rung higher.
@@ -458,7 +450,7 @@ terms, not restrictions: nothing ever stops an agent from saying anything.
 | knob | what it does |
 |---|---|
 | `reward.symbol_cost` (0.03) | per emitted atom, hyphen or space |
-| `reward.rarity_cost` (0.05) | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life`), centred on the batch so it favours established forms without ever favouring silence |
+| `reward.rarity_cost` (0.05) | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life_updates`), centred on the batch so it favours established forms without ever favouring silence |
 | `reward.convention` (0.15) | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
 | `train.shaping_reinforce` | how strongly these reach the speaker's token choices |
 
@@ -474,8 +466,8 @@ never got the lineup off chance in 200k episodes: each farmer kept its own
 drifting code (coherence 0.04-0.09), and even a strong convention bonus only
 lifted that to ~0.2. Two and two invent a code in ~80k. So a large community is
 *founded* small (`population.founders_farmers/_buyers`) and grows after the
-first rung: a newcomer of each role joins every `population.grow_every`
-episodes, born like any newborn -- random weights, then the transmission
+first rung: a newcomer of each role joins every `population.grow_every_updates`
+updates, born like any newborn -- random weights, then the transmission
 bottleneck on the community's transcripts -- so it learns the existing language
 instead of inventing another. Every rung after the first waits for, and is
 judged on, the full community.
@@ -487,7 +479,8 @@ the buyer's word use (1.0 = one shared vocabulary, 0.0 = two foreign codes).
 
 ## Generations, and what gets lost
 
-Agents age, die at a randomised lifespan, and are replaced by newborns with fresh
+Agents age, die at a randomised lifespan (900-1,600 training updates), and are
+replaced by newborns with fresh
 random weights. Deaths are staggered, so at any moment some agents already know the
 language and some must acquire it. A code that only works between two co-adapted
 agents fails to transmit and is selected against.
@@ -532,8 +525,11 @@ orchard/
   economy.py     market days, seasons, multi-variety inventories, replenishment
   env.py         episode mechanics, word parsing, trade resolution, reward
   agents.py      the randomly-initialised transformer policies
-  rollout.py     batched play + REINFORCE with a learned baseline
-  gumbel.py      straight-through Gumbel channel (the default; see below)
+  batched.py     the tensor world and reward the training loop uses
+  rollout.py     batched play (probes and evaluation)
+  gumbel.py      training: straight-through Gumbel channel + REINFORCE decisions
+  curriculum.py  the ladder of rungs, their worlds, and promotion
+  conventions.py the population's recent usage: coining cost, convention bonus
   population.py  ageing, death, birth, generation counting
   bottleneck.py  iterated learning, frequency-skewed curriculum
   metrics.py     spec section 5: success, topsim, entropy, stability,
@@ -543,15 +539,20 @@ orchard/
   render.py      human-readable transcripts (placeholder names only)
   report.py      the final report and its verdict
   plots.py       matplotlib figures, with a dependency-free SVG fallback
-  run.py         CLI
-configs/         open.json, open_full.json, and the earlier fixed-token configs
-tests/           41 tests, including the ones that would expose a rigged experiment
+  properties.py  the language-properties scorecard (disentanglement, duality, ...)
+  transcripts.py transcripts.txt: expected / dialogue / outcome for every round
+  analyse.py     re-measure a snapshot after the fact
+  run.py         CLI (also --benchmark and --resume)
+configs/         the GPU presets -- scale only; the method is config.py's defaults
+tests/           including test_config.py, which keeps presets from changing the method
 ```
 
-### Why Gumbel-softmax is the default
+### Why Gumbel-softmax
 
 Spec 2.3 offers REINFORCE or Gumbel-softmax and asks the implementer to document
-the choice. Both are implemented and either can be selected with `--algo`.
+the choice. Gumbel-softmax on the message symbols is the only training path; the
+pure-REINFORCE path was removed rather than left to fall out of date (it is in
+the git history).
 
 Pure REINFORCE was tried first and the ablation showed it failing: after 24k
 episodes, destroying every message in flight cost almost nothing, because almost
@@ -573,13 +574,15 @@ The scientific point is the comparison, so the mechanisms toggle from the comman
 line and the same code runs either way:
 
 ```bash
-python -m orchard.run --config configs/open.json --out runs/main
-python -m orchard.run --config configs/open.json --out runs/nobottleneck --bottleneck off
-python -m orchard.run --config configs/open.json --out runs/noturnover  --turnover off
+python -m orchard.run --config configs/gpu_small.json --out runs/main
+python -m orchard.run --config configs/gpu_small.json --out runs/nobottleneck --bottleneck off
+python -m orchard.run --config configs/gpu_small.json --out runs/noturnover  --turnover off
 python -m orchard.run --compare runs/main runs/nobottleneck runs/noturnover
 ```
 
 Any field is overridable: `--set world.zipf_alpha=0 --set bottleneck.frequency_skew=2`.
+A change to anything other than scale is printed in the run header and the
+report as a method change.
 
 ### Output
 
@@ -591,7 +594,10 @@ Any field is overridable: `--set world.zipf_alpha=0 --set bottleneck.frequency_s
 | `run.log` | the complete console history |
 | `plots/metrics.svg`, `plots/vocabulary.svg` (+ `.png`) | progress over the run |
 | `report.md` | final metrics, the inferred dictionary, example transcripts early/middle/late, economic totals, and a threshold-computed verdict |
-| `progress.json` | rewritten every batch; what the GUI's progress bar reads |
+| `transcripts.txt` | sampled rounds, each as an expected / dialogue / outcome block |
+| `promotions.jsonl` | every promotion check, passed or not, with its evidence |
+| `snapshots/` | `latest.pt` each checkpoint and `after-<rung>.pt` at each promotion, for `--resume` |
+| `progress.json` | rewritten every batch: episode, update, rate, ETA, headline numbers |
 
 Two runs can be put side by side on the measures that decide whether a change did
 anything:

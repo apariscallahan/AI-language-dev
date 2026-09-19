@@ -133,7 +133,6 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
     f_idx, b_idx = pop.pair(B, device=str(dev))
 
     from .gumbel import run_and_update_gumbel
-    from .rollout import run_episodes, update_agents
 
     from .curriculum import ReferentialWorld, phase_named
     rw = ReferentialWorld(cfg, device=str(dev),
@@ -147,14 +146,8 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
             sb = rw.sample_mutual(n)
         else:
             sb = tw.sample(n)
-        if cfg.train.algo == "gumbel":
-            run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, fi, bi,
-                                  frac_done=0.1, device=str(dev), phase=phase)
-        else:
-            batch = run_episodes(cfg, sb, pop.farmers, pop.buyers, fi, bi,
-                                 device=str(dev), phase=phase)
-            update_agents(cfg, batch, pop.farmers, pop.buyers, frac_done=0.1,
-                          device=str(dev))
+        run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, fi, bi,
+                              update=100, device=str(dev), phase=phase)
 
     # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
     # dialogue in the market. Time a light, a middle and the heaviest rung, at
@@ -199,7 +192,8 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
           "(%.1f at the lineup's, %.1f at the market's)"
           % ("{:,}".format(cfg.train.episodes), hours("refer-mutual"), hours("refer"),
              hours("market")))
-    n_ck = max(1, cfg.train.episodes // max(1, cfg.log.checkpoint_every))
+    n_ck = max(1, cfg.train.episodes // max(1, cfg.train.batch_size)
+               // max(1, cfg.log.checkpoint_every_updates))
     print("  plus %d checkpoints; the metric suite replays episodes three times "
           "for the\n  channel ablation, so allow roughly %.0f%% on top."
           % (n_ck, 15))
