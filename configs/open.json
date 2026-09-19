@@ -37,8 +37,9 @@
   },
   "channel": {
     "atomic_vocab": 16,
-    "max_symbols": 4,
-    "n_turns": 4
+    "max_symbols": 24,
+    "n_turns": 4,
+    "enforce_word_grammar": true
   },
   "model": {
     "d_model": 48,

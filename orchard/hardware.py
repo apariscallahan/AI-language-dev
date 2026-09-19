@@ -75,8 +75,9 @@ def describe(dev: torch.device, cfg: Config) -> str:
     else:
         bits.append("%d threads" % cfg.train.torch_threads)
     if cfg.train.amp:
-        bits.append("bf16 autocast")
+        bits.append("bf16 autocast on the transformer layers" if dev.type == "cuda"
+                    else "amp requested but ignored on CPU (fp32)")
     if cfg.train.compile:
-        bits.append("compiled")
+        bits.append("compile requested but not wired in (see HANDOFF.md)")
     bits.append("vectorised world+reward" if cfg.train.vectorised else "scalar world+reward")
     return ", ".join(bits)

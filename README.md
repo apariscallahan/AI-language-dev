@@ -194,16 +194,27 @@ Following the addendum, agents do not choose from a fixed word list. They emit a
 { a0 … a35 }  ∪  { HYPHEN, SPACE, END }
 ```
 
-- a **word** is a run of atoms joined by `HYPHEN` — `a7-a22-a3` is one word;
-- a **sentence** (one turn) is words separated by `SPACE`;
+- a **word** is atoms joined by `HYPHEN` — `a7-a22-a3` is one word;
+- an **utterance** (one turn) is words separated by `SPACE` — `a7-a22 a3` is two;
 - `HYPHEN` and `SPACE` are structural marks and mean nothing themselves, exactly
   as no atom means anything at the start.
 
-The vocabulary is therefore open — there are far more possible words than atoms —
-while the channel stays discrete and narrow. Nothing constrains where the marks go:
-messages are parsed leniently, so any symbol sequence is legal and stray marks just
-cost the speaker a symbol. **Whether word-like structure appears at all is
-measured, never enforced** (`orchard/lexicon.py`).
+That shape is part of the medium and is enforced at every step
+(`channel.enforce_word_grammar`): after an atom the speaker must choose `HYPHEN`
+(same word), `SPACE` (next word) or `END`; after a mark it must say an atom. So
+every junction between two atoms is an explicit "same word / next word" choice,
+and a transcript reads exactly as it was emitted. (An earlier version let bare
+atoms run together into one word while `HYPHEN` did nothing, and printed hyphens
+the agents had never emitted.)
+
+*Which* atoms make words, and where words split, is entirely the agents' own.
+Ideally separate words come to name separate fields -- a variety word (noun-like)
+next to a quality word (adjective-like) -- and the report measures exactly that
+("word classes"); nothing requires it.
+
+The vocabulary is open — far more possible words than atoms — while the channel
+stays discrete. `channel.max_symbols` (24 per turn) is a buffer, not a limit
+anyone should feel: the report flags any utterance that reaches it.
 
 ### What keeps utterances short is a cost, not a rule
 
@@ -322,8 +333,9 @@ skew regime the addendum envisages did not train at this scale**, and that is
 reported as a finding rather than worked around.
 
 Note the secondary effect in the first table: a longer per-turn cap costs
-transmission on its own, which is why `max_symbols` starts small, exactly as the
-addendum recommends.
+transmission on its own. The cap has since been raised to a generous buffer
+(24 symbols per turn) because a small cap does worse damage: at 4 symbols, 100%
+of utterances were hitting it once every field had to be named.
 
 ### Straight-through Gumbel cannot feel a length cost on its own
 
@@ -354,12 +366,20 @@ comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
 
 So the task is built up, and a rung is only left behind once it has worked:
 
-| phase | what is added | chance rate |
+| rung | what is added | chance rate |
 |---|---|---|
-| `refer` | a lineup game: the informer describes one meaning, the guesser picks it out of K candidates. No price, no budget, no negotiation, no market. | 1/K |
+| `refer` | a lineup game: the farmer describes one meaning, the buyer picks it out of K candidates. No price, no budget, no negotiation, no market. | 1/K |
+| `refer-swap` | the same game with the roles alternating batch by batch, so every agent must both describe and decode | 1/K |
+| `refer-mutual` | both hold a private (variety, quantity, quality) tuple and each must report the other's; still no price, no accept/reject | measured (muted channel) |
+| `order` | the buyer asks; the farmer must fill the order exactly with its *deal* decision — the first rung that uses the deal heads | measured (muted channel) |
 | `haggle` | price and budget, so accept/reject has a payoff — still one message each | ~0 |
 | `bargain` | several turns, so counter-offers become possible | ~0 |
 | `market` | the full economy: persistent stock, restocking, viability | ~0 |
+
+Each rung adds one thing. `refer-swap` exists because a single fixed describer
+produces a one-way code: in the run that motivated it, the farmer's utterances
+had positional structure 0.03 while the buyer's had 0.39, and every farmer
+newborn's token accuracy was 0.000.
 
 The point of the first rung is that 1/K is a gradient RL can climb, where the
 full task's success probability from random weights is about 1e-3.
@@ -372,19 +392,53 @@ empty. (The transmission bottleneck still applies normally to newborns *within* 
 phase. That is a separate mechanism and is untouched.)
 
 **Promotion is on evidence, not on a schedule.** All of these have to hold at the
-same checkpoint before the next phase starts:
+same check before the next rung starts:
 
-- success clear of that phase's chance rate (and above an absolute floor),
+- success clear of that rung's chance rate (and above an absolute floor),
 - topological similarity clear of its own shuffled null,
-- the channel-scramble control showing a real drop when messages are muted.
+- the channel control showing a real drop when messages are muted.
+
+In `refer-swap` and `refer-mutual` every one of these is checked **per role**,
+never pooled: each role's own utterances must show topsim over null *and*
+positional structure (`curriculum.min_positional_structure`), and each role must
+decode in the view where it is the one decoding (`refer-swap`) or report the
+other's tuple (`refer-mutual`, `curriculum.mutual_min_report`). A pooled
+average would let a fluent partner carry a role that never learned to speak.
 
 Success alone is not enough, because a pair can score on base rates without
-saying anything. Every transition is logged with the numbers that justified it.
+saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
-If a phase runs past `curriculum.max_episodes_per_phase` without meeting them, the
-run **does not advance**: it flags the stall loudly, names the unmet criteria, and
-either holds or stops (`curriculum.on_stall`). Building the next phase on top of
-one that never converged would only reproduce the failure a rung higher.
+**Every rung has a budget** (`curriculum.rung_budgets`, min and max episodes).
+Promotion is checked every `curriculum.check_every` episodes with a light probe,
+so a rung that works is left promptly. A rung that reaches its maximum without
+meeting its criteria **stops the run** (`curriculum.on_stall`, default `stop`)
+and the report names every unmet criterion. Building the next rung on top of one
+that never converged would only reproduce the failure a rung higher.
+
+**Who speaks when belongs to the rung.** In the lineup rungs the describer opens,
+so everything that needs to know whose words are whose — the symbol cost, the
+bottleneck's training targets, the "these were my words" embedding, and the
+probes that extract per-meaning forms — asks the rung. The earlier fixed
+buyer-opens schedule billed a silent guesser for the describer's symbols, trained
+buyer newborns to imitate farmer words, and gave farmer newborns no targets at
+all.
+
+### Hindsight feedback
+
+After each round, the heads a rung scores are also trained towards the outcome:
+the lineup target, the partner's actual meaning, the order that was placed, the
+other trader's actual situation (`train.hindsight_coef`). This is feedback about
+*what happened*, never about which words to use, and it reaches the speaker
+through the straight-through channel for every field the listener has to
+recover. Without it the code locked into naming variety alone -- 1.5 bits of
+variety and 0.01-0.05 bits of quantity or quality in live messages, e.g.
+`a13-a13-a13-a13` -- because a listener that only ever hears "right" or "wrong"
+never learns what it should have read, and a speaker whose every slot is read
+as variety gets no gradient towards anything else.
+
+Structure is judged by **field coverage** (how much of each field the messages
+carry, chance-corrected), not just positional structure, which that
+variety-only code scored at 1.00 by naming the variety in every slot.
 
 ### Telling inherited structure from new structure
 
@@ -395,6 +449,41 @@ it first appeared in and the phase it settled in, so the report separates
 specifically added" — and lists the words that first appeared in a negotiation
 phase, which is where anything like offer / counter-offer / accept / refuse
 vocabulary would show up.
+
+## Speaker pressures: brevity, established forms, shared conventions
+
+Three terms are paid to or charged to the *speaker* only. All three are reward
+terms, not restrictions: nothing ever stops an agent from saying anything.
+
+| knob | what it does |
+|---|---|
+| `reward.symbol_cost` (0.03) | per emitted atom, hyphen or space |
+| `reward.rarity_cost` (0.05) | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life`), centred on the batch so it favours established forms without ever favouring silence |
+| `reward.convention` (0.15) | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
+| `train.shaping_reinforce` | how strongly these reach the speaker's token choices |
+
+A language has to exist before it can be economised. Charged from the first
+episode, even a small symbol cost drives the lineup's describer to silence long
+before the lineup takes off, and ramping them in with the first rung's success
+capped that success once lineups demanded every field be named (0.42 with the
+costs two-thirds on, against 0.62 with them essentially off). So all three are
+off for the first rung and fully on from its promotion onwards.
+
+**Growing the community.** Six speakers and six listeners from random weights
+never got the lineup off chance in 200k episodes: each farmer kept its own
+drifting code (coherence 0.04-0.09), and even a strong convention bonus only
+lifted that to ~0.2. Two and two invent a code in ~80k. So a large community is
+*founded* small (`population.founders_farmers/_buyers`) and grows after the
+first rung: a newcomer of each role joins every `population.grow_every`
+episodes, born like any newborn -- random weights, then the transmission
+bottleneck on the community's transcripts -- so it learns the existing language
+instead of inventing another. Every rung after the first waits for, and is
+judged on, the full community.
+
+The report measures what they are for: distinct words, atoms per word, share of
+utterances at the length cap, coherence within each role and across roles, and
+**cross-role vocabulary overlap**: the histogram intersection of the farmer's and
+the buyer's word use (1.0 = one shared vocabulary, 0.0 = two foreign codes).
 
 ## Generations, and what gets lost
 

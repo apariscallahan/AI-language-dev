@@ -106,6 +106,13 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
     print("  %s" % describe(dev, cfg))
 
     pop = Population(cfg, random.Random(0), device=str(dev))
+    # Time the community at the size it will spend most of the run at, not the
+    # founders it starts from.
+    while not pop.full_size:
+        for role, target in ((FARMER, cfg.population.n_farmers),
+                             (BUYER, cfg.population.n_buyers)):
+            if len(pop.pool(role)) < target:
+                pop.add_newcomer(role, 0)
     per_agent = count_parameters(pop.farmers[0].net)
     n_agents = cfg.population.n_farmers + cfg.population.n_buyers
     print("  agents            : %d farmers + %d buyers = %d"
@@ -128,39 +135,54 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
     from .gumbel import run_and_update_gumbel
     from .rollout import run_episodes, update_agents
 
-    def one_step():
-        sb = tw.sample(B)
+    from .curriculum import ReferentialWorld, phase_named
+    rw = ReferentialWorld(cfg, device=str(dev),
+                          generator=torch.Generator(device=dev).manual_seed(1))
+
+    def one_step(phase):
+        if phase.referential:
+            sb = rw.sample(B, informer=phase.informer)
+        elif phase.mutual:
+            sb = rw.sample_mutual(B)
+        else:
+            sb = tw.sample(B)
         if cfg.train.algo == "gumbel":
             run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
-                                  frac_done=0.1, device=str(dev))
+                                  frac_done=0.1, device=str(dev), phase=phase)
         else:
             batch = run_episodes(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
-                                 device=str(dev))
+                                 device=str(dev), phase=phase)
             update_agents(cfg, batch, pop.farmers, pop.buyers, frac_done=0.1,
                           device=str(dev))
 
-    print("\n  warming up...")
-    for _ in range(3):
-        one_step()
-    if dev.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-
-    t0 = time.time()
-    for _ in range(n_batches):
-        one_step()
-    if dev.type == "cuda":
-        torch.cuda.synchronize()
-    dt = (time.time() - t0) / n_batches
-    eps = B / dt
-
-    print("\n  measured          : %.3f s per batch, %s episodes/sec"
-          % (dt, "{:,.0f}".format(eps)))
-    if dev.type == "cuda":
-        print("  peak GPU memory   : %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
+    # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
+    # dialogue in the market. Time a light, a middle and the heaviest rung, at
+    # full community size (an upper bound: founders are cheaper).
+    rates = {}
+    for name in ("refer", "refer-mutual", "market"):
+        phase = phase_named(cfg, name)
+        one_step(phase)                        # warm-up
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
+        for _ in range(n_batches):
+            one_step(phase)
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        dt = (time.time() - t0) / n_batches
+        rates[name] = B / dt
+        print("\n  %-17s : %.3f s per batch, %s episodes/sec"
+              % (name, dt, "{:,.0f}".format(rates[name])))
+        if dev.type == "cuda":
+            print("  peak GPU memory   : %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
+    eps = rates["refer-mutual"]
     total_h = cfg.train.episodes / eps / 3600
-    print("  configured run    : %s episodes -> %.1f hours of training"
-          % ("{:,}".format(cfg.train.episodes), total_h))
+    print("\n  configured run    : %s episodes -> ~%.1f hours at the middle rung's rate "
+          "(%.1f at the lineup's, %.1f at the market's)"
+          % ("{:,}".format(cfg.train.episodes), total_h,
+             cfg.train.episodes / rates["refer"] / 3600,
+             cfg.train.episodes / rates["market"] / 3600))
     n_ck = max(1, cfg.train.episodes // max(1, cfg.log.checkpoint_every))
     print("  plus %d checkpoints; the metric suite replays episodes three times "
           "for the\n  channel ablation, so allow roughly %.0f%% on top."
@@ -262,6 +284,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="finished run directories to overlay")
     p.add_argument("--compare-out", type=str, default="runs/comparison")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--resume", type=str, default=None,
+                   help="continue from a snapshot (runs/<name>/snapshots/*.pt) under "
+                        "the configuration given here; rung, weights, usage and the "
+                        "transcript store all carry over")
     p.add_argument("--benchmark", nargs="?", type=int, const=12, default=None,
                    metavar="N",
                    help="time N batches on this machine and print what the "
@@ -282,29 +308,40 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
 
     trainer = Trainer(cfg, out, quiet=args.quiet)
+    if args.resume:
+        trainer.load_snapshot(args.resume)
     try:
         final = trainer.run()
         trainer.log("")
         trainer.log("running post-hoc token-semantics analysis (spec 6.3)...")
+        # Analysed under the rung the run ended on: who speaks, and about what,
+        # depends on it.
+        phase = trainer.curriculum.phase
         sem = analyse_token_semantics(cfg, trainer.pop, trainer.world,
                                       n_samples=max(400, cfg.log.topsim_samples * 2),
-                                      device=cfg.train.device, rng=trainer.eval_rng)
+                                      device=cfg.train.device, rng=trainer.eval_rng,
+                                      phase=phase)
         with open(os.path.join(out, "token_semantics.json"), "w", encoding="utf-8") as fh:
             json.dump(sem.to_dict(), fh, indent=1)
 
         # keep the raw token counts available to the report
         from .lexicon import length_frequency, word_stats
         from .metrics import evaluate_success, vocab_stats
-        ev = evaluate_success(cfg, trainer.pop, trainer.world, 600,
-                              device=cfg.train.device, rng=trainer.eval_rng)
-        final["token_counts"] = vocab_stats(cfg, [ev["batch"]])["token_counts"]
-        final["word_counts"] = word_stats(cfg, [ev["batch"]])["word_counts"]
+        batches = [evaluate_success(cfg, trainer.pop, trainer.world,
+                                    600 // len(phase.views()), device=cfg.train.device,
+                                    rng=trainer.eval_rng, phase=v,
+                                    sampler=trainer.phase_sampler(v))["batch"]
+                   for v in phase.views()]
+        final["token_counts"] = vocab_stats(cfg, batches)["token_counts"]
+        final["word_counts"] = word_stats(cfg, batches)["word_counts"]
         final["length_frequency_rows"] = length_frequency(
-            cfg, trainer.pop, trainer.world, device=cfg.train.device).get("rows", [])[:20]
+            cfg, trainer.pop, trainer.world, device=cfg.train.device,
+            phase=phase).get("rows", [])[:20]
         if trainer.forms is not None:
             final["form_events"] = trainer.forms.report_rows()
             final["form_timeline"] = trainer.forms.timeline()
         final["curriculum"] = trainer.curriculum_report()
+        final["language_properties"] = trainer.language_properties(sem)
 
         path = write_report(
             cfg, out, final=final, chance=trainer.chance, sem=sem,

@@ -132,24 +132,37 @@ def entropy_bits(counts: Iterable[int]) -> float:
 # meaning-space distances  (spec 5.2)
 # ==========================================================================
 def meaning_distance(a: Sequence[int], b: Sequence[int], cfg: Config, role: int,
-                     metric: str = "hamming") -> float:
-    """Distance between two private states, over that role's real fields only."""
-    kinds = obs_schema(cfg.world, role)
+                     metric: str = "hamming", kinds: Optional[Sequence[int]] = None
+                     ) -> float:
+    """Distance between two private states, over that role's real fields only.
+
+    ``kinds`` overrides the trading-task schema -- a lineup describer's meaning
+    is a (variety, quantity, quality) tuple, not a shopping list.
+    """
+    kinds = list(kinds) if kinds is not None else obs_schema(cfg.world, role)
     if metric == "hamming":
         return float(sum(1 for x, y, k in zip(a, b, kinds)
                          if k != K_EMPTY and x != y))
     if metric == "l1":
         # keeps the ordinal structure of quantity and price that Hamming discards
-        spans = field_spans(cfg.world, role)
+        spans = _spans_for(cfg, kinds)
         return float(sum(abs(x - y) / sp
                          for x, y, k, sp in zip(a, b, kinds, spans) if k != K_EMPTY))
     raise ValueError("unknown meaning metric %r" % (metric,))
 
 
+def _spans_for(cfg: Config, kinds: Sequence[int]) -> list[int]:
+    w = cfg.world
+    spans = {K_EMPTY: 1, K_VARIETY: max(w.n_varieties - 1, 1), K_QTY: max(w.max_qty, 1),
+             K_QUALITY: max(w.n_quality - 1, 1), K_PRICE: max(w.n_price_bins - 1, 1)}
+    return [spans[k] for k in kinds]
+
+
 def topographic_similarity(meanings: Sequence[Sequence[int]],
                            messages: Sequence[Sequence[int]],
                            cfg: Config, role: int, *, metric: str = "hamming",
-                           n_null: int = 3, rng: Optional[random.Random] = None
+                           n_null: int = 3, rng: Optional[random.Random] = None,
+                           kinds: Optional[Sequence[int]] = None
                            ) -> dict[str, float]:
     """Brighton & Kirby topological similarity.
 
@@ -166,7 +179,7 @@ def topographic_similarity(meanings: Sequence[Sequence[int]],
     sd: list[float] = []
     for i in range(n):
         for j in range(i + 1, n):
-            md.append(meaning_distance(meanings[i], meanings[j], cfg, role, metric))
+            md.append(meaning_distance(meanings[i], meanings[j], cfg, role, metric, kinds))
             sd.append(float(levenshtein(messages[i], messages[j])))
     rho = _spearman(md, sd)
 
@@ -193,7 +206,7 @@ def topographic_similarity(meanings: Sequence[Sequence[int]],
 # ==========================================================================
 @torch.no_grad()
 def greedy_turn(cfg: Config, agent: Agent, obs: torch.Tensor, tokens: torch.Tensor,
-                turn: int) -> torch.Tensor:
+                turn: int, schema=None, self_mask=None) -> torch.Tensor:
     """Fill dialogue ``turn`` for a whole batch by greedy decoding.  Mutates ``tokens``."""
     c = cfg.channel
     B = obs.shape[0]
@@ -202,8 +215,11 @@ def greedy_turn(cfg: Config, agent: Agent, obs: torch.Tensor, tokens: torch.Tens
         if not bool(alive.any()):
             break
         p = turn * c.max_msg_len + k
-        logits, _ = agent.net.next_token_logits(obs, tokens, dialogue_offset(cfg) + p)
-        tok = logits.argmax(dim=-1)
+        logits, _ = agent.net.next_token_logits(obs, tokens, dialogue_offset(cfg) + p,
+                                                schema=schema, self_mask=self_mask)
+        from .env import MASKED, grammar_allowed
+        allowed = grammar_allowed(cfg, tokens[:, p - 1] if k > 0 else tokens[:, p], k)
+        tok = logits.masked_fill(~allowed, MASKED).argmax(dim=-1)
         tok = torch.where(alive, tok, torch.full_like(tok, c.pad_id))
         tokens[:, p] = tok
         alive = alive & (tok != c.eos_id)
@@ -217,35 +233,80 @@ def _strip(cfg: Config, row: Sequence[int]) -> list[int]:
 @torch.no_grad()
 def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequence[int]],
                             *, context: Optional[torch.Tensor] = None,
-                            device: str = "cpu") -> list[list[int]]:
+                            device: str = "cpu", phase=None) -> Optional[list[list[int]]]:
     """This agent's own first utterance for each meaning, greedily decoded.
 
-    For a Buyer (who opens) the utterance is a pure function of its private
-    observation.  For a Farmer, the reply also depends on what the Buyer just
-    said, so ``context`` supplies one fixed opening message for every probe --
-    holding the conversation constant so the variation measured is the Farmer's.
+    The first speaker's utterance is a pure function of its private observation.
+    A later speaker's also depends on what was said to it, so ``context``
+    supplies one fixed opening for every probe -- holding the conversation
+    constant so the variation measured is the probed agent's own.
+
+    ``phase`` decides who speaks when, what the observation slots mean, and which
+    slots are "mine". Without it this is the trading task (buyer opens). Returns
+    ``None`` if the agent's role does not speak in that phase: a lineup guesser
+    has no utterance to probe, and pretending otherwise is how per-meaning forms
+    got read off agents that had never said a word in that rung.
     """
+    from .curriculum import ladder, phase_schema
     c = cfg.channel
+    ph = phase if phase is not None else ladder(cfg)[-1]
+    turns = ph.turns_of(cfg, agent.role)
+    if not turns:
+        return None
+    turn = turns[0]
     n = len(meanings)
+    L = c.max_msg_len
     obs = torch.tensor([list(m) for m in meanings], dtype=torch.long, device=device)
     tokens = torch.full((n, c.dialogue_len), c.pad_id, dtype=torch.long, device=device)
-    turn = 0 if agent.role == BUYER else 1
-    if agent.role == FARMER:
+    if turn > 0:
         if context is None:
-            context = torch.full((c.max_msg_len,), c.eos_id, dtype=torch.long, device=device)
+            context = torch.full((turn * L,), c.pad_id, dtype=torch.long, device=device)
             context[0] = c.eos_id
-        tokens[:, :c.max_msg_len] = context.unsqueeze(0)
-    greedy_turn(cfg, agent, obs, tokens, turn)
-    L = c.max_msg_len
+        tokens[:, :turn * L] = context[:turn * L].unsqueeze(0)
+    greedy_turn(cfg, agent, obs, tokens, turn, schema=phase_schema(cfg, agent.role, ph),
+                self_mask=ph.self_mask(cfg, agent.role, device))
     return [_strip(cfg, tokens[i, turn * L:(turn + 1) * L]) for i in range(n)]
 
 
+def phase_kinds(cfg: Config, role: int, phase=None) -> list[int]:
+    from .curriculum import ladder, phase_schema
+    return phase_schema(cfg, role, phase if phase is not None else ladder(cfg)[-1])
+
+
+def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
+    """Human names for a speaker's observation slots in this phase."""
+    if phase is not None and phase.tuples:
+        names = ["variety", "quantity", "quality"]
+        kinds = phase_kinds(cfg, role, phase)
+        return names + ["-"] * (len(kinds) - len(names))
+    return field_labels(cfg.world, role)
+
+
+def tuple_meanings(cfg: Config, n: int, seed: int = 0) -> list[tuple[int, ...]]:
+    """(variety, quantity, quality) meanings from the lineup marginals, padded."""
+    from .curriculum import ReferentialWorld
+    from .world import n_obs_slots
+    g = torch.Generator()
+    g.manual_seed(seed)
+    rw = ReferentialWorld(cfg, device="cpu", generator=g)
+    rows = rw._draw(n).tolist()
+    width = n_obs_slots(cfg.world, cfg)
+    return [tuple(r) + (0,) * (width - len(r)) for r in rows]
+
+
 def sample_meanings(cfg: Config, world: World, role: int, n: int,
-                    *, held_out: bool | None = False) -> list[tuple[int, int, int, int]]:
+                    *, held_out: bool | None = False, phase=None,
+                    seed: Optional[int] = None) -> list[tuple[int, ...]]:
+    if phase is not None and phase.tuples:
+        return tuple_meanings(cfg, n, seed if seed is not None
+                              else random.Random().randrange(1 << 30))
+    from .world import n_obs_slots
+    width = n_obs_slots(cfg.world, cfg)
     out = []
     for _ in range(n):
         sc = world.sample(held_out=held_out)
-        out.append(obs_for(role, sc, cfg))
+        o = tuple(obs_for(role, sc, cfg))
+        out.append(o + (0,) * max(0, width - len(o)))
     return out
 
 
@@ -262,40 +323,119 @@ def farmer_context_message(cfg: Config, pop: Population, world: World,
     return tokens[0, :c.max_msg_len].clone()
 
 
+@torch.no_grad()
+def opening_context(cfg: Config, pop: Population, world: World, phase=None,
+                    device: str = "cpu") -> Optional[torch.Tensor]:
+    """One fixed opening turn, for probing whoever speaks second in ``phase``."""
+    if phase is None or not phase.tuples:
+        return farmer_context_message(cfg, pop, world, device)
+    first = phase.speaker_of_turn(0)
+    agent = pop.pool(first)[0]
+    m = sample_meanings(cfg, world, first, 1, phase=phase, seed=12345)
+    msg = utterances_for_meanings(cfg, agent, m, device=device, phase=phase)
+    c = cfg.channel
+    out = torch.full((c.max_msg_len,), c.pad_id, dtype=torch.long, device=device)
+    if msg:
+        u = msg[0][:c.max_msg_len]
+        if u:
+            out[:len(u)] = torch.tensor(u, dtype=torch.long, device=device)
+    return out
+
+
+def speaking_roles(cfg: Config, phase=None) -> list[tuple[int, str]]:
+    """The (role, label) pairs that actually talk in this phase, over all its views."""
+    from .curriculum import ladder
+    ph = phase if phase is not None else ladder(cfg)[-1]
+    out = []
+    for role, label in ((BUYER, "buyer"), (FARMER, "farmer")):
+        if any(v.speaks(cfg, role) for v in ph.views()):
+            out.append((role, label))
+    return out
+
+
+def speaker_view(phase, cfg: Config, role: int):
+    """The view of ``phase`` in which ``role`` speaks (its describer view in a swap)."""
+    from .curriculum import ladder
+    ph = phase if phase is not None else ladder(cfg)[-1]
+    for v in ph.views():
+        if v.speaks(cfg, role):
+            return v
+    return None
+
+
 # ==========================================================================
 # 5.2  compositionality, per role
 # ==========================================================================
 def compositionality(cfg: Config, pop: Population, world: World, *,
                      n_samples: int = 200, device: str = "cpu",
-                     rng: Optional[random.Random] = None) -> dict[str, Any]:
+                     rng: Optional[random.Random] = None, phase=None,
+                     n_null: int = 3) -> dict[str, Any]:
+    """Topographic similarity of each role's utterances, under ``phase``.
+
+    A role that does not speak in the phase is reported as NaN with
+    ``silent`` set, rather than probed anyway -- a lineup guesser never talks.
+    """
     rng = rng or random.Random(0)
-    ctx = farmer_context_message(cfg, pop, world, device)
     out: dict[str, Any] = {}
+    talking = dict((lbl, r) for r, lbl in speaking_roles(cfg, phase))
     for role, label in ((BUYER, "buyer"), (FARMER, "farmer")):
-        meanings = sample_meanings(cfg, world, role, n_samples)
+        view = speaker_view(phase, cfg, role) if phase is not None else None
+        if phase is not None and label not in talking:
+            out[label] = {"mean": float("nan"), "max": float("nan"),
+                          "mean_l1": float("nan"), "null_mean": float("nan"),
+                          "per_agent": [], "silent": True}
+            continue
+        kinds = phase_kinds(cfg, role, view)
+        ctx = opening_context(cfg, pop, world, view, device)
+        meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
+                                   seed=rng.randrange(1 << 30))
         per_agent = []
-        for agent in pop.pool(role):
-            msgs = utterances_for_meanings(cfg, agent, meanings,
-                                           context=ctx if role == FARMER else None,
-                                           device=device)
-            r = topographic_similarity(meanings, msgs, cfg, role, metric="hamming", rng=rng)
+        from .properties import disentanglement
+        real = [i for i, k in enumerate(kinds) if k != K_EMPTY]
+        pool = list(pop.pool(role))
+        cap = max(1, cfg.log.max_agents_probed)
+        if len(pool) > cap:
+            pool = random.Random(cfg.train.seed + len(pool)).sample(pool, cap)
+        for agent in pool:
+            msgs = utterances_for_meanings(cfg, agent, meanings, context=ctx,
+                                           device=device, phase=view)
+            r = topographic_similarity(meanings, msgs, cfg, role, metric="hamming",
+                                       rng=rng, kinds=kinds, n_null=n_null)
             r_l1 = topographic_similarity(meanings, msgs, cfg, role, metric="l1",
-                                          n_null=0, rng=rng)
+                                          n_null=0, rng=rng, kinds=kinds)
+            dis = disentanglement(meanings, msgs, real, cfg.channel.max_msg_len)
+            from .properties import field_coverage
+            cov = field_coverage(meanings, msgs, real, rng=rng)
             per_agent.append({"agent": agent.name, "generation": agent.generation,
                               "topsim": r["topsim"], "null": r["null_mean"],
-                              "z": r["z"], "topsim_l1": r_l1["topsim"]})
+                              "z": r["z"], "topsim_l1": r_l1["topsim"],
+                              "posdis": dis["posdis"], "bosdis": dis["bosdis"],
+                              "field_coverage": cov["coverage"],
+                              "per_field": cov["per_field"]})
         vals = [a["topsim"] for a in per_agent if a["topsim"] == a["topsim"]]
         l1s = [a["topsim_l1"] for a in per_agent if a["topsim_l1"] == a["topsim_l1"]]
         nulls = [a["null"] for a in per_agent if a["null"] == a["null"]]
+        def avg(key):
+            xs = [a[key] for a in per_agent if a[key] == a[key]]
+            return sum(xs) / len(xs) if xs else float("nan")
         out[label] = {
             "mean": sum(vals) / len(vals) if vals else float("nan"),
             "max": max(vals) if vals else float("nan"),
             "mean_l1": sum(l1s) / len(l1s) if l1s else float("nan"),
             "null_mean": sum(nulls) / len(nulls) if nulls else float("nan"),
+            "posdis": avg("posdis"),
+            "bosdis": avg("bosdis"),
+            "field_coverage": avg("field_coverage"),
+            "per_field_coverage": [
+                (sum(a["per_field"][i] for a in per_agent) / len(per_agent))
+                for i in range(len(per_agent[0]["per_field"]))] if per_agent else [],
             "per_agent": per_agent,
         }
     both = [out[k]["mean"] for k in ("buyer", "farmer") if out[k]["mean"] == out[k]["mean"]]
     out["mean"] = sum(both) / len(both) if both else float("nan")
+    nulls = [out[k]["null_mean"] for k in ("buyer", "farmer")
+             if out[k]["null_mean"] == out[k]["null_mean"]]
+    out["null_mean"] = sum(nulls) / len(nulls) if nulls else float("nan")
     return out
 
 
@@ -350,42 +490,67 @@ def vocab_stats(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
 # 5.4  stability of the meaning->message mapping over time
 # ==========================================================================
 class StabilityTracker:
-    """Re-asks the same fixed probe meanings every checkpoint (spec 5.4)."""
+    """Re-asks the same fixed probe meanings every checkpoint (spec 5.4).
+
+    Probes are per *meaning kind* -- a trading request, a farmer's barn, a lineup
+    tuple -- and only the roles that actually speak in the current phase are
+    asked. Coherence is "do different agents say the same thing for the same
+    meaning"; with both roles describing tuples it is also measured *across*
+    roles (``coherence_cross``), which is the one-language-or-two question.
+    """
 
     def __init__(self, cfg: Config, world: World, n_probes: int, seed: int = 99):
         self.cfg = cfg
+        self.n_probes = n_probes
+        self.seed = seed
         probe_rng = random.Random(seed)
         probe_world = World(cfg.world, probe_rng)
         self.probes = {
-            BUYER: [buyer_obs(probe_world.sample(held_out=False), cfg)
-                    for _ in range(n_probes)],
-            FARMER: [farmer_obs(probe_world.sample(held_out=False), cfg)
-                     for _ in range(n_probes)],
+            ("request", BUYER): [buyer_obs(probe_world.sample(held_out=False), cfg)
+                                 for _ in range(n_probes)],
+            ("barn", FARMER): [farmer_obs(probe_world.sample(held_out=False), cfg)
+                               for _ in range(n_probes)],
         }
-        self.last: dict[int, list[list[int]]] = {}       # agent_id -> messages
+        self._tuples = tuple_meanings(cfg, n_probes, seed=seed)
+        self.last: dict[tuple, list[list[int]]] = {}   # (agent_id, kind) -> messages
+
+    def probes_for(self, phase, role: int) -> tuple[str, list]:
+        if phase is None or not phase.tuples:
+            kind = "request" if role == BUYER else "barn"
+            return kind, self.probes[(kind, role)]
+        return "tuple", self._tuples
 
     @torch.no_grad()
-    def measure(self, pop: Population, world: World, device: str = "cpu") -> dict[str, Any]:
-        ctx = farmer_context_message(self.cfg, pop, world, device)
+    def measure(self, pop: Population, world: World, device: str = "cpu",
+                phase=None) -> dict[str, Any]:
         drift_scores: list[float] = []
         identical: list[float] = []
         coherence: dict[str, float] = {}
-        current: dict[int, list[list[int]]] = {}
+        by_role: dict[str, list[list[list[int]]]] = {}
+        kind_of: dict[str, str] = {}
+        talking = dict((lbl, r) for r, lbl in speaking_roles(self.cfg, phase))
 
         for role, label in ((BUYER, "buyer"), (FARMER, "farmer")):
-            probes = self.probes[role]
+            if phase is not None and label not in talking:
+                coherence[label] = float("nan")
+                continue
+            view = speaker_view(phase, self.cfg, role) if phase is not None else None
+            kind, probes = self.probes_for(view, role)
+            ctx = opening_context(self.cfg, pop, world, view, device)
             all_msgs: list[list[list[int]]] = []
             for agent in pop.pool(role):
-                msgs = utterances_for_meanings(
-                    self.cfg, agent, probes,
-                    context=ctx if role == FARMER else None, device=device)
-                current[agent.agent_id] = msgs
+                msgs = utterances_for_meanings(self.cfg, agent, probes, context=ctx,
+                                               device=device, phase=view)
+                if msgs is None:
+                    continue
+                key = (agent.agent_id, kind)
                 all_msgs.append(msgs)
-                prev = self.last.get(agent.agent_id)
+                prev = self.last.get(key)
                 if prev is not None and len(prev) == len(msgs):
                     ds = [normalised_levenshtein(a, b) for a, b in zip(prev, msgs)]
                     drift_scores.extend(ds)
                     identical.extend([1.0 if a == b else 0.0 for a, b in zip(prev, msgs)])
+                self.last[key] = msgs
 
             # population coherence: do *different* agents say the same thing for the
             # same meaning?  This is what makes it a shared code rather than N codes.
@@ -395,13 +560,24 @@ class StabilityTracker:
                     for a, b in zip(all_msgs[i], all_msgs[j]):
                         pair_d.append(normalised_levenshtein(a, b))
             coherence[label] = 1.0 - (sum(pair_d) / len(pair_d)) if pair_d else float("nan")
+            by_role[label] = all_msgs
+            kind_of[label] = kind
 
-        self.last = current
+        cross = float("nan")
+        if ("farmer" in by_role and "buyer" in by_role
+                and kind_of["farmer"] == kind_of["buyer"]):
+            d = [normalised_levenshtein(a, b)
+                 for fm in by_role["farmer"] for bm in by_role["buyer"]
+                 for a, b in zip(fm, bm)]
+            cross = 1.0 - sum(d) / len(d) if d else float("nan")
+        vals = [v for v in coherence.values() if v == v]
         return {
             "drift": sum(drift_scores) / len(drift_scores) if drift_scores else float("nan"),
             "identical_frac": sum(identical) / len(identical) if identical else float("nan"),
             "coherence_buyer": coherence.get("buyer", float("nan")),
             "coherence_farmer": coherence.get("farmer", float("nan")),
+            "coherence": sum(vals) / len(vals) if vals else float("nan"),
+            "coherence_cross": cross,
             "n_compared": len(drift_scores),
         }
 
@@ -436,6 +612,7 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     # 4096 attribute lookups on dataclasses that had to be built first.
     succ_t = batch.success_t
     referential = batch.sb is not None and not hasattr(batch.sb, "viable")
+    mutual = referential and batch.res is not None and "farmer_report_ok" in batch.res
     viable_t = (torch.ones_like(succ_t) if referential
                 else batch.viable_t.to(succ_t.device))
     succ = int(succ_t.sum())
@@ -477,7 +654,15 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     # channel -- every field is one the answering agent cannot observe.
     f_decode = float(batch.farmer_decode_t.float().mean())
     b_decode = float(batch.buyer_decode_t.float().mean())
+    extra: dict[str, Any] = {}
+    if mutual:
+        extra["farmer_report"] = float(batch.res["farmer_report_ok"].float().mean())
+        extra["buyer_report"] = float(batch.res["buyer_report_ok"].float().mean())
+        ff, bf = batch.res["farmer_fields"].float(), batch.res["buyer_fields"].float()
+        extra["farmer_report_fields"] = [float(x) for x in ff.mean(0)]
+        extra["buyer_report_fields"] = [float(x) for x in bf.mean(0)]
     return {
+        **extra,
         "n": n,
         "success_rate": succ / n,
         "success_rate_on_viable": succ_viable / viable if viable else float("nan"),
@@ -507,24 +692,56 @@ def evaluate_success(cfg: Config, pop: Population, world: World, n: int,
 
 
 # ---- 5.6 zero-shot generalisation ---------------------------------------
+ZS_MIN_SEEN_SUCCESSES = 20
+ZS_MIN_SEEN_RATE = 0.05
+
+
 def zero_shot(cfg: Config, pop: Population, world: World, n: int,
-              device: str = "cpu", rng: Optional[random.Random] = None) -> dict[str, Any]:
-    """Success on (variety, quantity) combinations never sampled during training."""
+              device: str = "cpu", rng: Optional[random.Random] = None,
+              phase=None, sampler=None, n_holdout: Optional[int] = None) -> dict[str, Any]:
+    """Success on (variety, quantity) combinations never sampled during training.
+
+    Retention is unseen / seen, which is meaningless when "seen" is a handful of
+    lucky rounds: 4 successes against 1 reads as 4.00, which is how a run with no
+    working language reported perfect-plus generalisation. Below
+    ``ZS_MIN_SEEN_SUCCESSES`` successes, or a seen rate under ``ZS_MIN_SEEN_RATE``,
+    retention is suppressed (NaN) and the reason recorded. Lineup rungs have no
+    held-out combinations at all, so there it is simply not applicable.
+    """
+    base = {"n": n, "n_holdout_combos": len(world.holdout) if n_holdout is None else n_holdout,
+            "context": "lineup tuples" if (phase is not None and phase.tuples) else "trades"}
+    if phase is not None and phase.tuples and not n_holdout:
+        return {**base, "seen_success": float("nan"), "unseen_success": float("nan"),
+                "seen_success_on_viable": float("nan"),
+                "unseen_success_on_viable": float("nan"), "retention": float("nan"),
+                "suppressed": "not applicable: no lineup tuples are held out"}
     f_all = list(range(len(pop.farmers)))
     b_all = list(range(len(pop.buyers)))
-    seen = _play(cfg, pop, world, n, f_all, b_all, held_out=False, device=device, rng=rng)
-    unseen = _play(cfg, pop, world, n, f_all, b_all, held_out=True, device=device, rng=rng)
-    gap = float("nan")
-    if seen["success_rate"] == seen["success_rate"] and seen["success_rate"] > 0:
-        gap = unseen["success_rate"] / seen["success_rate"]
+    seen = _play(cfg, pop, world, n, f_all, b_all, held_out=False, device=device, rng=rng,
+                 phase=phase, sampler=sampler)
+    unseen = _play(cfg, pop, world, n, f_all, b_all, held_out=True, device=device, rng=rng,
+                   phase=phase, sampler=sampler)
+    s_rate, u_rate = seen["success_rate"], unseen["success_rate"]
+    n_seen_succ = int(round(s_rate * seen["n"])) if s_rate == s_rate else 0
+    retention = float("nan")
+    why = None
+    if s_rate != s_rate:
+        why = "no evaluation"
+    elif n_seen_succ < ZS_MIN_SEEN_SUCCESSES or s_rate < ZS_MIN_SEEN_RATE:
+        why = ("suppressed: only %d successes (rate %.3f) on seen combinations; need "
+               "%d and %.2f for the ratio to mean anything"
+               % (n_seen_succ, s_rate, ZS_MIN_SEEN_SUCCESSES, ZS_MIN_SEEN_RATE))
+    else:
+        retention = u_rate / s_rate
     return {
-        "seen_success": seen["success_rate"],
-        "unseen_success": unseen["success_rate"],
+        **base,
+        "seen_success": s_rate,
+        "unseen_success": u_rate,
         "seen_success_on_viable": seen["success_rate_on_viable"],
         "unseen_success_on_viable": unseen["success_rate_on_viable"],
-        "retention": gap,
-        "n": n,
-        "n_holdout_combos": len(world.holdout),
+        "seen_successes": n_seen_succ,
+        "retention": retention,
+        "suppressed": why,
     }
 
 
@@ -616,6 +833,24 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
                                               scrambled["farmer_variety_acc"]),
         "length_only_variety": _headroom(scrambled["farmer_variety_acc"],
                                          muted["farmer_variety_acc"]),
+        **({"intact_farmer_report": intact["farmer_report"],
+            "muted_farmer_report": muted["farmer_report"],
+            "intact_buyer_report": intact["buyer_report"],
+            "muted_buyer_report": muted["buyer_report"],
+            "farmer_report_transfer": _headroom(intact["farmer_report"],
+                                                muted["farmer_report"]),
+            "buyer_report_transfer": _headroom(intact["buyer_report"],
+                                               muted["buyer_report"]),
+            # per field: variety, quantity, quality
+            "farmer_fields_intact": intact["farmer_report_fields"],
+            "farmer_fields_muted": muted["farmer_report_fields"],
+            "buyer_fields_intact": intact["buyer_report_fields"],
+            "buyer_fields_muted": muted["buyer_report_fields"],
+            "farmer_field_transfer": [_headroom(a, m) for a, m in zip(
+                intact["farmer_report_fields"], muted["farmer_report_fields"])],
+            "buyer_field_transfer": [_headroom(a, m) for a, m in zip(
+                intact["buyer_report_fields"], muted["buyer_report_fields"])]}
+           if "farmer_report" in intact else {}),
         "intact_reward": intact["mean_reward"],
         "scrambled_reward": scrambled["mean_reward"],
         "success_drop": drop("success_rate"),
@@ -627,10 +862,149 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
     }
 
 
+# ---- decontextualisation ------------------------------------------------------
+@torch.no_grad()
+def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
+                        device: str = "cpu") -> dict[str, Any]:
+    """Does a buyer name a meaning the same way in two different contexts?
+
+    The same (variety, quantity, quality) is probed twice per buyer: as the
+    describer in a lineup (tuple layout, speaking first) and as the requester
+    in a trade (request layout, price held at a reference value). Similarity of
+    the two forms for the *same* meaning, minus their similarity for different
+    meanings, is how context-free the form-meaning pairing is.
+    """
+    from .conventions import similarity
+    from .curriculum import phase_named
+    from .lexicon import reference_buyer_obs
+    lineup = phase_named(cfg, "refer-swap").with_informer(BUYER)
+    trade = phase_named(cfg, "haggle")
+    tup = tuple_meanings(cfg, n, seed=4242)
+    req = []
+    for m in tup:
+        r = list(reference_buyer_obs(cfg, (m[0], m[1])))
+        r[2] = m[2]
+        req.append(tuple(r))
+    same, diff = [], []
+    for agent in pop.buyers:
+        a = utterances_for_meanings(cfg, agent, tup, device=device, phase=lineup)
+        b = utterances_for_meanings(cfg, agent, req, device=device, phase=trade)
+        if a is None or b is None:
+            continue
+        strip = lambda u: [t for t in u if t < cfg.channel.end_id]
+        a, b = [strip(u) for u in a], [strip(u) for u in b]
+        for i in range(len(a)):
+            same.append(similarity(a[i], b[i]))
+            j = (i + 1 + i % 7) % len(a)
+            if tup[j] != tup[i]:
+                diff.append(similarity(a[i], b[j]))
+    if not same:
+        return {"n": 0, "consistency": float("nan")}
+    s, d = sum(same) / len(same), (sum(diff) / len(diff) if diff else 0.0)
+    return {"n": len(same), "same_meaning": s, "different_meaning": d, "consistency": s - d}
+
+
+# ---- the evidence a curriculum rung is judged on ---------------------------
+def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
+                   sampler_for, n_eval: int, n_topsim: int, n_semantics: int,
+                   chance: float, device: str = "cpu",
+                   rng: Optional[random.Random] = None) -> dict[str, Any]:
+    """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
+
+    * per view (both describers, in a swap rung): intact / muted success and the
+      share of headroom over a muted channel -- so each role's *decoding* is
+      measured in the view where it is the one decoding;
+    * per speaking role: topographic similarity against its own shuffled null,
+      and positional structure (mean slot->field strength), so each role's
+      *describing* is measured on its own utterances;
+    * in the mutual rung: each role's accuracy at reporting the other's tuple,
+      intact and muted.
+    """
+    rng = rng or random.Random(0)
+    f_all = list(range(len(pop.farmers)))
+    b_all = list(range(len(pop.buyers)))
+    out: dict[str, Any] = {"phase": phase.name, "views": [], "speakers": {},
+                           "chance": chance}
+    succ, trans = [], []
+    for v in phase.views():
+        abl = channel_ablation(cfg, pop, world, n_eval, device=device, rng=rng,
+                               phase=v, sampler=sampler_for(v))
+        if not abl.get("n"):
+            continue
+        row = {"informer": None, "guesser": None,
+               "success": abl["intact_success"], "muted_success": abl["muted_success"],
+               "scrambled_success": abl["scrambled_success"],
+               "transfer": abl["information_transfer"], "n": abl["n"]}
+        if v.referential:
+            row["informer"] = "farmer" if v.informer == FARMER else "buyer"
+            row["guesser"] = "farmer" if v.guesser == FARMER else "buyer"
+        for k in ("farmer_report", "buyer_report"):
+            if "intact_" + k in abl:
+                out[k] = abl["intact_" + k]
+                out["muted_" + k] = abl["muted_" + k]
+                out[k + "_transfer"] = abl[k + "_transfer"]
+        for k in ("farmer_field_transfer", "buyer_field_transfer",
+                  "farmer_fields_intact", "buyer_fields_intact",
+                  "farmer_fields_muted", "buyer_fields_muted"):
+            if k in abl:
+                out[k] = abl[k]
+        out["views"].append(row)
+        succ.append(row["success"])
+        trans.append(row["transfer"])
+    good = [x for x in succ if x == x]
+    out["success"] = sum(good) / len(good) if good else float("nan")
+    good = [x for x in trans if x == x]
+    out["transfer"] = sum(good) / len(good) if good else float("nan")
+    if (phase.mutual or phase.order) and out["views"]:
+        # no analytic chance for "report / fill a whole tuple": silence is the floor
+        out["chance"] = out["views"][0]["muted_success"]
+
+    comp = compositionality(cfg, pop, world, n_samples=n_topsim, device=device,
+                            rng=rng, phase=phase, n_null=2)
+    sem = analyse_token_semantics(cfg, pop, world, n_samples=n_semantics,
+                                  device=device, rng=rng, phase=phase)
+    for role, label in speaking_roles(cfg, phase):
+        c = comp.get(label, {})
+        out["speakers"][label] = {
+            "topsim": c.get("mean", float("nan")),
+            "null": c.get("null_mean", float("nan")),
+            "posdis": c.get("posdis", float("nan")),
+            "bosdis": c.get("bosdis", float("nan")),
+            "field_coverage": c.get("field_coverage", float("nan")),
+            "per_field_coverage": c.get("per_field_coverage", []),
+            "positional": positional_structure(sem.per_position.get(label, [])),
+            "positional_rows": sem.per_position.get(label, []),
+        }
+    out["topsim"] = comp.get("mean", float("nan"))
+    out["null"] = comp.get("null_mean", float("nan"))
+    out["_compositionality"] = comp
+    return out
+
+
 # ---- 5.5 cross-generation intelligibility -------------------------------
+def _play_views(cfg, pop, world, n, f_sel, b_sel, *, device, rng, phase, sampler_for):
+    """_play over every view of a phase (both describers in a swap), pooled."""
+    if phase is None:
+        return _play(cfg, pop, world, n, f_sel, b_sel, device=device, rng=rng)
+    views = phase.views()
+    rs = [_play(cfg, pop, world, max(1, n // len(views)), f_sel, b_sel, device=device,
+                rng=rng, phase=v, sampler=sampler_for(v) if sampler_for else None)
+          for v in views]
+    rs = [r for r in rs if r.get("n")]
+    if not rs:
+        return {"n": 0, "success_rate": float("nan"), "success_rate_on_viable": float("nan")}
+    out = dict(rs[0])
+    for k in ("success_rate", "success_rate_on_viable"):
+        vals = [r[k] for r in rs if r[k] == r[k]]
+        out[k] = sum(vals) / len(vals) if vals else float("nan")
+    out["n"] = sum(r["n"] for r in rs)
+    return out
+
+
 def intelligibility(cfg: Config, pop: Population, world: World, n: int,
                     *, newborn_age: int, device: str = "cpu",
-                    rng: Optional[random.Random] = None) -> dict[str, Any]:
+                    rng: Optional[random.Random] = None, phase=None,
+                    sampler_for=None) -> dict[str, Any]:
     """Can recent arrivals trade with agents that predate them?
 
     Compares newcomer-with-veteran success against veteran-with-veteran success.
@@ -645,9 +1019,10 @@ def intelligibility(cfg: Config, pop: Population, world: World, n: int,
 
     res: dict[str, Any] = {"n_newborn_farmers": len(new_f), "n_newborn_buyers": len(new_b),
                            "n_veteran_farmers": len(vet_f), "n_veteran_buyers": len(vet_b)}
-    vv = _play(cfg, pop, world, n, vet_f, vet_b, device=device, rng=rng) if vet_f and vet_b else None
-    nv = _play(cfg, pop, world, n, new_f, vet_b, device=device, rng=rng) if new_f and vet_b else None
-    vn = _play(cfg, pop, world, n, vet_f, new_b, device=device, rng=rng) if vet_b and new_b and vet_f else None
+    kw = dict(device=device, rng=rng, phase=phase, sampler_for=sampler_for)
+    vv = _play_views(cfg, pop, world, n, vet_f, vet_b, **kw) if vet_f and vet_b else None
+    nv = _play_views(cfg, pop, world, n, new_f, vet_b, **kw) if new_f and vet_b else None
+    vn = _play_views(cfg, pop, world, n, vet_f, new_b, **kw) if vet_b and new_b and vet_f else None
 
     res["veteran_veteran"] = vv["success_rate"] if vv else float("nan")
     res["newborn_farmer_veteran_buyer"] = nv["success_rate"] if nv else float("nan")
@@ -664,7 +1039,8 @@ def intelligibility(cfg: Config, pop: Population, world: World, n: int,
 
 def newborn_vs_veterans(cfg: Config, pop: Population, world: World, newborn: Agent,
                         n: int, *, device: str = "cpu",
-                        rng: Optional[random.Random] = None) -> dict[str, Any]:
+                        rng: Optional[random.Random] = None, phase=None,
+                        sampler_for=None) -> dict[str, Any]:
     """Spec 5.5, measured at the moment of birth: a fresh agent, straight out of the
     bottleneck, against the agents that were already alive.  It has never played a
     live episode, so any success is transmitted knowledge, not co-adaptation."""
@@ -677,9 +1053,13 @@ def newborn_vs_veterans(cfg: Config, pop: Population, world: World, newborn: Age
         f_sel = [i for i, a in enumerate(pop.farmers) if a.birth_episode < newborn.birth_episode]
     if not f_sel or not b_sel:
         return {"n": 0, "success_rate": float("nan")}
-    r = _play(cfg, pop, world, n, f_sel, b_sel, device=device, rng=rng)
+    # Tested on the game the population is currently playing. Testing a
+    # lineup-rung newborn on the full market scored every one of them 0.000.
+    r = _play_views(cfg, pop, world, n, f_sel, b_sel, device=device, rng=rng,
+                    phase=phase, sampler_for=sampler_for)
     return {"n": r["n"], "success_rate": r["success_rate"],
-            "success_rate_on_viable": r["success_rate_on_viable"]}
+            "success_rate_on_viable": r.get("success_rate_on_viable", float("nan")),
+            "phase": phase.name if phase is not None else "market"}
 
 
 # ==========================================================================
@@ -730,6 +1110,8 @@ class TokenSemantics:
     per_token: dict[int, dict[str, Any]] = field(default_factory=dict)
     per_word: dict[str, dict[str, Any]] = field(default_factory=dict)
     per_position: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # word classes: which separate words specialise to which field, per role
+    word_classes: dict[str, dict[str, Any]] = field(default_factory=dict)
     n_samples: int = 0
 
     def hint(self, tok: int) -> str:
@@ -750,12 +1132,14 @@ class TokenSemantics:
         return {"n_samples": self.n_samples,
                 "per_token": {str(k): v for k, v in sorted(self.per_token.items())},
                 "per_word": self.per_word,
-                "per_position": self.per_position}
+                "per_position": self.per_position,
+                "word_classes": self.word_classes}
 
 
 def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
                             n_samples: int = 600, device: str = "cpu",
-                            rng: Optional[random.Random] = None) -> TokenSemantics:
+                            rng: Optional[random.Random] = None,
+                            phase=None) -> TokenSemantics:
     """Correlate emitted tokens with the speaker's private fields.
 
     For every content token we compute the mutual information between "this token
@@ -771,20 +1155,29 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
     """
     rng = rng or random.Random(0)
     ts = TokenSemantics(cfg=cfg, n_samples=n_samples)
-    ctx = farmer_context_message(cfg, pop, world, device)
+    talking = dict((lbl, r) for r, lbl in speaking_roles(cfg, phase))
 
     for role, label in ((BUYER, "buyer"), (FARMER, "farmer")):
-        kinds = obs_schema(cfg.world, role)
-        labels = field_labels(cfg.world, role)
+        if phase is not None and label not in talking:
+            continue                    # silent in this phase: nothing to analyse
+        view = speaker_view(phase, cfg, role) if phase is not None else None
+        kinds = phase_kinds(cfg, role, view)
+        labels = phase_labels(cfg, role, view)
         real = [i for i, k in enumerate(kinds) if k != K_EMPTY]
-        meanings = sample_meanings(cfg, world, role, n_samples)
+        ctx = opening_context(cfg, pop, world, view, device)
+        meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
+                                   seed=rng.randrange(1 << 30))
         agents = pop.pool(role)
-        msgs: list[list[int]] = []
-        for i, m in enumerate(meanings):
-            agent = agents[i % len(agents)]
-            msgs.append(utterances_for_meanings(
-                cfg, agent, [m], context=ctx if role == FARMER else None,
-                device=device)[0])
+        msgs: list[list[int]] = [[] for _ in meanings]
+        # one batched greedy decode per agent over its share of the meanings
+        for a_i, agent in enumerate(agents):
+            idx = list(range(a_i, len(meanings), len(agents)))
+            if not idx:
+                continue
+            got = utterances_for_meanings(cfg, agent, [meanings[j] for j in idx],
+                                          context=ctx, device=device, phase=view)
+            for j, m in zip(idx, got):
+                msgs[j] = m
 
         binned = [[_bin_value(cfg, kinds[i], m[i]) for i in range(len(kinds))]
                   for m in meanings]
@@ -843,6 +1236,26 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
                     "usage": round(sum(present) / len(present), 3),
                 }
 
+        # ---- word classes: noun-, adjective-, numeral-like words ------------
+        # A word "belongs" to a field when it predicts that field strongly
+        # (normalised MI >= 0.3). The question the user of this report cares
+        # about is whether separate, space-separated words carry separate fields
+        # -- a variety word next to a quality word -- rather than one compound
+        # naming the whole meaning.
+        word_field = {k: r["dimension"] for k, r in ts.per_word.items()
+                      if r.get("role") == label and r["score"] >= 0.3}
+        classes: dict[str, list[str]] = {}
+        for k, f in word_field.items():
+            classes.setdefault(f, []).append(k)
+        multi = sum(1 for wl in word_lists
+                    if len({word_field.get(word_text(cfg, w)) for w in wl} - {None}) >= 2)
+        ts.word_classes[label] = {
+            "classes": {f: sorted(ws)[:8] for f, ws in classes.items()},
+            "n_classes": len(classes),
+            "multi_class_share": multi / max(1, len(word_lists)),
+            "mean_words_per_message": sum(len(wl) for wl in word_lists) / max(1, len(word_lists)),
+        }
+
         rows = []
         for k in range(cfg.channel.max_msg_len):
             toks_at_k = [(msg[k] if k < len(msg) else cfg.channel.pad_id)
@@ -854,12 +1267,25 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
                 score = mi / hy if hy > 1e-9 else 0.0
                 if best is None or score > best[1]:
                     best = (i, score)
+            used = sum(1 for t in toks_at_k if t < cfg.channel.end_id) / max(1, len(msgs))
             rows.append({"position": k, "dimension": labels[best[0]],
                          "score": round(float(best[1]), 4),
-                         "distinct_tokens": len(set(toks_at_k))})
+                         "distinct_tokens": len(set(toks_at_k)),
+                         "used": round(used, 3)})
         ts.per_position[label] = rows
 
     return ts
+
+
+def positional_structure(rows: Sequence[dict[str, Any]], min_used: float = 0.2) -> float:
+    """One number per role from the per-slot table: mean slot->field strength.
+
+    Averaged over the slots the language actually uses (a symbol there in at
+    least ``min_used`` of utterances), so a terse code is not penalised for the
+    slots it leaves empty -- and an empty code scores NaN rather than zero.
+    """
+    live = [r["score"] for r in rows if r.get("used", 1.0) >= min_used]
+    return sum(live) / len(live) if live else float("nan")
 
 
 def _describe_value(cfg: Config, kind: int, vals: Sequence[int]) -> str:

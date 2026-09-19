@@ -1,5 +1,5 @@
 {
-  "name": "gpu_small",
+  "name": "ladder3",
   "world": {
     "n_varieties": 3,
     "n_quality": 3,
@@ -30,35 +30,35 @@
     "max_episodes_per_phase": 400000,
     "rung_budgets": {
       "refer": [
-        163840,
-        5120000
+        20000,
+        600000
       ],
       "refer-swap": [
-        163840,
-        5120000
+        20000,
+        600000
       ],
       "refer-mutual": [
-        163840,
-        7168000
-      ],
-      "order": [
-        163840,
-        5120000
+        20000,
+        800000
       ],
       "haggle": [
-        163840,
-        7168000
+        20000,
+        600000
       ],
       "bargain": [
-        163840,
-        7168000
+        20000,
+        600000
       ],
       "market": [
-        163840,
+        20000,
         1000000000000
+      ],
+      "order": [
+        20000,
+        400000
       ]
     },
-    "check_every": 51200,
+    "check_every": 10000,
     "start_phase": "",
     "refer_min_success": 0.45,
     "trade_min_success": 0.15,
@@ -70,10 +70,10 @@
     "mutual_min_success": 0.1,
     "on_stall": "stop",
     "hard_distractor_frac": 0.75,
+    "holdout_tuple_frac": 0.1,
     "mutual_qty_tol": 0,
     "min_field_transfer": 0.25,
-    "order_min_success": 0.5,
-    "holdout_tuple_frac": 0.1
+    "order_min_success": 0.5
   },
   "channel": {
     "atomic_vocab": 16,
@@ -82,10 +82,10 @@
     "enforce_word_grammar": true
   },
   "model": {
-    "d_model": 64,
+    "d_model": 48,
     "n_layers": 2,
     "n_heads": 4,
-    "d_ff": 128,
+    "d_ff": 96,
     "dropout": 0.0
   },
   "reward": {
@@ -118,15 +118,15 @@
     "convention_gated": true
   },
   "population": {
-    "n_farmers": 16,
-    "n_buyers": 16,
+    "n_farmers": 6,
+    "n_buyers": 6,
     "turnover": true,
-    "lifespan_min": 60000,
-    "lifespan_max": 100000,
+    "lifespan_min": 25000,
+    "lifespan_max": 45000,
     "initial_stagger": true,
     "founders_farmers": 2,
     "founders_buyers": 2,
-    "grow_every": 40000
+    "grow_every": 10000
   },
   "bottleneck": {
     "enabled": true,
@@ -134,7 +134,7 @@
     "max_samples": 40000,
     "n_samples": 0,
     "epochs": 3,
-    "batch_size": 1024,
+    "batch_size": 256,
     "lr": 0.001,
     "store_capacity": 40000,
     "only_successful": true,
@@ -146,25 +146,25 @@
     "algo": "gumbel",
     "gumbel_tau": 1.5,
     "gumbel_tau_final": 0.5,
-    "gumbel_tau_anneal_frac": 0.256,
+    "gumbel_tau_anneal_frac": 0.1,
     "gumbel_mix_reinforce": 0.1,
     "shaping_reinforce": 0.2,
-    "episodes": 8000000,
-    "batch_size": 2048,
+    "episodes": 2400000,
+    "batch_size": 256,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
     "entropy_coef": 0.01,
     "entropy_coef_final": 0.002,
-    "entropy_anneal_frac": 0.2048,
+    "entropy_anneal_frac": 0.083333,
     "decision_entropy_coef": 0.02,
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
     "seed": 0,
-    "device": "auto",
+    "device": "cpu",
     "torch_threads": 4,
     "vectorised": true,
-    "amp": true,
+    "amp": false,
     "compile": false,
     "grad_checkpoint": false,
     "tf32": true,
@@ -172,21 +172,19 @@
     "convention_reinforce": 1.0
   },
   "log": {
-    "ledger_stride": 200,
-    "checkpoint_every": 204800,
-    "summary_every": 204800,
+    "ledger_stride": 10,
+    "checkpoint_every": 50000,
+    "summary_every": 50000,
     "n_example_transcripts": 3,
-    "topsim_samples": 200,
+    "topsim_samples": 150,
     "stability_probes": 32,
-    "intelligibility_episodes": 2048,
-    "zeroshot_episodes": 2048,
-    "ablation_episodes": 2048,
+    "intelligibility_episodes": 600,
+    "zeroshot_episodes": 600,
+    "ablation_episodes": 800,
     "word_analysis_samples": 400,
     "rare_frequent_split": 0.5,
     "track_form_survival": true,
     "plot": true,
-    "flush_every": 200,
-    "snapshot_every_checkpoint": true,
-    "max_agents_probed": 8
+    "flush_every": 200
   }
 }

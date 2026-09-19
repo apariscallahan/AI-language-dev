@@ -37,14 +37,21 @@ import torch.nn.functional as F
 
 from .agents import Agent, dialogue_offset, own_dialogue_positions
 from .config import Config
-from .env import (BUYER, FARMER, Beliefs, Decision, Outcome, buyer_obs,
-                  farmer_obs, resolve, speaker_of_turn)
+from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
+                  farmer_obs, grammar_allowed, resolve, speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
-from .curriculum import (H_CHOICE, N_HEADS, Phase, ReferentialBatch, ladder,
-                         phase_schema, resolve_referential)
+from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch, Phase,
+                         ReferentialBatch, hindsight_targets, ladder, phase_schema,
+                         resolve_mutual, resolve_order, resolve_referential)
 from .rollout import (BatchRollout, UpdateStats, anneal, group_by_agent,
                       n_outputs, split_decision)
 from .world import Scenario
+
+
+def _count(content: torch.Tensor, positions: list[int]) -> torch.Tensor:
+    if not positions:
+        return torch.zeros(content.shape[0], dtype=torch.long, device=content.device)
+    return content[:, positions].sum(dim=1)
 
 
 def gumbel_tau(cfg: Config, frac_done: float) -> float:
@@ -57,22 +64,40 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                           f_idx: torch.Tensor, b_idx: torch.Tensor, *,
                           frac_done: float = 0.0, device: str = "cpu",
                           train: bool = True, phase: Optional[Phase] = None,
-                          generator: Optional[torch.Generator] = None
+                          generator: Optional[torch.Generator] = None,
+                          usage=None, cost_scale: float = 1.0
                           ) -> tuple[BatchRollout, UpdateStats]:
     """Play a batch with a reparameterised message channel, then learn from it.
 
     ``scenarios`` is either a list of :class:`~orchard.world.Scenario` -- the
     readable path -- or a :class:`~orchard.batched.ScenarioBatch`, which keeps the
     whole batch on device and never enters the interpreter per episode.
+
+    ``usage`` is the population's recent-usage record
+    (:class:`orchard.conventions.PopulationUsage`). When given, speakers pay the
+    coining cost and earn the convention bonus, and -- if training -- the batch is
+    folded into it afterwards.
+
+    ``cost_scale`` in [0, 1] scales the speaker's costs -- the symbol cost and
+    the coining cost, and the convention bonus only if
+    ``reward.convention_gated``. The trainer raises it as the first rung starts
+    to work and holds it at 1 from then on (see ``Trainer.update_cost_gate``).
     """
     c = cfg.channel
     t = cfg.train
     if phase is None:
         phase = ladder(cfg)[-1]              # the full market task
     referential = isinstance(scenarios, ReferentialBatch)
-    batched = referential or isinstance(scenarios, ScenarioBatch)
+    mutual = isinstance(scenarios, MutualBatch)
+    batched = referential or mutual or isinstance(scenarios, ScenarioBatch)
+    if referential and scenarios.informer != phase.informer:
+        phase = phase.with_informer(scenarios.informer)
     schema_of = {FARMER: phase_schema(cfg, FARMER, phase),
                  BUYER: phase_schema(cfg, BUYER, phase)}
+    # Which slots are "mine" follows the phase's speaking order, not the trading
+    # task's buyer-opens order.
+    mask_of = {FARMER: phase.self_mask(cfg, FARMER, device),
+               BUYER: phase.self_mask(cfg, BUYER, device)}
     B = len(scenarios)
     D = c.dialogue_len
     NT = c.n_token_ids
@@ -89,6 +114,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     obs_of = {FARMER: f_obs, BUYER: b_obs}
     idx_of = {FARMER: f_idx, BUYER: b_idx}
     pool_of = {FARMER: farmers, BUYER: buyers}
+    # Which episodes each agent plays, computed once. Deriving it reads the index
+    # tensor on the host, which on a GPU is a device sync; doing that at every
+    # symbol step for every agent was the dominant cost with large populations.
+    groups_of = {FARMER: group_by_agent(f_idx), BUYER: group_by_agent(b_idx)}
 
     pad_onehot = F.one_hot(torch.tensor(c.pad_id, device=device), NT).float()
     soft = pad_onehot.view(1, 1, NT).expand(B, D, NT).clone()
@@ -97,6 +126,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     token_entropy_terms: list[torch.Tensor] = []
     token_logp_terms: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {
         FARMER: [], BUYER: []}
+    want_token_logp = (t.gumbel_mix_reinforce > 0 or t.shaping_reinforce > 0
+                       or t.convention_reinforce > 0)
 
     # ---- the conversation ------------------------------------------------
     # Phases that use fewer turns simply leave the later dialogue slots empty,
@@ -115,11 +146,14 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             p = turn * c.max_msg_len + k
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
-            for a_i, ep in group_by_agent(idx):
+            for a_i, ep in groups_of[role]:
                 h = pool[a_i].net.encode(obs[ep], soft[ep], upto=seq_pos,
-                                         schema=schema_of[role])[:, -1]
+                                         schema=schema_of[role],
+                                         self_mask=mask_of[role])[:, -1]
                 logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))
 
+            allowed = grammar_allowed(cfg, tokens[:, p - 1] if k > 0 else tokens[:, p], k)
+            logits = logits.masked_fill(~allowed, MASKED)
             y = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
             tok = y.argmax(dim=-1)
             tok = torch.where(alive, tok, torch.full_like(tok, c.pad_id))
@@ -131,16 +165,23 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             active[:, p] = alive
             lp = F.log_softmax(logits, dim=-1)
             token_entropy_terms.append(-(lp.exp() * lp).sum(-1) * alive.float())
-            if t.gumbel_mix_reinforce > 0:
+            if want_token_logp:
                 chosen = lp.gather(-1, tok.clamp(max=c.n_emittable - 1).unsqueeze(-1)).squeeze(-1)
                 token_logp_terms[role].append((chosen, alive.float()))
             alive = alive & (tok != c.eos_id)
+            # Stop early once every utterance in the batch has ended. Checked every
+            # few symbols only: the check reads the device, and the buffer is long.
+            if k % 4 == 3 and not bool(alive.any()):
+                break
 
     # ---- the decisions: still discrete, still REINFORCE ------------------
     dec_sampled: dict[int, torch.Tensor] = {}
     dec_logp: dict[int, torch.Tensor] = {}
     dec_ent: dict[int, torch.Tensor] = {}
     dec_value: dict[int, torch.Tensor] = {}
+    targets = (hindsight_targets(cfg, phase, scenarios)
+               if train and batched and t.hindsight_coef > 0 else {FARMER: {}, BUYER: {}})
+    head_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         scored = set(phase.active_heads(role, cfg))
@@ -148,9 +189,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         logp_sum = torch.zeros(B, device=device)
         ent_sum = torch.zeros(B, device=device)
         val = torch.zeros(B, device=device)
-        for a_i, ep in group_by_agent(idx):
+        for a_i, ep in groups_of[role]:
             net = pool[a_i].net
-            h = net.encode(obs[ep], soft[ep], schema=schema_of[role])[:, -1]
+            h = net.encode(obs[ep], soft[ep], schema=schema_of[role],
+                           self_mask=mask_of[role])[:, -1]
             heads = net.all_heads(h, obs[ep])
             val = val.index_copy(0, ep, net.value_head(h).squeeze(-1))
             lps = torch.zeros(ep.shape[0], device=device)
@@ -160,6 +202,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 with torch.no_grad():
                     a = torch.multinomial(lp.exp(), 1, generator=generator).squeeze(-1)
                 out[ep, col] = a
+                if col in targets[role]:
+                    full = head_lp[role].get(col)
+                    if full is None:
+                        full = torch.zeros((B, lp.shape[-1]), device=device)
+                    head_lp[role][col] = full.index_copy(0, ep, lp)
                 if col not in scored:
                     continue          # sampled for shape, not scored: no gradient
                 # The belief heads are what make "were you understood" scoreable,
@@ -179,15 +226,26 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         dec_value[role] = val
 
     # ---- resolve ---------------------------------------------------------
+    # Everyone pays for the symbols they emitted -- counted from the phase's
+    # speaking order. Counting from the trading order billed the lineup's
+    # describer for nothing and its silent guesser for everything.
     content = (tokens < c.end_id)
-    f_emitted = content[:, own_dialogue_positions(cfg, FARMER)].sum(dim=1)
-    b_emitted = content[:, own_dialogue_positions(cfg, BUYER)].sum(dim=1)
+    f_emitted = _count(content, phase.own_positions(cfg, FARMER))
+    b_emitted = _count(content, phase.own_positions(cfg, BUYER))
     outcomes: list[Outcome] = []
     res = None
     if referential:
         res = resolve_referential(cfg, scenarios,
-                                  dec_sampled[BUYER][:, H_CHOICE],
+                                  dec_sampled[phase.guesser][:, H_CHOICE],
                                   f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif mutual:
+        rep = list(H_BELIEF[:3])
+        res = resolve_mutual(cfg, scenarios, dec_sampled[FARMER][:, rep],
+                             dec_sampled[BUYER][:, rep], f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif phase.order and batched:
+        res = resolve_order(cfg, scenarios, dec_sampled[FARMER], f_emitted, b_emitted)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif batched:
         # One pass over the batch instead of B trips through the interpreter.
@@ -210,13 +268,50 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             f_rew[i] = o.farmer_reward
             b_rew[i] = o.buyer_reward
 
+    # ---- the speaker's own terms: brevity, coining, convention ------------
+    g = float(min(1.0, max(0.0, cost_scale)))
+    sc = cfg.reward.symbol_cost
+    shape = {FARMER: -g * sc * f_emitted.float(), BUYER: -g * sc * b_emitted.float()}
+    agree = {FARMER: torch.zeros(B, device=device), BUYER: torch.zeros(B, device=device)}
+    if g < 1.0:
+        # the resolvers charged the full symbol cost; hand back the gated share
+        f_rew = f_rew + (1.0 - g) * sc * f_emitted.float()
+        b_rew = b_rew + (1.0 - g) * sc * b_emitted.float()
+        if res is not None:
+            res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
+    terms = {}
+    if usage is not None:
+        conv_on = g > 0 or not cfg.reward.convention_gated
+        terms = usage.speaker_terms(phase, tokens, obs_of, rarity=g > 0,
+                                    convention=conv_on)
+        for role, d in terms.items():
+            d["rarity"] = g * d["rarity"]
+            if cfg.reward.convention_gated:
+                d["convention"] = g * d["convention"]
+            extra = d["convention"] - d["rarity"]
+            shape[role] = shape[role] - d["rarity"]
+            agree[role] = d["convention"]
+            if role == FARMER:
+                f_rew = f_rew + extra
+            else:
+                b_rew = b_rew + extra
+        if res is not None:
+            for role, label in ((FARMER, "farmer"), (BUYER, "buyer")):
+                d = terms.get(role)
+                zero = torch.zeros(B, device=device)
+                res[label + "_rarity_cost"] = d["rarity"] if d else zero
+                res[label + "_convention"] = d["convention"] if d else zero
+            res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
+        if train:
+            usage.observe(terms, B)
+
     batch = BatchRollout(
         scenarios=[] if batched else list(scenarios), tokens=tokens, active=active,
         f_obs=f_obs, b_obs=b_obs, f_idx=f_idx, b_idx=b_idx,
         f_dec=dec_sampled[FARMER].detach(), b_dec=dec_sampled[BUYER].detach(),
         f_reward=f_rew.detach(), b_reward=b_rew.detach(), outcomes=outcomes,
         f_emitted=f_emitted, b_emitted=b_emitted,
-        res=res, sb=scenarios if batched else None, n=B, cfg_ref=cfg)
+        res=res, sb=scenarios if batched else None, n=B, cfg_ref=cfg, phase=phase)
 
     stats = UpdateStats()
     if not train:
@@ -232,8 +327,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     value_loss_total = 0.0
     for role in (FARMER, BUYER):
         R = rew_of[role]
+        scale = 1.0
         if t.normalise_adv and R.numel() > 1:
-            R = (R - R.mean()) / (R.std(unbiased=False) + 1e-6)
+            scale = float(R.std(unbiased=False)) + 1e-6
+            R = (R - R.mean()) / scale
         adv = (R - dec_value[role]).detach()
         # The speaker's gradient arrives through this term: dec_logp depends on
         # the soft message, which depends on the other agent's token logits.
@@ -246,6 +343,31 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             for chosen, mask in token_logp_terms[role]:
                 denom = mask.sum().clamp(min=1.0)
                 loss = loss + t.gumbel_mix_reinforce * (-(adv * chosen * mask).sum() / denom)
+        if (t.shaping_reinforce > 0 or t.convention_reinforce > 0) and token_logp_terms[role]:
+            # Brevity, coining and convention are the speaker's alone and depend
+            # only on what it said, so they are credited to its token choices
+            # directly, in the same units as the task advantage (divided by the
+            # same reward scale) so raising a cost really does raise its pull.
+            sh = shape[role]
+            adv_s = ((sh - sh.mean()) / scale).detach()
+            ag = agree[role]
+            adv_c = ((ag - ag.mean()) / scale).detach()
+            for chosen, mask in token_logp_terms[role]:
+                denom = mask.sum().clamp(min=1.0)
+                loss = loss + t.shaping_reinforce * (-(adv_s * chosen * mask).sum() / denom)
+                if t.convention_reinforce > 0:
+                    loss = loss + t.convention_reinforce * (
+                        -(adv_c * chosen * mask).sum() / denom)
+
+    # hindsight feedback: every scored head is pulled towards the outcome
+    if t.hindsight_coef > 0:
+        for role in (FARMER, BUYER):
+            for col, tgt in targets[role].items():
+                lp = head_lp[role].get(col)
+                if lp is None:
+                    continue
+                tgt = tgt.long().clamp(0, lp.shape[-1] - 1)
+                loss = loss + t.hindsight_coef * F.nll_loss(lp, tgt)
 
     if token_entropy_terms:
         ent_stack = torch.stack(token_entropy_terms, dim=1)
@@ -256,7 +378,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
 
     seen = []
     for role in (FARMER, BUYER):
-        for a_i, _ in group_by_agent(idx_of[role]):
+        for a_i, _ in groups_of[role]:
             seen.append(pool_of[role][a_i])
     for a in seen:
         a.opt.zero_grad(set_to_none=True)

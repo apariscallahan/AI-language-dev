@@ -37,6 +37,7 @@ class BirthEvent:
     replaced_success_rate: float
     lifespan: int
     bottleneck: dict[str, Any] = field(default_factory=dict)
+    kind: str = "replacement"          # or "newcomer": a new slot, nobody replaced
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -56,10 +57,35 @@ class Population:
         self.deaths = 0
 
         p = cfg.population
+        nf = p.founders_farmers if p.founders_farmers > 0 else p.n_farmers
+        nb = p.founders_buyers if p.founders_buyers > 0 else p.n_buyers
         self.farmers: list[Agent] = [self._spawn(FARMER, s, 0, 0, initial=True)
-                                     for s in range(p.n_farmers)]
+                                     for s in range(nf)]
         self.buyers: list[Agent] = [self._spawn(BUYER, s, 0, 0, initial=True)
-                                    for s in range(p.n_buyers)]
+                                    for s in range(nb)]
+
+    @property
+    def full_size(self) -> bool:
+        p = self.cfg.population
+        return len(self.farmers) >= p.n_farmers and len(self.buyers) >= p.n_buyers
+
+    def add_newcomer(self, role: int, episode: int,
+                     on_birth: Optional[Callable[[Agent, "BirthEvent"], None]] = None
+                     ) -> "BirthEvent":
+        """Grow the community by one agent of ``role``, in a new lineage slot."""
+        pool = self.pool(role)
+        slot = len(pool)
+        agent = self._spawn(role, slot, 1, episode)
+        ev = BirthEvent(episode=episode, agent_id=agent.agent_id, role=role, slot=slot,
+                        generation=agent.generation, replaced_agent_id=-1, replaced_age=0,
+                        replaced_success_rate=float("nan"), lifespan=agent.lifespan,
+                        kind="newcomer")
+        pool.append(agent)
+        if on_birth is not None:
+            on_birth(agent, ev)
+        agent.bottleneck_info = ev.bottleneck
+        self.births.append(ev)
+        return ev
 
     # ------------------------------------------------------------------
     def _sample_lifespan(self, initial: bool) -> int:

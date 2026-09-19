@@ -22,7 +22,7 @@ from orchard.bottleneck import StoredEpisode, TranscriptStore
 from orchard.batched import TensorWorld
 from orchard.config import Config
 from orchard.curriculum import (H_CHOICE, N_HEADS, CurriculumState, Phase,
-                                ReferentialWorld, ladder, phase_schema,
+                                ReferentialWorld, ladder, phase_named, phase_schema,
                                 promotion_for, resolve_referential)
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import run_and_update_gumbel
@@ -73,11 +73,11 @@ class TestLadder(unittest.TestCase):
         p = ladder(cfg_small())[0]
         self.assertEqual(p.speaker_of_turn(0), FARMER)
         # and the buyer opens once there is something to ask for
-        self.assertEqual(ladder(cfg_small())[1].speaker_of_turn(0), BUYER)
+        self.assertEqual(phase_named(cfg_small(), "haggle").speaker_of_turn(0), BUYER)
 
     def test_only_relevant_heads_are_scored(self):
         cfg = cfg_small()
-        refer, haggle = ladder(cfg)[0], ladder(cfg)[1]
+        refer, haggle = ladder(cfg)[0], phase_named(cfg, "haggle")
         self.assertEqual(refer.active_heads(BUYER, cfg), [H_CHOICE])
         self.assertEqual(refer.active_heads(FARMER, cfg), [],
                          "the informer has no decision in a lineup game")
@@ -118,7 +118,12 @@ class TestOneArchitectureEveryPhase(unittest.TestCase):
         fi, bi = i % 2, torch.div(i, 2, rounding_mode="floor") % 2
 
         for phase in ladder(cfg):
-            scen = rw.sample(B) if phase.referential else tw.sample(B)
+            if phase.referential:
+                scen = rw.sample(B)
+            elif phase.mutual:
+                scen = rw.sample_mutual(B)
+            else:
+                scen = tw.sample(B)
             batch, stats = run_and_update_gumbel(cfg, scen, f, b, fi, bi,
                                                  frac_done=0.2, phase=phase)
             self.assertEqual(stats.policy_loss, stats.policy_loss)   # finite
@@ -325,7 +330,7 @@ class TestPromotion(unittest.TestCase):
         self.assertEqual(st.phase.name, "refer")
         st.episodes_in_phase = 999
         st.advance(1234, {"success above floor": {"met": True, "detail": "0.9"}})
-        self.assertEqual(st.phase.name, "haggle")
+        self.assertEqual(st.phase.name, "refer-swap")
         self.assertEqual(st.episodes_in_phase, 0)
         self.assertEqual(len(st.transitions), 1)
         self.assertEqual(st.transitions[0]["from"], "refer")

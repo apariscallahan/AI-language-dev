@@ -39,7 +39,8 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
 
     succ = nn(succ)
     topsim = nn(topsim)
-    coh = (nn(stab.get("coherence_buyer"), 0.0) + nn(stab.get("coherence_farmer"), 0.0)) / 2
+    coh = nn(stab.get("coherence"),
+             (nn(stab.get("coherence_buyer"), 0.0) + nn(stab.get("coherence_farmer"), 0.0)) / 2)
     retention = nn(zs.get("retention"))
     transmission = nn(intel.get("transmission_ratio"))
     ent_norm = nn(vocab.get("token_entropy_norm"), 0.0)
@@ -95,6 +96,13 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
     if retention == retention:
         ev.append("zero-shot retention %.2f on held-out (variety, quantity) combinations"
                   % retention)
+    elif zs.get("suppressed"):
+        ev.append("zero-shot retention not reported (%s)" % zs["suppressed"])
+    ov = final.get("cross_role_overlap") or {}
+    if nn(ov.get("weighted_overlap")) == nn(ov.get("weighted_overlap")):
+        ev.append("cross-role vocabulary overlap %.2f (histogram intersection of the "
+                  "two roles' word use; 1.0 = one shared vocabulary)"
+                  % ov["weighted_overlap"])
     if transmission == transmission:
         ev.append("cross-generation transmission ratio %.2f" % transmission)
 
@@ -173,6 +181,47 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+def _bottleneck_sentence(bc: dict[str, Any]) -> str:
+    """Describe what newborns were actually shown -- from this run's own numbers.
+
+    The previous report asserted "a newborn now sees essentially the whole parent
+    generation" as fixed prose, beside a births table showing 400 transcripts per
+    newborn (that run's config forced ``n_samples=400``, which overrides
+    coverage) and coverage figures of 13% / 0%. The claim is now computed.
+    """
+    if not bc:
+        return "No newborn was trained during this run, so nothing was transmitted."
+    shown = float(bc.get("mean_transcripts_shown", 0.0))
+    store = float(bc.get("mean_store_size", 0.0))
+    share = float(bc.get("mean_share_of_store", 0.0))
+    com = float(bc.get("common_form_coverage", float("nan")))
+    rare = float(bc.get("rare_form_coverage", float("nan")))
+    cap = int(bc.get("fixed_cap", 0) or 0)
+    if cap > 0:
+        regime = ("This run used a fixed cap of %d transcripts per newborn "
+                  "(``bottleneck.n_samples``, which overrides coverage), i.e. %.0f%% of "
+                  "a store averaging %d." % (cap, 100 * share, store))
+    else:
+        regime = ("Newborns were shown on average %d of %d stored transcripts (%.0f%%; "
+                  "coverage setting %.0f%%, ceiling %d)."
+                  % (shown, store, 100 * share, 100 * float(bc.get("coverage_setting", 1.0)),
+                     int(bc.get("max_samples", 0))))
+    if com == com and com >= 0.9:
+        verdict = ("Common forms were reliably shown (%.0f%% of them at least three "
+                   "times) and rare ones much less often (%.0f%%): the intended "
+                   "asymmetry, where only the rare end is at risk." % (100 * com, 100 * rare))
+    elif com == com:
+        verdict = ("Only %.0f%% of common forms (and %.0f%% of rare ones) appeared "
+                   "often enough to learn, so this run did **not** achieve near-complete "
+                   "transmission: common vocabulary was itself at risk. With the store "
+                   "this small relative to the vocabulary in circulation (%d forms), "
+                   "even a full pass shows most forms too rarely."
+                   % (100 * com, 100 * rare, int(bc.get("vocabulary_in_population", 0))))
+    else:
+        verdict = ""
+    return regime + " " + verdict
+
+
 def _dictionary_lines(cfg: Config, sem: TokenSemantics, vocab: dict[str, Any]) -> list[str]:
     counts = vocab.get("token_counts", {}) or {}
     total = sum(int(v) for v in counts.values()) or 1
@@ -193,13 +242,20 @@ def _dictionary_lines(cfg: Config, sem: TokenSemantics, vocab: dict[str, Any]) -
 
 
 def _position_lines(sem: TokenSemantics) -> list[str]:
-    lines = ["| speaker | message slot | dimension most predicted by this slot | strength | distinct tokens seen |",
-             "|---|---|---|---|---|"]
+    from .metrics import positional_structure
+    lines = ["| speaker | positional-structure score | slots in use |", "|---|---|---|"]
+    for role, rows in sem.per_position.items():
+        live = sum(1 for r in rows if r.get("used", 1.0) >= 0.2)
+        lines.append("| %s | %.3f | %d of %d |"
+                     % (role, positional_structure(rows), live, len(rows)))
+    lines += ["", "| speaker | message slot | dimension most predicted by this slot | "
+              "strength | slot in use | distinct tokens seen |",
+              "|---|---|---|---|---|---|"]
     for role, rows in sem.per_position.items():
         for r in rows:
-            lines.append("| %s | %d | %s | %.3f | %d |"
+            lines.append("| %s | %d | %s | %.3f | %.0f%% | %d |"
                          % (role, r["position"], r["dimension"], r["score"],
-                            r["distinct_tokens"]))
+                            100 * r.get("used", 1.0), r["distinct_tokens"]))
     return lines
 
 
@@ -317,7 +373,10 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("")
     A("If a language is compositional, different slots of an utterance should carry "
       "different fields. This table asks, for each symbol slot, which field the "
-      "symbol in that slot predicts best.")
+      "symbol in that slot predicts best. Each role is probed only in a phase where "
+      "it actually speaks, on the meanings it actually describes there; the score is "
+      "the mean strength over the slots in use (a symbol there in at least 20% of "
+      "utterances).")
     A("")
     L.extend(_position_lines(sem))
     A("")
@@ -337,11 +396,38 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
           "shuffled null, and muting the channel actually costing something. "
           "Weights carry across every transition; nothing is reinitialised.")
         A("")
-        A("| rung | phase | reached |")
-        A("|---|---|---|")
+        budgets = cur.get("budgets") or {}
+        spent = {t.get("from"): t.get("episodes_in_previous_phase") for t in
+                 (cur.get("transitions") or [])}
+        A("| rung | phase | reached | budget (min - max episodes) | episodes spent |")
+        A("|---|---|---|---|---|")
         for i, name in enumerate(phases):
             mark = ("**yes**" if i <= cur.get("reached_index", 0) else "no")
-            A("| %d | `%s` | %s |" % (i + 1, name, mark))
+            b = budgets.get(name) or ["?", "?"]
+            hi = ("open" if isinstance(b[1], (int, float)) and b[1] >= 10**11
+                  else "{:,}".format(b[1]) if isinstance(b[1], (int, float)) else b[1])
+            lo = "{:,}".format(b[0]) if isinstance(b[0], (int, float)) else b[0]
+            if name in spent:
+                used = "{:,}".format(int(spent[name] or 0))
+            elif i == cur.get("reached_index", -1):
+                used = "{:,} (current)".format(int(g(cur, "episodes_in_current_phase", 0)))
+            else:
+                used = "-"
+            A("| %d | `%s` | %s | %s - %s | %s |" % (i + 1, name, mark, lo, hi, used))
+        A("")
+        growth = cur.get("community_growth") or []
+        if growth:
+            A("The community was founded by %d farmers and %d buyers and grew by "
+              "newcomers -- random weights, then the transmission bottleneck on the "
+              "community's transcripts -- to %d + %d, reached at episode %s during "
+              "`%s`. Every rung after the first was judged on the full community."
+              % (cfg.population.founders_farmers, cfg.population.founders_buyers,
+                 growth[-1]["farmers"], growth[-1]["buyers"],
+                 "{:,}".format(growth[-1]["episode"]), growth[-1]["phase"]))
+            A("")
+        A("`refer-swap` and `refer-mutual` are judged per role: each role has to clear "
+          "every bar on its own, describing and decoding, rather than on a pooled "
+          "average that a fluent partner could carry.")
         A("")
         A("Furthest rung reached: **%s** (%s episodes in it at the end)."
           % (reached, "{:,}".format(int(g(cur, "episodes_in_current_phase", 0)))))
@@ -359,20 +445,47 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
                 for k, c in (t.get("criteria") or {}).items():
                     A("- %s: %s" % (k, c.get("detail")))
                 A("")
+                ev_t = t.get("evidence") or {}
+                sp = ev_t.get("speakers") or {}
+                if sp:
+                    A("  Per role at that check: " + "; ".join(
+                        "%s topsim %.3f (null %.3f), positional %.3f"
+                        % (k, g(v, "topsim"), g(v, "null"), g(v, "positional"))
+                        for k, v in sp.items()))
+                    A("")
         else:
             A("No transition happened during this run.")
             A("")
         if cur.get("stalled"):
+            sr = cur.get("stop_report") or {}
             last = cur.get("last_promotion_check") or {}
-            A("> **This phase stalled.** It ran past its episode budget without "
-              "meeting the promotion criteria, so the run did not advance -- "
-              "building the next phase on top of one that never converged would "
-              "only reproduce the failure a rung higher. Unmet at the last check:")
+            A("> **Rung `%s` exceeded its budget.** %s episodes in it (maximum %s) "
+              "without meeting its criteria, so the run %s rather than advance -- "
+              "building the next rung on top of one that never converged would only "
+              "reproduce the failure a rung higher."
+              % (sr.get("phase", cur.get("reached")),
+                 "{:,}".format(int(sr.get("episodes_in_phase", 0) or 0)),
+                 "{:,}".format(int(sr.get("max_episodes", 0) or 0)),
+                 "stopped" if sr.get("action") == "stop" else "held"))
             A(">")
-            for k, c in (last.get("checks") or {}).items():
-                if not c.get("met"):
-                    A("> - %s: %s" % (k, c.get("detail")))
+            A("> Unmet:")
+            for k, d in (sr.get("unmet") or {}).items():
+                A("> - %s: %s" % (k, d))
+            if sr.get("met"):
+                A(">")
+                A("> Met:")
+                for k, d in sr["met"].items():
+                    A("> - %s: %s" % (k, d))
             A("")
+        elif last_check := (cur.get("last_promotion_check") or {}):
+            if not last_check.get("passed") and last_check.get("checks"):
+                A("Last promotion check on `%s` (episode %s):"
+                  % (last_check.get("phase"), "{:,}".format(int(last_check.get("episode", 0)))))
+                A("")
+                for k, c in last_check["checks"].items():
+                    A("- %s %s: %s" % ("met" if c.get("met") else "**unmet**", k,
+                                       c.get("detail")))
+                A("")
 
     A("## 3b. The vocabulary that emerged")
     A("")
@@ -396,7 +509,38 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
              int(g(words, "max_symbols_allowed", 0))))
         A("| utterances at the cap | %.0f%% | high means length-cap babbling |"
           % (100 * g(words, "at_length_cap_frac", 0.0)))
+        stab = final.get("stability", {}) or {}
+        A("| coherence | %.3f | agents of a role saying the same thing for the same "
+          "meaning (farmer %.3f, buyer %.3f) |"
+          % (g(stab, "coherence"), g(stab, "coherence_farmer"), g(stab, "coherence_buyer")))
+        A("| coherence across roles | %.3f | a farmer and a buyer describing the same "
+          "meaning the same way (lineup rungs only) |" % g(stab, "coherence_cross"))
+        ov = final.get("cross_role_overlap") or {}
+        A("| cross-role overlap | %.3f | histogram intersection of the two roles' word "
+          "use: 1.0 is one shared vocabulary, 0.0 two foreign codes |"
+          % g(ov, "weighted_overlap"))
+        A("| shared-form share | farmer %.0f%% / buyer %.0f%% | of each role's word "
+          "tokens, the share that are forms the other role also uses |"
+          % (100 * g(ov, "farmer_share_shared"), 100 * g(ov, "buyer_share_shared")))
+        A("| shared forms (types) | %s of %s farmer / %s buyer (Jaccard %.3f) | the "
+          "one-off tail drags this down |"
+          % (ov.get("shared_types", "-"), ov.get("farmer_types", "-"),
+             ov.get("buyer_types", "-"), g(ov, "jaccard_types")))
         A("")
+        if ov.get("farmer_only_top") or ov.get("buyer_only_top"):
+            A("Role-specific forms (commonest first): farmer-only %s; buyer-only %s. "
+              "Shared core: %s."
+              % (", ".join("`%s`" % w for w in ov.get("farmer_only_top", [])) or "none",
+                 ", ".join("`%s`" % w for w in ov.get("buyer_only_top", [])) or "none",
+                 ", ".join("`%s`" % w for w in ov.get("shared_top", [])) or "none"))
+            A("")
+        q = final.get("quantity_encoding_live") or {}
+        if q.get("n", 0) >= 50:
+            A("Quantity in live messages: %.3f bits beyond what variety already tells "
+              "you (plug-in %.3f, shuffled null %.3f, %d sampled messages). Near zero "
+              "means messages do not carry quantity at all, whatever a greedy form "
+              "table suggests." % (q["excess_bits"], q["mi_bits"], q["null_bits"], q["n"]))
+            A("")
         top = words.get("top_words") or []
         if top:
             A("Commonest words (placeholder names; `a7-a3` is atom 7 hyphenated to atom 3):")
@@ -550,12 +694,14 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
               % (100 * float(bc.get("common_form_coverage", 0.0)),
                  100 * float(bc.get("rare_form_coverage", 0.0))))
         A("")
-        A("A newborn now sees essentially the whole parent generation rather than a "
-          "few hundred transcripts, so a form used with any regularity is shown to "
-          "it hundreds of times and transmits reliably. Only genuinely rare forms "
-          "are at real risk of being absent from the sample -- which is the "
-          "asymmetry real vocabularies show, and the reverse of what a small fixed "
-          "sample produces.")
+        A(_bottleneck_sentence(bc))
+        A("")
+        A("The two retention rows measure different things. \"Form kept between "
+          "checkpoints\" is whether the population's greedy form for a meaning "
+          "survived from one checkpoint to the next -- generational turnover, "
+          "learning drift and phase changes all move it. \"Shown to newborns\" is "
+          "whether a word appeared at least three times in what a newborn was "
+          "trained on; a word can be shown and still not survive, and vice versa.")
         A("")
         A("Replacements observed: %d, of which %d rebuilt from commoner parts. "
           "Drift at the final checkpoint alone was %.3f (frequent) and %.3f (rare)."
@@ -579,6 +725,26 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
             trail = " -> ".join("`%s` (ep %d)" % (x["form"], x["episode"])
                                 for x in t["trail"][:8])
             A("- **%s** (%s, p=%.4f): %s" % (t["meaning"], t["bucket"], t["prob"], trail))
+        A("")
+
+    props = final.get("language_properties") or []
+    if props:
+        A("## 3f. Properties of language")
+        A("")
+        A("Nothing tells the agents what kind of language to build: they start from "
+          "random weights and are shaped only by what the world rewards. So each "
+          "property is *measured*, from numbers recorded during the run, and marked "
+          "as present, partial, absent -- or not testable, where the world as "
+          "configured gives the property no work to do.")
+        A("")
+        A("| property | how it is measured | value | verdict | note |")
+        A("|---|---|---|---|---|")
+        for p in props:
+            v = p.get("value")
+            vs = ("%.3f" % v) if isinstance(v, float) and v == v else (
+                str(v) if isinstance(v, int) else "-")
+            A("| %s | %s | %s | **%s** | %s |" % (p["property"], p["measure"], vs,
+                                                p["verdict"], p.get("note", "")))
         A("")
 
     A("## 4. Example transcripts across the run")
@@ -634,17 +800,39 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
         A("Newborns tested against veterans immediately after their bottleneck training "
           "(before any live episode):")
         A("")
-        A("| episode | newborn | generation | bottleneck samples | token acc | success vs veterans |")
-        A("|---|---|---|---|---|---|")
-        for r in newborn_reports[-15:]:
+        nta = (final.get("curriculum") or {}).get("newborn_token_accuracy") or {}
+        if nta:
+            A("| role | births | mean newborn token accuracy | range | births with no "
+              "own tokens in their curriculum |")
+            A("|---|---|---|---|---|")
+            for lbl in ("farmer", "buyer"):
+                d = nta.get(lbl) or {}
+                A("| %s | %d | %s | %s | %d |"
+                  % (lbl, int(d.get("births", 0)),
+                     ("%.3f" % d["mean"]) if d.get("mean") is not None else "n/a",
+                     ("%.3f - %.3f" % (d["min"], d["max"])) if d.get("min") is not None
+                     else "-", int(d.get("births_with_nothing_to_say", 0))))
+            A("")
+        A("| episode | newborn | generation | phase | transcripts shown / stored | own "
+          "tokens | token acc | decision acc | success vs veterans |")
+        A("|---|---|---|---|---|---|---|---|---|")
+        for r in newborn_reports[-20:]:
             bn = r.get("bottleneck", {}) or {}
             pr = r.get("at_birth_vs_veterans", {}) or {}
             sr = pr.get("success_rate")
-            A("| %d | %s slot %d | %d | %s | %s | %s |"
+
+            def f3(x):
+                return ("%.3f" % x) if isinstance(x, (int, float)) and x == x else "n/a"
+            A("| %d | %s slot %d | %d | %s | %s / %s | %s | %s | %s | %s |"
               % (r.get("episode", 0), r.get("role", "?"), r.get("slot", -1),
-                 r.get("generation", 0), bn.get("n_samples", "-"),
-                 ("%.3f" % bn["token_accuracy"]) if bn.get("token_accuracy") is not None else "-",
-                 ("%.3f" % sr) if isinstance(sr, float) and sr == sr else "-"))
+                 r.get("generation", 0), r.get("phase", "-"),
+                 bn.get("n_samples", "-"), bn.get("store_size", "-"),
+                 bn.get("own_token_targets", "-"), f3(bn.get("token_accuracy")),
+                 f3(bn.get("decision_accuracy")), f3(sr)))
+        A("")
+        A("Token accuracy is over the newborn's *own* message slots under the phase "
+          "each transcript was played in; `n/a` means its curriculum contained nothing "
+          "that role said (a buyer born during `refer`, where only farmers describe).")
         A("")
 
     A("## 7. Where everything is")

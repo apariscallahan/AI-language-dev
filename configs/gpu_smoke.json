@@ -4,10 +4,10 @@
     "n_varieties": 3,
     "n_quality": 3,
     "max_qty": 8,
-    "n_price_bins": 8,
+    "n_price_bins": 6,
     "price_min": 1.0,
     "price_step": 0.5,
-    "reservation_max_bin": 6,
+    "reservation_max_bin": 4,
     "budget_min_bin": 1,
     "p_stocked": 0.9,
     "stock_floor_frac": 0.0,
@@ -26,19 +26,60 @@
   "curriculum": {
     "enabled": true,
     "n_candidates": 4,
-    "min_episodes_per_phase": 4000,
-    "max_episodes_per_phase": 12000,
-    "refer_min_success": 0.55,
+    "min_episodes_per_phase": 20000,
+    "max_episodes_per_phase": 400000,
+    "rung_budgets": {
+      "refer": [
+        81920,
+        2560000
+      ],
+      "refer-swap": [
+        81920,
+        2560000
+      ],
+      "refer-mutual": [
+        81920,
+        3584000
+      ],
+      "order": [
+        81920,
+        2560000
+      ],
+      "haggle": [
+        81920,
+        3584000
+      ],
+      "bargain": [
+        81920,
+        3584000
+      ],
+      "market": [
+        81920,
+        1000000000000
+      ]
+    },
+    "check_every": 25600,
+    "start_phase": "",
+    "refer_min_success": 0.45,
     "trade_min_success": 0.15,
     "min_success_over_chance": 2.0,
     "min_topsim_over_null": 0.1,
     "min_channel_transfer": 0.25,
-    "on_stall": "stop"
+    "min_positional_structure": 0.15,
+    "mutual_min_report": 0.3,
+    "mutual_min_success": 0.1,
+    "on_stall": "stop",
+    "hard_distractor_frac": 0.75,
+    "mutual_qty_tol": 0,
+    "min_field_transfer": 0.25,
+    "order_min_success": 0.5,
+    "holdout_tuple_frac": 0.1
   },
   "channel": {
     "atomic_vocab": 16,
-    "max_symbols": 4,
-    "n_turns": 4
+    "max_symbols": 24,
+    "n_turns": 4,
+    "enforce_word_grammar": true
   },
   "model": {
     "d_model": 64,
@@ -59,23 +100,33 @@
     "success": 1.5,
     "correct_no_deal": 0.25,
     "agree_per_dim": 0.05,
-    "correct_per_dim": 0.1,
+    "correct_per_dim": 0.2,
     "judgement": 0.25,
     "one_sided_accept": -0.1,
     "missed_deal": -0.1,
     "bad_deal": -0.15,
-    "symbol_cost": 0.012,
+    "symbol_cost": 0.03,
     "economics": 0.25,
     "qty_tol": 0,
-    "price_tol": 0
+    "price_tol": 0,
+    "rarity_cost": 0.05,
+    "rarity_common_share": 0.01,
+    "rarity_novel_share": 0.0001,
+    "convention": 0.3,
+    "convention_min_support": 12,
+    "usage_half_life": 20000,
+    "convention_gated": true
   },
   "population": {
-    "n_farmers": 4,
-    "n_buyers": 4,
+    "n_farmers": 8,
+    "n_buyers": 8,
     "turnover": true,
-    "lifespan_min": 1750,
-    "lifespan_max": 3250,
-    "initial_stagger": true
+    "lifespan_min": 25000,
+    "lifespan_max": 45000,
+    "initial_stagger": true,
+    "founders_farmers": 2,
+    "founders_buyers": 2,
+    "grow_every": 10000
   },
   "bottleneck": {
     "enabled": true,
@@ -83,7 +134,7 @@
     "max_samples": 40000,
     "n_samples": 0,
     "epochs": 3,
-    "batch_size": 256,
+    "batch_size": 1024,
     "lr": 0.001,
     "store_capacity": 40000,
     "only_successful": true,
@@ -97,8 +148,9 @@
     "gumbel_tau_final": 0.5,
     "gumbel_tau_anneal_frac": 0.6,
     "gumbel_mix_reinforce": 0.1,
-    "episodes": 20000,
-    "batch_size": 512,
+    "shaping_reinforce": 0.2,
+    "episodes": 500000,
+    "batch_size": 1024,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
@@ -112,18 +164,19 @@
     "device": "auto",
     "torch_threads": 4,
     "vectorised": true,
-    "amp": false,
+    "amp": true,
     "compile": false,
     "grad_checkpoint": false,
     "tf32": true,
-    "log_every_batches": 0
+    "log_every_batches": 0,
+    "convention_reinforce": 1.0
   },
   "log": {
-    "ledger_stride": 10,
-    "checkpoint_every": 10000,
-    "summary_every": 10000,
+    "ledger_stride": 100,
+    "checkpoint_every": 102400,
+    "summary_every": 102400,
     "n_example_transcripts": 3,
-    "topsim_samples": 300,
+    "topsim_samples": 100,
     "stability_probes": 32,
     "intelligibility_episodes": 1024,
     "zeroshot_episodes": 1024,
@@ -132,6 +185,8 @@
     "rare_frequent_split": 0.5,
     "track_form_survival": true,
     "plot": true,
-    "flush_every": 200
+    "flush_every": 200,
+    "snapshot_every_checkpoint": true,
+    "max_agents_probed": 8
   }
 }

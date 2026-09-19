@@ -66,8 +66,8 @@ coverage.xml
 # ---------------------------------------------------------------------------
 # Model weights
 # ---------------------------------------------------------------------------
-# Not written today -- agents are rebuilt from a seed rather than checkpointed --
-# but torch artefacts have a way of appearing, and they should never be commits.
+# Runs write snapshots to runs/<name>/snapshots/*.pt (already under runs/). Move
+# them between machines with scp/rsync, never through git.
 *.pt
 *.pth
 *.ckpt

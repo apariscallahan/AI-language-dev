@@ -127,6 +127,15 @@ class BatchRollout:
                        f_beliefs=fb, b_beliefs=bb)
 
     cfg_ref: Any = None
+    # The curriculum phase this batch was played under (with its informer, for a
+    # swap rung). Whose words are whose depends on it.
+    phase: Any = None
+
+    def own_positions(self, role: int) -> list[int]:
+        """Dialogue slots ``role`` produced in this batch."""
+        if self.phase is not None:
+            return self.phase.own_positions(self.cfg_ref, role)
+        return own_dialogue_positions(self.cfg_ref, role)
 
     def transcript(self, i: int) -> Transcript:
         return Transcript(tokens=[int(t) for t in self.tokens[i]],
@@ -238,15 +247,21 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     if channel_mode not in ("intact", "scrambled", "muted"):
         raise ValueError("unknown channel_mode %r" % (channel_mode,))
     from .batched import ScenarioBatch, resolve_batch
-    from .curriculum import (H_CHOICE, N_HEADS, ReferentialBatch, ladder,
-                             phase_schema, resolve_referential)
+    from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch,
+                             ReferentialBatch, ladder, phase_schema,
+                             resolve_mutual, resolve_order, resolve_referential)
     c = cfg.channel
     if phase is None:
         phase = ladder(cfg)[-1]
     referential = isinstance(scenarios, ReferentialBatch)
-    tensor_in = referential or isinstance(scenarios, ScenarioBatch)
+    mutual = isinstance(scenarios, MutualBatch)
+    tensor_in = referential or mutual or isinstance(scenarios, ScenarioBatch)
+    if referential and scenarios.informer != phase.informer:
+        phase = phase.with_informer(scenarios.informer)
     schema_of = {FARMER: phase_schema(cfg, FARMER, phase),
                  BUYER: phase_schema(cfg, BUYER, phase)}
+    mask_of = {FARMER: phase.self_mask(cfg, FARMER, device),
+               BUYER: phase.self_mask(cfg, BUYER, device)}
     B = len(scenarios)
     D = c.dialogue_len
 
@@ -265,6 +280,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     views = ({FARMER: tokens.clone(), BUYER: tokens.clone()} if altered
              else {FARMER: tokens, BUYER: tokens})
 
+    # who plays which episode, worked out once (reading the index is a device sync)
+    groups_of = {FARMER: group_by_agent(f_idx), BUYER: group_by_agent(b_idx)}
     for turn in range(min(phase.n_turns, c.n_turns)):
         role = phase.speaker_of_turn(turn)
         other = BUYER if role == FARMER else FARMER
@@ -279,10 +296,16 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
             p = turn * c.max_msg_len + k
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
-            for a_i, ep in group_by_agent(idx, alive):
+            # finished utterances are computed too and masked to PAD below:
+            # cheaper on a GPU than finding the live ones at every step
+            for a_i, ep in groups_of[role]:
                 lg, _ = pool[a_i].net.next_token_logits(
-                    obs[ep], views[role][ep], seq_pos, schema=schema_of[role])
+                    obs[ep], views[role][ep], seq_pos, schema=schema_of[role],
+                    self_mask=mask_of[role])
                 logits[ep] = lg
+            from .env import MASKED, grammar_allowed
+            allowed = grammar_allowed(cfg, tokens[:, p - 1] if k > 0 else tokens[:, p], k)
+            logits = logits.masked_fill(~allowed, MASKED)
             if greedy:
                 tok = logits.argmax(dim=-1)
             else:
@@ -311,9 +334,10 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         idx = f_idx if role == FARMER else b_idx
         obs = f_obs if role == FARMER else b_obs
         out = torch.zeros((B, N_HEADS), dtype=torch.long, device=device)
-        for a_i, ep in group_by_agent(idx):
+        for a_i, ep in groups_of[role]:
             heads = pool[a_i].net.decision_logits(
-                obs[ep], views[role][ep], schema=schema_of[role])[:N_HEADS]
+                obs[ep], views[role][ep], schema=schema_of[role],
+                self_mask=mask_of[role])[:N_HEADS]
             for col, lg in enumerate(heads):
                 if greedy:
                     out[ep, col] = lg.argmax(dim=-1)
@@ -325,16 +349,25 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     # Addendum 2.1: atoms, hyphens and spaces are all charged for; ending is free,
     # because brevity should not be taxed.
     content = (tokens < c.end_id)
-    f_pos = own_dialogue_positions(cfg, FARMER)
-    b_pos = own_dialogue_positions(cfg, BUYER)
-    f_emitted = content[:, f_pos].sum(dim=1)
-    b_emitted = content[:, b_pos].sum(dim=1)
+    zeros = torch.zeros(B, dtype=torch.long, device=device)
+    f_pos = phase.own_positions(cfg, FARMER)
+    b_pos = phase.own_positions(cfg, BUYER)
+    f_emitted = content[:, f_pos].sum(dim=1) if f_pos else zeros
+    b_emitted = content[:, b_pos].sum(dim=1) if b_pos else zeros
 
     outcomes: list[Outcome] = []
     res = None
     if referential:
-        res = resolve_referential(cfg, scenarios, decs[BUYER][:, H_CHOICE],
+        res = resolve_referential(cfg, scenarios, decs[phase.guesser][:, H_CHOICE],
                                   f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif mutual:
+        rep = list(H_BELIEF[:3])
+        res = resolve_mutual(cfg, scenarios, decs[FARMER][:, rep], decs[BUYER][:, rep],
+                             f_emitted, b_emitted)
+        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
+    elif phase.order and tensor_in:
+        res = resolve_order(cfg, scenarios, decs[FARMER], f_emitted, b_emitted)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif tensor_in:
         use_bel = cfg.reward.belief_heads
@@ -362,7 +395,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         f_dec=decs[FARMER], b_dec=decs[BUYER],
         f_reward=f_rew, b_reward=b_rew,
         outcomes=outcomes, f_emitted=f_emitted, b_emitted=b_emitted,
-        res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg)
+        res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg, phase=phase)
 
 
 # --------------------------------------------------------------------------
@@ -426,6 +459,9 @@ def update_agents(cfg: Config, batch: BatchRollout, farmers: Sequence[Agent],
 
             tok_logits, tok_values, dec_logits, dec_value = agent.net.full_pass(
                 obs, toks, read_pos)
+            from .env import MASKED, grammar_mask_for_positions
+            tok_logits = tok_logits.masked_fill(
+                ~grammar_mask_for_positions(cfg, toks, own_pos), MASKED)
 
             logp_all = F.log_softmax(tok_logits, dim=-1)
             # Slots the agent never actually spoke hold PAD, which is not an

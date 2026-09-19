@@ -1,0 +1,11 @@
+# Orchard runtime dependencies.
+#
+# On a CUDA machine install the CUDA build of torch first, matching the driver,
+# e.g. for CUDA 12.1:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then:
+#     pip install -r requirements.txt
+torch>=2.1
+numpy>=1.24
+scipy>=1.10        # optional: Spearman for topsim; a pure-Python fallback is used without it
+matplotlib>=3.7    # optional: plots; an SVG fallback is used without it

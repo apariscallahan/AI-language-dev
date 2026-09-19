@@ -66,7 +66,13 @@ def sequence_len(cfg: Config) -> int:
 
 
 def own_dialogue_positions(cfg: Config, role: int) -> list[int]:
-    """Dialogue-buffer indices (0..D-1) at which ``role`` is the speaker."""
+    """Dialogue-buffer indices (0..D-1) at which ``role`` speaks *in the trading task*.
+
+    This is the buyer-opens schedule only. Anything that can run in a lineup
+    rung must ask the phase instead (:meth:`orchard.curriculum.Phase.own_positions`):
+    there the farmer describes first, and using this schedule there silently
+    swaps whose words are whose.
+    """
     L = cfg.channel.max_msg_len
     out: list[int] = []
     for turn in range(cfg.channel.n_turns):
@@ -171,7 +177,8 @@ class CommNet(nn.Module):
 
     # ------------------------------------------------------------------
     def embed(self, obs: torch.Tensor, tokens: torch.Tensor,
-              schema: "list[int] | None" = None) -> torch.Tensor:
+              schema: "list[int] | None" = None,
+              self_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """obs: (B,4) long -> (B, seq_len, d).
 
         ``tokens`` is either (B,D) integer ids, or (B,D,n_token_ids) of
@@ -180,6 +187,10 @@ class CommNet(nn.Module):
         message that crosses the channel is genuinely discrete, but the lookup
         becomes a differentiable matrix product and a gradient can reach the
         speaker that produced it.
+
+        ``self_mask`` (D,) marks the dialogue slots this agent produced. It
+        defaults to the trading schedule; a phase with a different speaking order
+        passes its own, so an agent's own words are always embedded as its own.
         """
         B = obs.shape[0]
         d = self.d_model
@@ -204,7 +215,8 @@ class CommNet(nn.Module):
 
         parts.append(self.slot_emb.weight[SLOT_SEP].expand(B, 1, d))
 
-        spk = torch.where(self._self_mask, 0, 1).to(dev)              # (D,)
+        mine = self._self_mask if self_mask is None else self_mask
+        spk = torch.where(mine.to(dev), 0, 1)                            # (D,)
         tok_vec = (self.tok_emb(tokens) if tokens.dtype == torch.long
                    else tokens @ self.tok_emb.weight)
         dial = (tok_vec
@@ -219,31 +231,45 @@ class CommNet(nn.Module):
 
     def encode(self, obs: torch.Tensor, tokens: torch.Tensor,
                upto: Optional[int] = None,
-               schema: "list[int] | None" = None) -> torch.Tensor:
+               schema: "list[int] | None" = None,
+               self_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Hidden states for the prefix of length ``upto`` (default: whole sequence)."""
-        x = self.embed(obs, tokens, schema)
+        x = self.embed(obs, tokens, schema, self_mask)
         n = self.seq_len if upto is None else upto
         x = x[:, :n]
         mask = self._causal[:n, :n]
+        # bf16 autocast on the transformer layers only, and only on CUDA: that
+        # is where the arithmetic is, and keeping embeddings, heads and losses in
+        # fp32 means nothing downstream has to know. (The flag used to be set by
+        # the GPU presets and read by nothing.)
+        amp = self.cfg.train.amp and x.is_cuda
+
+        def run(t):
+            if amp:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    return self.encoder(t, mask=mask).float()
+            return self.encoder(t, mask=mask)
         if self.cfg.train.grad_checkpoint and self.training and x.requires_grad:
             from torch.utils.checkpoint import checkpoint
-            h = checkpoint(lambda t: self.encoder(t, mask=mask), x,
-                           use_reentrant=False)
+            h = checkpoint(run, x, use_reentrant=False)
         else:
-            h = self.encoder(x, mask=mask)
+            h = run(x)
         return self.norm(h)
 
     # ------------------------------------------------------------------
     def next_token_logits(self, obs: torch.Tensor, tokens: torch.Tensor,
-                          seq_pos: int, schema=None) -> tuple[torch.Tensor, torch.Tensor]:
+                          seq_pos: int, schema=None, self_mask=None
+                          ) -> tuple[torch.Tensor, torch.Tensor]:
         """Logits for the token that will occupy ``seq_pos``, plus that state's value."""
-        h = self.encode(obs, tokens, upto=seq_pos, schema=schema)[:, -1]
+        h = self.encode(obs, tokens, upto=seq_pos, schema=schema,
+                        self_mask=self_mask)[:, -1]
         return self.token_head(h), self.value_head(h).squeeze(-1)
 
-    def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor, schema=None):
+    def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor, schema=None,
+                        self_mask=None):
         """Every discrete head, then the value.  Order matches curriculum.py's
         head indices, so callers can slice the first N_HEADS and trust it."""
-        h = self.encode(obs, tokens, schema=schema)[:, -1]
+        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)[:, -1]
         return self.all_heads(h, obs) + (self.value_head(h).squeeze(-1),)
 
     def decision_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -303,7 +329,7 @@ class CommNet(nn.Module):
         return self.decision_heads(h) + self.belief_heads(h) + (choice,)
 
     def full_pass(self, obs: torch.Tensor, tokens: torch.Tensor,
-                  read_positions: torch.Tensor):
+                  read_positions: torch.Tensor, schema=None, self_mask=None):
         """One causal forward over the finished episode.
 
         ``read_positions`` are sequence indices whose hidden state produced this
@@ -311,7 +337,7 @@ class CommNet(nn.Module):
         dialogue slot ``p``).  Returns token logits and values at those
         positions, plus the four decision logits and the value at DECIDE.
         """
-        h = self.encode(obs, tokens)                        # (B, L, d)
+        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)   # (B, L, d)
         hr = h[:, read_positions]                           # (B, K, d)
         tok_logits = self.token_head(hr)                    # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)

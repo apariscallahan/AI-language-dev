@@ -1,13 +1,13 @@
 {
   "name": "gpu_full",
   "world": {
-    "n_varieties": 5,
+    "n_varieties": 3,
     "n_quality": 3,
-    "max_qty": 20,
-    "n_price_bins": 12,
+    "max_qty": 8,
+    "n_price_bins": 6,
     "price_min": 1.0,
     "price_step": 0.5,
-    "reservation_max_bin": 10,
+    "reservation_max_bin": 4,
     "budget_min_bin": 1,
     "p_stocked": 0.9,
     "stock_floor_frac": 0.0,
@@ -26,25 +26,66 @@
   "curriculum": {
     "enabled": true,
     "n_candidates": 4,
-    "min_episodes_per_phase": 500000,
-    "max_episodes_per_phase": 8000000,
-    "refer_min_success": 0.55,
+    "min_episodes_per_phase": 20000,
+    "max_episodes_per_phase": 400000,
+    "rung_budgets": {
+      "refer": [
+        655360,
+        20480000
+      ],
+      "refer-swap": [
+        655360,
+        20480000
+      ],
+      "refer-mutual": [
+        655360,
+        28672000
+      ],
+      "order": [
+        655360,
+        20480000
+      ],
+      "haggle": [
+        655360,
+        28672000
+      ],
+      "bargain": [
+        655360,
+        28672000
+      ],
+      "market": [
+        655360,
+        1000000000000
+      ]
+    },
+    "check_every": 204800,
+    "start_phase": "",
+    "refer_min_success": 0.45,
     "trade_min_success": 0.15,
     "min_success_over_chance": 2.0,
     "min_topsim_over_null": 0.1,
     "min_channel_transfer": 0.25,
-    "on_stall": "stop"
+    "min_positional_structure": 0.15,
+    "mutual_min_report": 0.3,
+    "mutual_min_success": 0.1,
+    "on_stall": "stop",
+    "hard_distractor_frac": 0.75,
+    "mutual_qty_tol": 0,
+    "min_field_transfer": 0.25,
+    "order_min_success": 0.5,
+    "holdout_tuple_frac": 0.1
   },
   "channel": {
-    "atomic_vocab": 48,
-    "max_symbols": 5,
-    "n_turns": 5
+    "atomic_vocab": 16,
+    "max_symbols": 24,
+    "n_turns": 4,
+    "enforce_word_grammar": true
   },
   "model": {
-    "d_model": 320,
-    "n_layers": 6,
-    "n_heads": 8,
-    "d_ff": 1280,
+    "d_model": 96,
+    "n_layers": 3,
+    "n_heads": 4,
+    "d_ff": 256,
     "dropout": 0.0
   },
   "reward": {
@@ -59,23 +100,33 @@
     "success": 1.5,
     "correct_no_deal": 0.25,
     "agree_per_dim": 0.05,
-    "correct_per_dim": 0.1,
+    "correct_per_dim": 0.2,
     "judgement": 0.25,
     "one_sided_accept": -0.1,
     "missed_deal": -0.1,
     "bad_deal": -0.15,
-    "symbol_cost": 0.012,
+    "symbol_cost": 0.03,
     "economics": 0.25,
-    "qty_tol": 1,
-    "price_tol": 0
+    "qty_tol": 0,
+    "price_tol": 0,
+    "rarity_cost": 0.05,
+    "rarity_common_share": 0.01,
+    "rarity_novel_share": 0.0001,
+    "convention": 0.3,
+    "convention_min_support": 12,
+    "usage_half_life": 20000,
+    "convention_gated": true
   },
   "population": {
-    "n_farmers": 64,
-    "n_buyers": 64,
+    "n_farmers": 128,
+    "n_buyers": 128,
     "turnover": true,
-    "lifespan_min": 21000,
-    "lifespan_max": 39000,
-    "initial_stagger": true
+    "lifespan_min": 80000,
+    "lifespan_max": 140000,
+    "initial_stagger": true,
+    "founders_farmers": 2,
+    "founders_buyers": 2,
+    "grow_every": 80000
   },
   "bottleneck": {
     "enabled": true,
@@ -83,7 +134,7 @@
     "max_samples": 40000,
     "n_samples": 0,
     "epochs": 3,
-    "batch_size": 256,
+    "batch_size": 1024,
     "lr": 0.001,
     "store_capacity": 40000,
     "only_successful": true,
@@ -95,16 +146,17 @@
     "algo": "gumbel",
     "gumbel_tau": 1.5,
     "gumbel_tau_final": 0.5,
-    "gumbel_tau_anneal_frac": 0.6,
+    "gumbel_tau_anneal_frac": 0.1024,
     "gumbel_mix_reinforce": 0.1,
-    "episodes": 30000000,
+    "shaping_reinforce": 0.2,
+    "episodes": 80000000,
     "batch_size": 8192,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
     "entropy_coef": 0.01,
     "entropy_coef_final": 0.002,
-    "entropy_anneal_frac": 0.5,
+    "entropy_anneal_frac": 0.08192,
     "decision_entropy_coef": 0.02,
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
@@ -114,16 +166,17 @@
     "vectorised": true,
     "amp": true,
     "compile": false,
-    "grad_checkpoint": true,
+    "grad_checkpoint": false,
     "tf32": true,
-    "log_every_batches": 0
+    "log_every_batches": 0,
+    "convention_reinforce": 1.0
   },
   "log": {
     "ledger_stride": 1000,
-    "checkpoint_every": 1000000,
-    "summary_every": 1000000,
+    "checkpoint_every": 819200,
+    "summary_every": 819200,
     "n_example_transcripts": 3,
-    "topsim_samples": 300,
+    "topsim_samples": 200,
     "stability_probes": 32,
     "intelligibility_episodes": 8192,
     "zeroshot_episodes": 8192,
@@ -132,6 +185,8 @@
     "rare_frequent_split": 0.5,
     "track_form_survival": true,
     "plot": true,
-    "flush_every": 200
+    "flush_every": 200,
+    "snapshot_every_checkpoint": true,
+    "max_agents_probed": 8
   }
 }

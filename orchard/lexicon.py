@@ -13,11 +13,22 @@ All of it is measurement.  Nothing here tells an agent how to speak; every
 
 Probing convention
 ------------------
-A meaning is a (variety, quantity) request -- the thing the buyer has to name.
-To turn one into an actual observation the other two buyer fields have to be
-filled in, and they are held at fixed reference values so that the probe is a
+A meaning is a (variety, quantity) pair. To turn one into an actual observation
+the remaining fields are held at fixed reference values, so the probe is a
 deterministic function of the meaning and stays comparable across checkpoints
-and across generations.  Messages are decoded greedily for the same reason.
+and generations. Messages are decoded greedily for the same reason.
+
+*Who* is probed depends on the phase. In the trading rungs it is the buyer, who
+opens by naming what it wants. In the lineup rungs it is whoever describes: the
+farmer in ``refer``, both roles in ``refer-swap`` and ``refer-mutual``. An
+earlier version always probed buyers with a shopping-list observation, which in
+``refer`` read "the population's form for this meaning" off agents that never
+spoke in that rung.
+
+Greedy forms are the policy's *mode*. When a policy is still high-entropy the
+mode can be one repeated symbol for a whole row of meanings while sampled play
+varies -- so a greedy form table on its own is not evidence about what live
+messages encode; :func:`live_encoding` measures that directly.
 """
 from __future__ import annotations
 
@@ -47,21 +58,120 @@ def reference_buyer_obs(cfg: Config, key: tuple[int, int]) -> tuple[int, ...]:
     ref_quality = 0
     ref_price = cfg.world.n_price_bins - 2
     vals = (variety, qty, ref_quality, ref_price)
-    return tuple(vals) + (0,) * (n_obs_slots(cfg.world) - len(vals))
+    return tuple(vals) + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
+
+
+def reference_obs(cfg: Config, key: tuple[int, int], phase=None) -> tuple[int, ...]:
+    """The probe observation for ``key`` under ``phase``: a request, or a tuple."""
+    if phase is None or not phase.tuples:
+        return reference_buyer_obs(cfg, key)
+    from .world import n_obs_slots
+    variety, qty = key
+    vals = (variety, qty, 0)
+    return tuple(vals) + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
+
+
+def probe_plan(cfg: Config, phase=None) -> list[tuple[int, Any]]:
+    """(role, view) pairs whose first utterance is "the form" for a meaning."""
+    if phase is None or not phase.tuples:
+        from .curriculum import ladder
+        return [(BUYER, phase if phase is not None else ladder(cfg)[-1])]
+    out = []
+    for role in (FARMER, BUYER):
+        for v in phase.views():
+            if v.speaks(cfg, role):
+                out.append((role, v))
+                break
+    return out
 
 
 def probe_messages(cfg: Config, pop: Population, keys: Sequence[tuple[int, int]],
-                   *, device: str = "cpu", agents: Optional[Sequence] = None
-                   ) -> dict[tuple[int, int], list[list[int]]]:
-    """For each meaning, every buyer's greedy utterance for it."""
-    obs = [reference_buyer_obs(cfg, k) for k in keys]
-    pool = agents if agents is not None else pop.pool(BUYER)
+                   *, device: str = "cpu", agents: Optional[Sequence] = None,
+                   phase=None) -> dict[tuple[int, int], list[list[int]]]:
+    """For each meaning, every describing agent's greedy utterance for it."""
+    from .metrics import opening_context
+    obs = [reference_obs(cfg, k, phase) for k in keys]
     out: dict[tuple[int, int], list[list[int]]] = {k: [] for k in keys}
-    for agent in pool:
-        msgs = utterances_for_meanings(cfg, agent, obs, device=device)
-        for k, m in zip(keys, msgs):
-            out[k].append(m)
+    for role, view in probe_plan(cfg, phase):
+        pool = (agents if agents is not None else pop.pool(role))
+        pool = [a for a in pool if a.role == role]
+        ctx = opening_context(cfg, pop, None, view, device) if (
+            view.turns_of(cfg, role) and view.turns_of(cfg, role)[0] > 0
+            and view.tuples) else None
+        for agent in pool:
+            msgs = utterances_for_meanings(cfg, agent, obs, context=ctx, device=device,
+                                           phase=view)
+            if msgs is None:
+                continue
+            for k, m in zip(keys, msgs):
+                out[k].append(m)
     return out
+
+
+def live_encoding(cfg: Config, batches: Sequence[Any], field: int = 1,
+                  given: int = 0, n_shuffles: int = 5, seed: int = 0) -> dict[str, Any]:
+    """Does what speakers *actually said* carry a field, beyond another field?
+
+    Plug-in mutual information between a message and a meaning field is badly
+    inflated when most messages are unique, so this reports the excess over a
+    shuffled null (the field permuted within each value of ``given``) -- the
+    honest "bits the message carries about quantity once variety is known".
+    Computed on sampled play, not greedy probes.
+    """
+    rows: list[tuple[tuple[int, ...], int, int]] = []
+    for batch in batches:
+        ph = getattr(batch, "phase", None)
+        sb = getattr(batch, "sb", None)
+        if sb is None:
+            continue
+        for role in (FARMER, BUYER):
+            pos = batch.own_positions(role)
+            if not pos:
+                continue
+            if ph is not None and ph.tuples:
+                if hasattr(sb, "meaning_of"):
+                    mean = sb.meaning_of(role)
+                elif getattr(sb, "informer", None) == role:
+                    mean = sb.true_meaning
+                else:
+                    continue
+            elif role == BUYER and hasattr(sb, "want_variety"):
+                mean = torch.stack([sb.want_variety, sb.need_qty], dim=1)
+            else:
+                continue
+            L = cfg.channel.max_msg_len
+            first = pos[:L]
+            toks = batch.tokens[:, first].tolist()
+            for msg, m in zip(toks, mean.tolist()):
+                u = tuple(t for t in msg if t != cfg.channel.pad_id)
+                rows.append((u, int(m[given]), int(m[field])))
+    if len(rows) < 50:
+        return {"n": len(rows)}
+
+    def mi(pairs):
+        n = len(pairs)
+        cx = Counter(a for a, _ in pairs)
+        cy = Counter(b for _, b in pairs)
+        cxy = Counter(pairs)
+        return sum(c / n * math.log2((c / n) / ((cx[x] / n) * (cy[y] / n)))
+                   for (x, y), c in cxy.items())
+
+    rng = random.Random(seed)
+    groups: dict[int, list[tuple[tuple[int, ...], int]]] = defaultdict(list)
+    for u, g, f in rows:
+        groups[g].append((u, f))
+    real = null = 0.0
+    for g, pairs in groups.items():
+        w = len(pairs) / len(rows)
+        real += w * mi(pairs)
+        ys = [f for _, f in pairs]
+        acc = 0.0
+        for _ in range(n_shuffles):
+            rng.shuffle(ys)
+            acc += mi(list(zip([u for u, _ in pairs], ys)))
+        null += w * acc / n_shuffles
+    return {"n": len(rows), "mi_bits": real, "null_bits": null,
+            "excess_bits": real - null}
 
 
 def consensus_message(msgs: Sequence[Sequence[int]]) -> list[int]:
@@ -88,9 +198,16 @@ def word_stats(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
     for batch in batches:
         toks = batch.tokens
         B = toks.shape[0]
+        act = getattr(batch, "active", None)
         for turn in range(c.n_turns):
             seg = toks[:, turn * c.max_symbols:(turn + 1) * c.max_symbols]
+            # A turn the phase never schedules is all PAD. Counting it as a
+            # "silent message" padded every lineup statistic with phantom silence.
+            spoken = (act[:, turn * c.max_symbols].tolist() if act is not None
+                      else [True] * B)
             for i in range(B):
+                if not spoken[i]:
+                    continue
                 syms = [int(t) for t in seg[i] if int(t) != c.pad_id]
                 emitted = [t for t in syms if c.costed(t)]
                 n_msgs += 1
@@ -131,6 +248,63 @@ def word_stats(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def role_word_counts(cfg: Config, batches: Sequence[Any]) -> dict[str, Counter]:
+    """Word tokens each role actually emitted, over sampled play."""
+    out = {"farmer": Counter(), "buyer": Counter()}
+    for batch in batches:
+        toks = batch.tokens.tolist()
+        L = cfg.channel.max_msg_len
+        for role, label in ((FARMER, "farmer"), (BUYER, "buyer")):
+            pos = batch.own_positions(role)
+            if not pos:
+                continue
+            turns = sorted({p // L for p in pos})
+            for row in toks:
+                for t in turns:
+                    seg = [x for x in row[t * L:(t + 1) * L] if x != cfg.channel.pad_id]
+                    for w in parse_words(cfg, seg):
+                        out[label][word_text(cfg, w)] += 1
+    return out
+
+
+def cross_role_overlap(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
+    """One community language, or two mutually foreign codes?
+
+    Computed over the words each role actually emitted in sampled play:
+
+    * ``weighted_overlap`` -- histogram intersection of the two roles' word
+      distributions, sum over words of min(p_farmer, p_buyer). 1.0 is one shared
+      vocabulary used in the same proportions; 0.0 is two disjoint codes. This
+      is the headline.
+    * ``farmer_share_shared`` / ``buyer_share_shared`` -- the fraction of each
+      role's word tokens that are forms the other role also uses. High on both
+      with a modest type-level Jaccard is exactly "one language with
+      role-specific jargon at the edges".
+    * ``jaccard_types`` -- shared forms over all forms, unweighted, which the
+      long tail of one-off coinages drags down.
+    """
+    counts = role_word_counts(cfg, batches)
+    f, b = counts["farmer"], counts["buyer"]
+    nf, nb = sum(f.values()), sum(b.values())
+    out: dict[str, Any] = {"farmer_word_tokens": nf, "buyer_word_tokens": nb,
+                           "farmer_types": len(f), "buyer_types": len(b)}
+    if not nf or not nb:
+        out.update({"weighted_overlap": float("nan"), "jaccard_types": float("nan"),
+                    "farmer_share_shared": float("nan"), "buyer_share_shared": float("nan"),
+                    "note": "only one role spoke in the evaluated play"})
+        return out
+    shared = set(f) & set(b)
+    out["shared_types"] = len(shared)
+    out["jaccard_types"] = len(shared) / len(set(f) | set(b))
+    out["weighted_overlap"] = sum(min(f[w] / nf, b[w] / nb) for w in shared)
+    out["farmer_share_shared"] = sum(f[w] for w in shared) / nf
+    out["buyer_share_shared"] = sum(b[w] for w in shared) / nb
+    out["farmer_only_top"] = [w for w, _ in f.most_common() if w not in b][:5]
+    out["buyer_only_top"] = [w for w, _ in b.most_common() if w not in f][:5]
+    out["shared_top"] = [w for w, _ in (f + b).most_common() if w in shared][:8]
+    return out
+
+
 def word_usage_flags(cfg: Config, ws: dict[str, Any]) -> list[str]:
     """Distinguish the failure modes the addendum tells us not to conflate."""
     flags: list[str] = []
@@ -154,7 +328,7 @@ def word_usage_flags(cfg: Config, ws: dict[str, Any]) -> list[str]:
 # 3.1  length <-> frequency
 # ==========================================================================
 def length_frequency(cfg: Config, pop: Population, world: World, *,
-                     device: str = "cpu") -> dict[str, Any]:
+                     device: str = "cpu", phase=None) -> dict[str, Any]:
     """Do commoner meanings get shorter messages?  (Addendum 2.2's prediction.)
 
     Reported as a correlation, not eyeballed: Spearman between how often a
@@ -166,7 +340,7 @@ def length_frequency(cfg: Config, pop: Population, world: World, *,
         return {"n": len(table)}
     keys = [k for k, _ in table]
     probs = [p for _, p in table]
-    msgs = probe_messages(cfg, pop, keys, device=device)
+    msgs = probe_messages(cfg, pop, keys, device=device, phase=phase)
 
     sym_len, word_len, rows = [], [], []
     for k, p in zip(keys, probs):
@@ -220,8 +394,8 @@ def split_meanings(world: World, quantile: float = 0.5
 
 
 def bucketed_analysis(cfg: Config, pop: Population, world: World, *,
-                      device: str = "cpu", rng: Optional[random.Random] = None
-                      ) -> dict[str, Any]:
+                      device: str = "cpu", rng: Optional[random.Random] = None,
+                      phase=None) -> dict[str, Any]:
     """Compositionality, agreement and length, computed separately per bucket.
 
     A global average hides precisely the effect the addendum predicts -- frequent
@@ -235,10 +409,13 @@ def bucketed_analysis(cfg: Config, pop: Population, world: World, *,
         if len(keys) < 4:
             out[label] = {"n": len(keys)}
             continue
-        msgs = probe_messages(cfg, pop, keys, device=device)
-        meanings = [reference_buyer_obs(cfg, k) for k in keys]
+        msgs = probe_messages(cfg, pop, keys, device=device, phase=phase)
+        meanings = [reference_obs(cfg, k, phase) for k in keys]
         consensus = [consensus_message(msgs[k]) for k in keys]
-        ts = topographic_similarity(meanings, consensus, cfg, BUYER, n_null=2, rng=rng)
+        from .metrics import phase_kinds
+        role, view = probe_plan(cfg, phase)[0]
+        ts = topographic_similarity(meanings, consensus, cfg, role, n_null=2, rng=rng,
+                                    kinds=phase_kinds(cfg, role, view))
         # agreement across the population for the same meaning
         spread = []
         for k in keys:
@@ -309,6 +486,10 @@ class FormTracker:
         self._drift_sum = {"frequent": 0.0, "rare": 0.0}
         self._drift_n = {"frequent": 0, "rare": 0}
         self._changed = {"frequent": 0, "rare": 0}
+        # Who was probed. Crossing into a rung with different speakers is not a
+        # form "changing": the comparison restarts, and the boundary is logged.
+        self._regime: Optional[tuple] = None
+        self.regime_changes: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     def _compositionality(self, words: Sequence[tuple[int, ...]],
@@ -319,9 +500,16 @@ class FormTracker:
         shared = sum(1 for w in words if inventory[w] >= 3)
         return shared / len(words)
 
-    def observe(self, pop: Population, episode: int, *, device: str = "cpu"
-                ) -> dict[str, Any]:
-        msgs = probe_messages(self.cfg, pop, self.keys, device=device)
+    def observe(self, pop: Population, episode: int, *, device: str = "cpu",
+                phase=None) -> dict[str, Any]:
+        regime = tuple((r, "tuple" if v.tuples else "trade")
+                       for r, v in probe_plan(self.cfg, phase))
+        if self._regime is not None and regime != self._regime:
+            self._last = {}
+            self.regime_changes.append({"episode": episode,
+                                        "phase": phase.name if phase else "market"})
+        self._regime = regime
+        msgs = probe_messages(self.cfg, pop, self.keys, device=device, phase=phase)
         consensus = {k: consensus_message(msgs[k]) for k in self.keys}
 
         inventory: Counter = Counter()

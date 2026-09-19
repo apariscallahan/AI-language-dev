@@ -30,34 +30,103 @@ bash cloud_run.sh                               # the full pipeline, timestamped
 
 ## 2. The presets
 
-| preset | agents | brain | episodes | generations | weights + Adam | activations |
+Every preset uses the same method, validated on a CPU at 2 + 2 agents before
+being scaled: the seven-rung ladder (`refer`, `refer-swap`, `refer-mutual`,
+`order`, `haggle`, `bargain`, `market`), per-role promotion, hard lineup rounds,
+held-out combinations, speaker pressures, and a community **founded by 2 farmers
+and 2 buyers that grows** to full size once the first rung is passed. Only the
+scale differs.
+
+| preset | community | brain | params / agent | episodes | batch | ~generations |
 |---|---|---|---|---|---|---|
-| `gpu_smoke` | 4 + 4 | d=64, 2 layers, 77k params | 20,000 | 2 | 0.01 GB | 0.4 GB |
-| `gpu_small` | 8 + 8 | d=96, 3 layers, 353k params | 1,000,000 | 6.2 | 0.07 GB | 5.7 GB |
-| `gpu_community` | 24 + 24 | d=160, 4 layers, 1.3M params | 6,000,000 | 10.0 | 0.73 GB | 3.2 GB |
-| `gpu_full` | 64 + 64 | d=320, 6 layers, 7.5M params | 30,000,000 | 11.5 GB | 13.3 GB |
+| `gpu_smoke` | 2+2 -> 8+8 | d=64, 2 layers | 87k | 0.5M | 1,024 | 2 |
+| `gpu_small` | 2+2 -> 16+16 | d=64, 2 layers | 87k | 8M | 2,048 | 6 |
+| `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 30M | 4,096 | 6 |
+| `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 8,192 | 6 |
+| `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 4,096 | 6 |
+
+Brains are deliberately small and communities large. A supervised check showed
+the 48k-parameter CPU brain already learns a full compositional code for every
+meaning (100% on combinations it never saw), so capacity is not what limits
+these runs; agent count is what makes "a community" mean something. Rung
+budgets, checkpoint cadence and annealing are all set in optimiser *updates*
+(e.g. a lineup rung may take up to 2,500 updates) and converted to episodes by
+the preset's batch size, so they mean the same thing at every scale.
 
 ```bash
-python -m orchard.run --config configs/gpu_community.json --out runs/community
+CONFIG=configs/gpu_community.json bash cloud_run.sh
 ```
 
-**`gpu_smoke`** — four minutes, proves the box works end to end and writes every
-artefact. Nothing will have been learned; that is not what it is for.
+**Why founded small.** Six farmers and six buyers starting from random weights
+never got the lineup game off chance in 200k episodes: each farmer kept its own
+drifting code (coherence 0.04-0.09), so no buyer could learn to read any of them.
+Two and two invent a code in ~80-140k episodes. So every preset founds the
+community at 2 + 2, and after the first rung a newcomer of each role joins every
+`population.grow_every` episodes -- random weights, then the transmission
+bottleneck on the community's transcripts -- until it reaches full size. Every
+rung after the first waits for, and is judged on, the full community.
 
-**`gpu_small`** — the smallest preset that can actually produce a language. Use it
-to check a hypothesis before spending money on `gpu_community`.
+**`gpu_smoke`** -- minutes. Proves the box works end to end and writes every
+artefact. It will usually stop at the first rung's budget: that is the machinery
+working, not a result.
 
-**`gpu_community`** — 48 agents is where "a population" starts to mean something
-rather than a handful of co-adapted pairs, and ten generations gives the
-transmission bottleneck real work to do. This is the preset to reach for by
-default.
+**`gpu_small`** -- the smallest preset worth reading. Use it to check a change
+before paying for `gpu_community`.
 
-**`gpu_full`** — 128 agents, 7.5M parameters each (960M in total), 30M episodes,
-15 generations. Needs roughly **25 GB of VRAM** and will run for a long time;
-benchmark it first. Gradient checkpointing is on, which is what makes it fit (see
-§5).
+**`gpu_community`** -- the default. 96 agents (48 + 48) is where "a community"
+means something rather than a handful of co-adapted pairs.
 
----
+**`gpu_full`** -- 256 agents (128 + 128). Memory is modest; the cost is
+the per-agent loop (each agent runs its own forward pass per symbol step), so
+wall time grows with agent count. Benchmark first.
+
+**`gpu_duality`** -- the community preset in a world with **more things to name
+than atoms to name them with**: 12 apple varieties (plus 8 quantities and 3
+qualities) against 8 atoms, with a 32-symbol buffer per utterance. In the default world 16
+atoms cover 14 field values, so every value can simply get its own atom and
+nothing pushes towards *duality of patterning* -- meaningless units combining
+into meaningful words. This preset makes that pressure real. It is harder and
+has not been validated on a CPU; treat it as the experiment, not the baseline.
+
+**Anneal schedules are in updates, not run fractions.** The Gumbel temperature
+and the entropy bonus anneal over ~1,000 and ~800 optimiser updates, as in the
+CPU runs that worked. An earlier version annealed over a fraction of the whole
+run, so giving a run more episodes silently slowed its learning -- a 2.4M-episode
+run was still at temperature 1.36 after 200k episodes and never left chance.
+
+## 2b. Interruptions, snapshots and resuming
+
+A snapshot of the whole community -- weights, optimiser state, recent usage, the
+transcript store, the curriculum record -- is written to
+`<run>/snapshots/latest.pt` at every checkpoint and to `after-<rung>.pt` at every
+promotion. `cloud_run.sh` resumes automatically when `latest.pt` exists, so on a
+spot or pre-emptible instance just rerun the same command with the same `RUN`:
+
+```bash
+RUN=runs/community CONFIG=configs/gpu_community.json bash cloud_run.sh   # starts
+RUN=runs/community CONFIG=configs/gpu_community.json bash cloud_run.sh   # resumes
+```
+
+Resume by hand, or branch a new experiment off any rung, under any config:
+
+```bash
+python -m orchard.run --config configs/gpu_community.json --out runs/branch \
+    --resume runs/community/snapshots/after-refer-mutual.pt \
+    --set curriculum.order_min_success=0.6
+```
+
+## 2c. Measuring a saved community
+
+```bash
+python -m orchard.analyse --snapshot runs/community/snapshots/after-refer-swap.pt
+```
+
+Runs the full metric suite on the rung the snapshot closed and prints the
+**language-properties scorecard** (reference, productivity, intentionality,
+decontextualised, displaced, interchangeable, generic, perspectives, cultural
+transmission, duality of patterning), each with how it is measured, the value,
+and present / partial / absent / not testable. No training happens; it runs
+fine on a laptop CPU against a snapshot copied down from the box.
 
 ## 3. Changing settings from the command line
 
@@ -92,6 +161,10 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 | setting | what it does |
 |---|---|
 | `--curriculum on\|off` | the referential-then-trading ladder. Off means the full task from random weights, which has not been made to work. |
+| `population.founders_farmers/_buyers`, `population.grow_every` | found the community small and grow it after the first rung. 0 founders = start at full size. |
+| `curriculum.hard_distractor_frac` | share of lineup rounds built as one-field near misses, so every field (quantity included) has to be named. |
+| `curriculum.holdout_tuple_frac` | share of (variety, quantity, quality) combinations never trained on: the productivity test. |
+| `curriculum.min_field_transfer`, `curriculum.mutual_qty_tol` | the mutual rung checks every field for every role, quantity exactly. |
 | `--on-stall hold\|stop` | what to do if a phase never converges. |
 | `bottleneck.coverage` | how much of the parent generation a newborn sees. 1.0 means essentially all of it; lowering it puts common forms back at risk. |
 | `--n-farmers`, `--n-buyers` | population size per role. More agents means a code that has to work for strangers, not a private pair. |
@@ -101,7 +174,8 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 | `--turnover on\|off` | births and deaths. Off means one fixed cohort forever. |
 | `model.d_model`, `model.n_layers`, `model.d_ff` | brain size. |
 | `channel.atomic_vocab` | how many meaningless atoms words are built from. |
-| `channel.max_symbols`, `channel.n_turns` | how long an utterance and a negotiation may be. Both multiply memory. |
+| `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 by default: a buffer, not a pressure -- the symbol cost sets length) and the number of turns. Both multiply memory. |
+| `channel.enforce_word_grammar` | atoms and marks alternate: `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |
 | `world.zipf_alpha` | how skewed demand is. **Read §7 before raising it.** |
 | `reward.decode`, `reward.understood` | the two halves of the communication loop. |
 | `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
@@ -113,22 +187,38 @@ python -m orchard.run --config runs/community/config.json --out runs/community_r
 Runs start on a lineup game and work up to the full market. Nothing is
 reinitialised between phases; the same population carries its weights forward.
 
+The rungs are `refer`, `refer-swap`, `refer-mutual`, `haggle`, `bargain`,
+`market`. Each has its own (min, max) episode budget:
+
 ```bash
 --curriculum off                          # straight to the full trading task
 --set curriculum.n_candidates=6           # a harder lineup (chance 1/6)
---set curriculum.min_episodes_per_phase=100000
---set curriculum.max_episodes_per_phase=2000000
---on-stall stop                           # end the run instead of holding
+--set 'curriculum.rung_budgets={"refer":[20000,600000],"refer-swap":[20000,600000],"refer-mutual":[20000,800000],"haggle":[20000,600000],"bargain":[20000,600000],"market":[20000,1000000000000]}'
+--set curriculum.check_every=5000         # how often promotion is probed
+--on-stall stop                           # end the run on a blown budget (the default)
 ```
 
 Promotion needs success clear of chance, topsim clear of its shuffled null, *and*
-the channel-scramble control showing a real drop — all at one checkpoint. Thresholds:
+the muted-channel control showing a real drop. In `refer-swap` and
+`refer-mutual` each of those is checked separately for the farmer and the buyer.
+Thresholds:
 
 ```bash
---set curriculum.refer_min_success=0.55   # lineup phase
---set curriculum.trade_min_success=0.15   # trading phases
+--set curriculum.refer_min_success=0.55   # lineup rungs
+--set curriculum.trade_min_success=0.15   # trading rungs
 --set curriculum.min_topsim_over_null=0.10
 --set curriculum.min_channel_transfer=0.25
+--set curriculum.min_positional_structure=0.15   # per role, swap and mutual
+--set curriculum.mutual_min_report=0.30          # per role, mutual
+--set curriculum.mutual_min_success=0.10         # both at once, mutual
+```
+
+Speaker pressures (see the README's section on them):
+
+```bash
+--symbol-cost 0.03
+--set reward.rarity_cost=0.05 --set reward.convention=0.15
+--set train.shaping_reinforce=0.2
 ```
 
 **On a rented box use `--on-stall stop`.** If a phase runs past its budget without

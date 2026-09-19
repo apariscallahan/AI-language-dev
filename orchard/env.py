@@ -17,6 +17,8 @@ which keeps it testable with scripted dummy agents (spec 7 step 1).
 """
 from __future__ import annotations
 
+import torch
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -396,6 +398,68 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
 # --------------------------------------------------------------------------
 # Transcript container
 # --------------------------------------------------------------------------
+def grammar_allowed(cfg: Config, prev: torch.Tensor, k: int) -> torch.Tensor:
+    """(B, n_emittable) bool: which symbols may come next in a turn.
+
+    ``prev`` is the previous symbol of this turn (ignored at ``k == 0``). At the
+    start: an atom, or END (silence). After an atom: HYPHEN, SPACE or END. After a
+    HYPHEN or SPACE: an atom. In the last slot of the buffer an atom is followed
+    by END, so no utterance ends on a dangling mark.
+    """
+    c = cfg.channel
+    E = c.n_emittable
+    dev = prev.device
+    if not c.enforce_word_grammar:
+        return torch.ones((prev.shape[0], E), dtype=torch.bool, device=dev)
+    start, atoms, after_atom, closing = _grammar_rows(c.atomic_vocab, c.hyphen_id,
+                                                      c.space_id, c.end_id, E, str(dev))
+    if k == 0:
+        return start.unsqueeze(0).expand(prev.shape[0], E)
+    after = closing if k >= c.max_symbols - 1 else after_atom
+    prev_atom = (prev >= 0) & (prev < c.atomic_vocab)
+    return torch.where(prev_atom.unsqueeze(1), after.unsqueeze(0), atoms.unsqueeze(0))
+
+
+_GRAMMAR_CACHE: dict = {}
+
+
+def _grammar_rows(A: int, hyphen: int, space: int, end: int, E: int, dev: str):
+    """The four fixed legal-next-symbol rows, built once per device (they are
+    consulted at every symbol step of every rollout)."""
+    key = (A, hyphen, space, end, E, dev)
+    hit = _GRAMMAR_CACHE.get(key)
+    if hit is None:
+        atoms = torch.zeros(E, dtype=torch.bool, device=dev)
+        atoms[:A] = True
+        start = atoms.clone()
+        start[end] = True
+        after_atom = torch.zeros(E, dtype=torch.bool, device=dev)
+        after_atom[[hyphen, space, end]] = True
+        closing = torch.zeros(E, dtype=torch.bool, device=dev)
+        closing[end] = True
+        hit = _GRAMMAR_CACHE[key] = (start, atoms, after_atom, closing)
+    return hit
+
+
+def grammar_mask_for_positions(cfg: Config, tokens: torch.Tensor,
+                               positions: "list[int]") -> torch.Tensor:
+    """(B, P, n_emittable) legal-symbol masks for teacher forcing at ``positions``
+    (dialogue indices), each judged from the previous symbol in its own turn."""
+    L = cfg.channel.max_msg_len
+    out = []
+    for p in positions:
+        k = p % L
+        prev = tokens[:, p - 1] if k > 0 else torch.zeros_like(tokens[:, 0])
+        out.append(grammar_allowed(cfg, prev, k))
+    if not out:
+        return torch.zeros((tokens.shape[0], 0, cfg.channel.n_emittable),
+                           dtype=torch.bool, device=tokens.device)
+    return torch.stack(out, dim=1)
+
+
+MASKED = -1e9     # a logit no sample can land on; finite, so entropies stay finite
+
+
 def parse_words(cfg: Config, symbols: "list[int]") -> list[tuple[int, ...]]:
     """Split a symbol sequence into words of atoms.  Never raises, never rejects."""
     c = cfg.channel
@@ -485,8 +549,14 @@ class RandomScriptedAgent:
     def speak(self, obs, history) -> list[int]:
         """Random symbols, including the structural ones, then END."""
         c = self.cfg.channel
-        n = self.rng.randint(1, c.max_symbols)
-        syms = [self.rng.randrange(c.end_id) for _ in range(n - 1)]
+        n_atoms = self.rng.randint(1, max(1, c.max_symbols // 2))
+        syms = [self.rng.randrange(c.atomic_vocab)]
+        for _ in range(n_atoms - 1):
+            syms.append(self.rng.choice((c.hyphen_id, c.space_id)))
+            syms.append(self.rng.randrange(c.atomic_vocab))
+        syms = syms[:c.max_symbols - 1]
+        if syms and not c.is_atom(syms[-1]):
+            syms = syms[:-1]
         syms.append(c.end_id)
         return syms[:c.max_symbols]
 

@@ -26,20 +26,30 @@ Sampling stays proportional to how often each meaning actually came up
 newborn's experience still mirrors the parent generation's.  What changed is that
 it is no longer artificially thin.
 
-The smallness is the whole mechanism.  Kirby-style iterated learning produces
-systematic structure precisely because each generation must reconstruct the whole
-language from a fraction of it: an idiosyncratic lookup table cannot survive the
-squeeze, whereas a compositional code can be inferred from a handful of examples
-and regenerated in full.  Making ``n_samples`` large would remove the pressure
-and turn this into plain cloning -- which is exactly why it is the headline knob
-in the on/off comparison (spec 9).
+Where the squeeze still comes from: the newborn is an apprentice, not a clone.
+It sees transcripts, never weights, for a few epochs, and must rebuild the
+parents' code from the forms that actually occur in them. A positive
+``n_samples`` restores a hard cap for the Kirby-style on/off comparison
+(spec 9); the report states which regime a run was in rather than assuming.
 
 What the newborn learns is standard cross-entropy:
   * its own message tokens, teacher-forced against what the retiring generation
     said in the same position of the same conversation, and
-  * its trade decision, against what that generation decided.
+  * the decisions its role actually made in that phase, against what that
+    generation decided.
 It never sees the other party's private observation -- only its own half of the
 transcript, exactly as in live play.
+
+Whose half is whose depends on the phase
+----------------------------------------
+Each stored transcript remembers the curriculum phase it was played in. "My
+tokens" are the slots *this role* produced under *that phase's* speaking order,
+read with that phase's observation layout, and the decision targets are only the
+heads that phase scores for this role. An earlier version used the trading
+task's buyer-opens order for everything, so in the lineup game -- where the
+farmer describes first -- a farmer newborn's targets were the empty slots of a
+turn nobody spoke (token accuracy 0.000 at every farmer birth), and a buyer
+newborn was trained to imitate the *farmer's* words.
 """
 from __future__ import annotations
 
@@ -52,10 +62,10 @@ import torch.nn.functional as F
 
 from collections import Counter
 
-from .agents import Agent, own_dialogue_positions
+from .agents import Agent
 from .config import Config
-from .env import BUYER, FARMER
-from .rollout import BatchRollout, read_positions_for
+from .env import BUYER, FARMER, MASKED, grammar_mask_for_positions
+from .rollout import BatchRollout
 
 
 @dataclass
@@ -71,6 +81,7 @@ class StoredEpisode:
     f_generation: int
     b_generation: int
     meaning: tuple[int, int] = (0, 0)   # (wanted variety, needed quantity)
+    phase: Any = None                   # the curriculum phase it was played in
 
     def obs_for(self, role: int) -> torch.Tensor:
         return self.f_obs if role == FARMER else self.b_obs
@@ -80,6 +91,25 @@ class StoredEpisode:
 
     def generation_of(self, role: int) -> int:
         return self.f_generation if role == FARMER else self.b_generation
+
+
+class _HostBatch:
+    """A host-side slice of a batch that looks enough like one for ``_push``."""
+
+    def __init__(self, cpu: dict, batch):
+        self.__dict__.update(cpu)
+        self._batch = batch
+        self.row = (0, 0)
+        self.meanings = None
+        self.phase = getattr(batch, "phase", None)
+
+    @property
+    def sb(self):
+        return self._batch.sb
+
+    @property
+    def scenarios(self):
+        return self._batch.scenarios
 
 
 class TranscriptStore:
@@ -98,14 +128,24 @@ class TranscriptStore:
 
     def meaning_of(self, batch, i: int) -> tuple[int, int]:
         """The (variety, quantity) this episode was about."""
+        if isinstance(batch, _HostBatch):
+            if batch.meanings is not None:
+                m = batch.meanings[batch.row[0]]
+                return (int(m[0]), int(m[1]))
+            i = batch.row[1]                 # the episode's index in the full batch
         sb = batch.sb
         if sb is None:
             sc = batch.scenarios[i]
             return (sc.buyer.want_variety, sc.buyer.need_qty)
         if hasattr(sb, "want_variety"):                     # a trading batch
             return (int(sb.want_variety[i]), int(sb.need_qty[i]))
-        m = sb.true_meaning[i]                              # a lineup round
+        m = sb.true_meaning[i]                              # a lineup / mutual round
         return (int(m[0]), int(m[1]))
+
+    def _phase_of(self, batch):
+        from .curriculum import ladder
+        ph = getattr(batch, "phase", None)
+        return ph if ph is not None else ladder(self.cfg)[-1]
 
     def _push(self, batch, i: int, farmers, buyers, episode: int) -> None:
         item = StoredEpisode(
@@ -119,6 +159,7 @@ class TranscriptStore:
             f_generation=farmers[int(batch.f_idx[i])].generation,
             b_generation=buyers[int(batch.b_idx[i])].generation,
             meaning=self.meaning_of(batch, i),
+            phase=self._phase_of(batch),
         )
         if len(self._buf) < self.capacity:
             self._buf.append(item)
@@ -145,10 +186,27 @@ class TranscriptStore:
             keep = batch.res["success"]
             if not self.cfg.bottleneck.only_successful:
                 keep = torch.ones_like(keep)
-            idx = keep.nonzero(as_tuple=True)[0].tolist()
-            for i in idx:
-                self._push(batch, i, farmers, buyers, episode)
-            return len(idx)
+            idx = keep.nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                return 0
+            # Everything the store keeps, gathered and moved to the host in one go.
+            # Cloning six tiny tensors per episode on a GPU was thousands of kernel
+            # launches per batch at cloud batch sizes.
+            cpu = {k: getattr(batch, k)[idx].detach().cpu()
+                   for k in ("f_obs", "b_obs", "tokens", "active", "f_dec", "b_dec",
+                             "f_idx", "b_idx")}
+            rows = idx.tolist()
+            view = _HostBatch(cpu, batch)
+            sb = batch.sb
+            if sb is not None and hasattr(sb, "want_variety"):
+                view.meanings = torch.stack([sb.want_variety[idx], sb.need_qty[idx]],
+                                            dim=1).cpu().tolist()
+            elif sb is not None:
+                view.meanings = sb.true_meaning[idx][:, :2].cpu().tolist()
+            for j, i in enumerate(rows):
+                view.row = (j, i)
+                self._push(view, j, farmers, buyers, episode)
+            return len(rows)
 
         added = 0
         for i, o in enumerate(batch.outcomes):
@@ -280,11 +338,6 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         return info
 
     role = agent.role
-    obs = torch.stack([s.obs_for(role) for s in samples]).to(device)
-    toks = torch.stack([s.tokens for s in samples]).to(device)
-    act = torch.stack([s.active for s in samples]).to(device)
-    dec = torch.stack([s.dec_for(role) for s in samples]).to(device)
-
     gens: dict[int, int] = {}
     for s in samples:
         g = s.generation_of(role)
@@ -299,66 +352,121 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     info["sample_episode_span"] = [min(s.episode for s in samples),
                                    max(s.episode for s in samples)]
 
-    own_pos = own_dialogue_positions(cfg, role)
-    read_pos = read_positions_for(cfg, role, device)
-    target_tokens = toks[:, own_pos]
-    target_mask = act[:, own_pos]
-    # PAD is not an emittable id; park masked-out slots at 0 and drop them from the loss.
-    safe_targets = torch.where(target_mask, target_tokens, torch.zeros_like(target_tokens))
+    # One group per phase (and per describer, in the swap rung): each has its own
+    # speaking order, observation layout and scored heads.
+    from .curriculum import ladder, phase_schema
+    groups: dict[Any, list[StoredEpisode]] = {}
+    for s in samples:
+        groups.setdefault(s.phase if s.phase is not None else ladder(cfg)[-1], []).append(s)
+
+    plans = []
+    for ph, items in groups.items():
+        own_pos = ph.own_positions(cfg, role)
+        heads = ph.active_heads(role, cfg)
+        if not own_pos and not heads:
+            continue                     # this role neither spoke nor decided here
+        obs = torch.stack([s.obs_for(role) for s in items]).to(device)
+        toks = torch.stack([s.tokens for s in items]).to(device)
+        act = torch.stack([s.active for s in items]).to(device)
+        dec = torch.stack([s.dec_for(role) for s in items]).to(device)
+        if own_pos:
+            tgt = toks[:, own_pos]
+            m = act[:, own_pos]
+            safe = torch.where(m, tgt, torch.zeros_like(tgt))
+            gram = grammar_mask_for_positions(cfg, toks, own_pos)
+        else:
+            tgt = m = safe = gram = None
+        plans.append({
+            "phase": ph, "obs": obs, "toks": toks, "dec": dec, "heads": heads,
+            "targets": tgt, "mask": m, "safe": safe, "grammar": gram, "n": len(items),
+            "read_pos": ph.read_positions(cfg, role, device) if own_pos else None,
+            "schema": phase_schema(cfg, role, ph),
+            "self_mask": ph.self_mask(cfg, role, device),
+        })
+    info["phases_in_curriculum"] = {
+        ("%s/%s-describes" % (p["phase"].name, "farmer" if p["phase"].informer == FARMER
+                              else "buyer") if p["phase"].swaps else p["phase"].name): p["n"]
+        for p in plans}
+    info["own_token_targets"] = int(sum(int(p["mask"].sum()) for p in plans
+                                        if p["mask"] is not None))
+    if not plans:
+        info["skipped"] = "nothing in the store that this role said or decided"
+        return info
 
     opt = torch.optim.Adam(agent.net.parameters(), lr=bc.lr)
-    n = len(samples)
-    order = list(range(n))
     tok_loss_val = dec_loss_val = 0.0
-    tok_acc = dec_acc = 0.0
+    tok_acc = dec_acc = None
 
     agent.net.train()
     for _ in range(bc.epochs):
-        rng.shuffle(order)
+        # every minibatch of every group, in one shuffled order
+        work = []
+        for gi, p in enumerate(plans):
+            order = list(range(p["n"]))
+            rng.shuffle(order)
+            for start in range(0, p["n"], bc.batch_size):
+                work.append((gi, order[start:start + bc.batch_size]))
+        rng.shuffle(work)
         ep_tok = ep_dec = 0.0
-        ep_tok_acc = ep_dec_acc = 0.0
-        nb = 0
-        for start in range(0, n, bc.batch_size):
-            sel = torch.tensor(order[start:start + bc.batch_size], dtype=torch.long,
-                               device=device)
-            tok_logits, _, dec_logits, _ = agent.net.full_pass(obs[sel], toks[sel], read_pos)
-            m = target_mask[sel]
-            denom = m.sum().clamp(min=1)
-            ce = F.cross_entropy(
-                tok_logits.reshape(-1, tok_logits.shape[-1]),
-                safe_targets[sel].reshape(-1), reduction="none").reshape(m.shape)
-            tok_loss = (ce * m).sum() / denom
-            pred = tok_logits.argmax(-1)
-            ep_tok_acc += float(((pred == target_tokens[sel]) & m).sum() / denom)
-
-            dec_loss = torch.zeros((), device=device)
-            corr = torch.ones(sel.shape[0], dtype=torch.bool, device=device)
-            for col, lg in enumerate(dec_logits):
-                dec_loss = dec_loss + F.cross_entropy(lg, dec[sel][:, col])
-                corr &= (lg.argmax(-1) == dec[sel][:, col])
-            dec_loss = dec_loss / len(dec_logits)
-            ep_dec_acc += float(corr.float().mean())
-
-            loss = bc.token_loss_weight * tok_loss + bc.decision_loss_weight * dec_loss
+        n_tok_b = n_dec_b = 0
+        tok_hit = tok_n = 0.0
+        dec_hit = dec_n = 0.0
+        for gi, idx in work:
+            p = plans[gi]
+            sel = torch.tensor(idx, dtype=torch.long, device=device)
+            read_pos = (p["read_pos"] if p["read_pos"] is not None
+                        else torch.zeros(0, dtype=torch.long, device=device))
+            tok_logits, _, dec_logits, _ = agent.net.full_pass(
+                p["obs"][sel], p["toks"][sel], read_pos, schema=p["schema"],
+                self_mask=p["self_mask"])
+            loss = torch.zeros((), device=device)
+            if p["mask"] is not None:
+                m = p["mask"][sel]
+                denom = m.sum().clamp(min=1)
+                # the same word grammar the speaker is held to in live play
+                tok_logits = tok_logits.masked_fill(~p["grammar"][sel], MASKED)
+                ce = F.cross_entropy(
+                    tok_logits.reshape(-1, tok_logits.shape[-1]),
+                    p["safe"][sel].reshape(-1), reduction="none").reshape(m.shape)
+                tok_loss = (ce * m).sum() / denom
+                pred = tok_logits.argmax(-1)
+                tok_hit += float(((pred == p["targets"][sel]) & m).sum())
+                tok_n += float(m.sum())
+                loss = loss + bc.token_loss_weight * tok_loss
+                ep_tok += float(tok_loss.detach())
+                n_tok_b += 1
+            if p["heads"]:
+                d = p["dec"][sel]
+                dl = torch.zeros((), device=device)
+                corr = torch.ones(sel.shape[0], dtype=torch.bool, device=device)
+                for col in p["heads"]:
+                    lg = dec_logits[col]
+                    dl = dl + F.cross_entropy(lg, d[:, col])
+                    corr &= (lg.argmax(-1) == d[:, col])
+                dl = dl / len(p["heads"])
+                dec_hit += float(corr.float().sum())
+                dec_n += float(sel.shape[0])
+                loss = loss + bc.decision_loss_weight * dl
+                ep_dec += float(dl.detach())
+                n_dec_b += 1
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.net.parameters(), cfg.train.grad_clip)
             opt.step()
-
-            ep_tok += float(tok_loss.detach())
-            ep_dec += float(dec_loss.detach())
-            nb += 1
-        nb = max(nb, 1)
-        tok_loss_val, dec_loss_val = ep_tok / nb, ep_dec / nb
-        tok_acc, dec_acc = ep_tok_acc / nb, ep_dec_acc / nb
+        tok_loss_val = ep_tok / max(1, n_tok_b)
+        dec_loss_val = ep_dec / max(1, n_dec_b)
+        tok_acc = (tok_hit / tok_n) if tok_n else None
+        dec_acc = (dec_hit / dec_n) if dec_n else None
     agent.net.eval()
 
     # Hand the agent back a fresh RL optimiser -- the apprenticeship optimiser's
     # moments are about a different objective and should not carry over.
     agent.opt = torch.optim.Adam(agent.net.parameters(), lr=cfg.train.lr)
 
-    info["final_token_loss"] = round(tok_loss_val, 4)
-    info["final_decision_loss"] = round(dec_loss_val, 4)
-    info["token_accuracy"] = round(tok_acc, 4)
-    info["decision_accuracy"] = round(dec_acc, 4)
+    # None, not 0.0, when there was nothing of that kind to learn: a buyer born
+    # during ``refer`` never speaks there, and a zero would read as a failure.
+    info["final_token_loss"] = round(tok_loss_val, 4) if tok_acc is not None else None
+    info["final_decision_loss"] = round(dec_loss_val, 4) if dec_acc is not None else None
+    info["token_accuracy"] = round(tok_acc, 4) if tok_acc is not None else None
+    info["decision_accuracy"] = round(dec_acc, 4) if dec_acc is not None else None
     return info

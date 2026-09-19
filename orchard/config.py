@@ -80,8 +80,10 @@ class WorldConfig:
 
     @property
     def variety_names(self) -> list[str]:
-        base = ["RED", "GREEN", "GOLD", "RUSSET", "BRAMLEY", "PIPPIN"]
-        return base[: self.n_varieties]
+        base = ["RED", "GREEN", "GOLD", "RUSSET", "BRAMLEY", "PIPPIN", "FUJI", "GALA",
+                "COX", "BRAEBURN", "JAZZ", "ENVY", "EMPIRE", "COMICE", "DISCOVERY", "SPARTAN"]
+        # Labels are for humans reading reports; the agents only ever see indices.
+        return (base + ["V%d" % i for i in range(len(base), self.n_varieties)])[: self.n_varieties]
 
     @property
     def quality_names(self) -> list[str]:
@@ -104,25 +106,37 @@ class ChannelConfig:
 
         {atom_0 .. atom_{A-1}}  u  {HYPHEN, SPACE, END}
 
-    A **word** is a run of atoms joined by HYPHEN; a **sentence** (one turn) is
-    words separated by SPACE.  Neither HYPHEN nor SPACE means anything itself --
-    they are structural marks, exactly like the atoms they join, in that no
-    meaning is assigned to any of them by the implementer.  Nothing constrains
-    where the agent puts them: messages are parsed leniently (see
-    ``Transcript.words``), so any symbol sequence is legal and whether word-like
-    structure appears at all is something to measure, not to enforce.
+    A **word** is atoms joined by HYPHEN; an **utterance** (one turn) is words
+    separated by SPACE:
 
-    The vocabulary is therefore open -- A^k words of length k are available --
-    while the channel stays discrete and narrow.  What keeps utterances short is
-    a *cost*, not a rule: see ``RewardConfig.symbol_cost``.
+        utterance := word (SPACE word)*        word := atom (HYPHEN atom)*
+
+    That shape is part of the medium, like letters being written in words, and
+    with ``enforce_word_grammar`` it is enforced at every step: after an atom the
+    speaker may continue the word (HYPHEN), start a new word (SPACE) or stop
+    (END); after a HYPHEN or SPACE it must say an atom. So every junction between
+    two atoms is an explicit choice between "same word" and "next word", and a
+    transcript reads exactly as it was emitted -- ``a3-a7 a1`` is a two-atom word
+    and a one-atom word. (Without the rule, bare atoms ran together into one
+    "word" while the HYPHEN symbol did nothing, and reports printed hyphens the
+    agents had never emitted.)
+
+    Nothing about *which* atoms form words, or where words split, is given: no
+    meaning is assigned to any atom, HYPHEN or SPACE.
+
+    ``max_symbols`` is a buffer size, not a pressure. It is set well above what
+    any meaning needs; what keeps utterances short is a *cost*
+    (``RewardConfig.symbol_cost``), and the report flags it if utterances ever
+    actually reach the buffer's end.
     """
     atomic_vocab: int = 36     # meaningless atoms; ids 0 .. atomic_vocab-1
                                # HYPHEN = atomic_vocab       joins atoms into a word
                                # SPACE  = atomic_vocab + 1   separates words
                                # END    = atomic_vocab + 2   ends the utterance
                                # PAD    = atomic_vocab + 3   never emitted; fills the slot
-    max_symbols: int = 8       # hard cap on symbols per turn (the soft cap is the cost)
+    max_symbols: int = 24      # buffer per turn; generous on purpose (the cost sets length)
     n_turns: int = 6           # alternating turns per negotiation; buyer speaks first
+    enforce_word_grammar: bool = True   # atoms and HYPHEN/SPACE must alternate
 
     # ---- symbol ids ----------------------------------------------------
     @property
@@ -261,7 +275,7 @@ class RewardConfig:
     one_sided_accept: float = -0.10 # one accepts, one rejects
     missed_deal: float = -0.10      # viable but both rejected
     bad_deal: float = -0.15         # not viable but both accepted
-    symbol_cost: float = 0.012      # per emitted symbol -- atoms, hyphens and spaces
+    symbol_cost: float = 0.03       # per emitted symbol -- atoms, hyphens and spaces
                                     # all count (addendum 2.1).  A soft pressure toward
                                     # brevity on top of the hard per-turn cap, because
                                     # people do not routinely max out the longest
@@ -274,6 +288,31 @@ class RewardConfig:
 
     qty_tol: int = 0                # tolerance when comparing believed quantities
     price_tol: int = 0              # tolerance when comparing believed price bins
+
+    # ---- conventions (charged or paid to the speaker only) ---------------
+    # Coining: a word costs more the rarer it is in the population's recent
+    # usage. Rarity runs from 0 for established forms (at least
+    # ``rarity_common_share`` of recent word tokens) to 1 at or below
+    # ``rarity_novel_share`` -- including forms nobody has used -- log-linear
+    # between, and each word is charged ``rarity_cost`` x (its rarity minus the
+    # batch's mean word rarity). Centred, so it steers towards established forms
+    # without ever making silence the cheap option. A price, not a ban.
+    rarity_cost: float = 0.05
+    rarity_common_share: float = 0.01
+    rarity_novel_share: float = 1e-4
+    # Agreeing: paid for saying what the population currently says for this
+    # meaning (1 - normalised edit distance to the modal utterance), not just
+    # for being understood by this one partner. Only counts once the
+    # convention has ``convention_min_support`` recent uses behind it.
+    convention: float = 0.15
+    convention_min_support: int = 12
+    # Whether the convention bonus waits for a working channel like the costs do.
+    # Measured: ungated, even strongly weighted, it raised coherence among six
+    # speakers from random weights only to ~0.2 and did not get their lineup off
+    # chance -- a population that size needs founding small (see
+    # population.founders_*), after which the bonus is fully on anyway.
+    convention_gated: bool = True
+    usage_half_life: int = 20_000    # episodes; how "recent" recent usage is
 
 
 # --------------------------------------------------------------------------
@@ -303,17 +342,56 @@ class CurriculumConfig:
     n_candidates: int = 4            # lineup size in the referential phase
 
     # ---- promotion, on evidence rather than on a schedule -----------------
+    # Fallback budget for a rung not named in ``rung_budgets``.
     min_episodes_per_phase: int = 20_000
     max_episodes_per_phase: int = 400_000
+    # (minimum, maximum) episodes per rung. A rung that meets its criteria after
+    # its minimum is left at the next check; one that reaches its maximum
+    # without meeting them ends the run with a report (see ``on_stall``).
+    rung_budgets: dict = field(default_factory=lambda: {
+        "refer": [20_000, 250_000],
+        "refer-swap": [20_000, 250_000],
+        "refer-mutual": [20_000, 300_000],
+        "order": [20_000, 300_000],
+        "haggle": [20_000, 300_000],
+        "bargain": [20_000, 300_000],
+        "market": [20_000, 10**12],
+    })
+    # Promotion is checked this often -- a light probe of just the evidence the
+    # rung needs -- rather than only at the (much heavier) full checkpoints.
+    check_every: int = 5_000
+    # Start partway up the ladder (a rung name), e.g. to exercise later rungs.
+    # Empty = the bottom rung, which is what every real run should use.
+    start_phase: str = ""
     refer_min_success: float = 0.55    # vs 1/n_candidates by chance
     trade_min_success: float = 0.15
     min_success_over_chance: float = 2.0
     min_topsim_over_null: float = 0.10
     min_channel_transfer: float = 0.25
-    # If a phase never hits threshold inside its budget, advancing anyway would
-    # just rebuild the same failure one rung up.  "hold" keeps training and flags
-    # it loudly; "stop" ends the run so a rented box is not burned for nothing.
-    on_stall: str = "hold"
+    # per-role bars in refer-swap and refer-mutual
+    min_positional_structure: float = 0.15   # mean slot->field strength, each role
+    mutual_min_report: float = 0.30          # each role reports the other's tuple
+    mutual_min_success: float = 0.10         # both do, in the same round
+    mutual_qty_tol: int = 0                  # quantity must be reported exactly
+    # each role, each field (variety, quantity, quality): share of headroom over
+    # a muted channel, so no field can ride on the others
+    min_field_transfer: float = 0.25
+    order_min_success: float = 0.50          # farmer fills the buyer's order exactly
+    # swap and mutual: mean over fields of I(message; field) / H(field), chance-
+    # corrected, for each describing role
+    min_field_coverage: float = 0.30
+    # Share of lineup rounds that are "hard": one anchor plus near misses of it,
+    # each differing in one field, target uniform among them. At 0.75, quantity
+    # is needed to pick the target in ~46% of rounds (31% with independent
+    # candidates), variety in ~36%, quality in ~33%.
+    hard_distractor_frac: float = 0.75
+    # Share of (variety, quantity, quality) combinations never used in the lineup
+    # rungs, so describing one is a test of productivity, not recall.
+    holdout_tuple_frac: float = 0.1
+    # If a rung never hits threshold inside its budget, advancing anyway would
+    # just rebuild the same failure one rung up.  "stop" ends the run and writes
+    # the report; "hold" keeps training and flags it loudly.
+    on_stall: str = "stop"
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +401,18 @@ class CurriculumConfig:
 class PopulationConfig:
     n_farmers: int = 8
     n_buyers: int = 8
+    # A community can be founded small and grow to n_farmers / n_buyers. With
+    # founders > 0 the run starts with that many of each, and once the first
+    # curriculum rung has been passed a newcomer of each role joins every
+    # ``grow_every`` episodes. Newcomers are born like any newborn -- random
+    # weights, then the transmission bottleneck on the community's transcripts --
+    # so they learn the existing language rather than inventing one. Measured:
+    # six speakers and six listeners from random weights kept six private,
+    # drifting codes and the lineup never left chance in 200k episodes, where two
+    # and two invent one in ~80k. 0 = start at full size.
+    founders_farmers: int = 0
+    founders_buyers: int = 0
+    grow_every: int = 10_000
     turnover: bool = True                 # master switch for birth/death (spec 9)
     lifespan_min: int = 6000              # in episodes *this agent* participated in
     lifespan_max: int = 12000
@@ -387,6 +477,19 @@ class TrainConfig:
     # term back in over the symbols, which is the direct path for "shorter is
     # better".  0 disables it and reproduces the babbling.
     gumbel_mix_reinforce: float = 1.0
+    # Speaker-only terms (symbol cost, coining cost, convention) reach the
+    # speaker's token choices through this score-function term, in the same
+    # units as the task advantage. Through the Gumbel path they have no route at
+    # all -- the straight-through gradient only carries what the listener did.
+    shaping_reinforce: float = 0.5
+    # The convention bonus gets its own coefficient on the same route: it has to
+    # be strong enough to seed a shared code before the task pays anything,
+    # whereas the costs have to be weak enough not to silence a young channel.
+    convention_reinforce: float = 1.0
+    # Hindsight feedback: after each round the scored heads are also trained
+    # towards the outcome (the target, the partner's meaning, the order), and the
+    # gradient reaches the speaker through the straight-through channel.
+    hindsight_coef: float = 1.0
     episodes: int = 200_000
     batch_size: int = 64                  # episodes per policy-gradient update
     lr: float = 3e-4
@@ -440,6 +543,9 @@ class LogConfig:
     summary_every: int = 5_000       # episodes between human-readable console summaries
     n_example_transcripts: int = 3
     topsim_samples: int = 200        # scenarios sampled for topological similarity
+    # Topsim is O(samples^2) per agent; with a large community, probe a fixed
+    # random sample of agents per role instead of every one.
+    max_agents_probed: int = 8
     stability_probes: int = 32       # fixed probe meanings re-queried each checkpoint
     intelligibility_episodes: int = 400
     zeroshot_episodes: int = 600
@@ -449,6 +555,9 @@ class LogConfig:
     track_form_survival: bool = True   # follow specific meanings across generations
     plot: bool = True
     flush_every: int = 200           # ledger flush cadence (episodes)
+    # Overwrite snapshots/latest.pt at every checkpoint (promotions always
+    # snapshot). Resume with ``python -m orchard.run --resume <file>``.
+    snapshot_every_checkpoint: bool = True
 
 
 @dataclass
@@ -559,6 +668,8 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
 
 
 def _coerce(cur: Any, raw: str) -> Any:
+    if isinstance(cur, (dict, list)):
+        return json.loads(raw)            # e.g. --set 'curriculum.rung_budgets={"refer": [0, 50000]}'
     if isinstance(cur, bool):
         return _tobool(raw)
     if isinstance(cur, int):

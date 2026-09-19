@@ -33,10 +33,12 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       channel_ablation, compositionality, detect_degenerate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
-from .curriculum import (CurriculumState, ReferentialWorld, ladder,
-                         promotion_for)
+from .conventions import PopulationUsage
+from .curriculum import (CurriculumState, ReferentialWorld, evaluate_rung, ladder,
+                         promotion_for, rung_budget)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
-                      length_frequency, word_stats)
+                      cross_role_overlap, length_frequency, live_encoding, word_stats)
+from .metrics import phase_evidence
 from .population import BirthEvent, Population
 from .render import render_transcript
 from .world import World
@@ -100,6 +102,14 @@ class History:
     drift_rare: list[float] = field(default_factory=list)
     reward: list[float] = field(default_factory=list)
     generations: list[float] = field(default_factory=list)
+    # per-role and cross-role series
+    positional_farmer: list[float] = field(default_factory=list)
+    positional_buyer: list[float] = field(default_factory=list)
+    coherence_cross: list[float] = field(default_factory=list)
+    cross_role_overlap: list[float] = field(default_factory=list)
+    mean_word_len: list[float] = field(default_factory=list)
+    at_length_cap: list[float] = field(default_factory=list)
+    phase_index: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: list(v) for k, v in self.__dict__.items()}
@@ -130,6 +140,8 @@ class Trainer:
         # Phase 1 has no trades to put in the trade ledger, but its rounds are
         # still the record of how the language started, so they get their own.
         self.lineup_log = JsonlLog(out_dir, "lineups.jsonl")
+        # every promotion check, passed or not, with the criteria it applied
+        self.promotion_log = JsonlLog(out_dir, "promotions.jsonl")
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # The fast path.  Same distributions, drawn on device in one go; the
@@ -148,11 +160,32 @@ class Trainer:
                                           seed=cfg.train.seed + 4)
         self.forms = FormTracker(cfg, self.world) if cfg.log.track_form_survival else None
         self.provenance = WordProvenance()
+        # what the population has recently been saying: drives the coining cost
+        # and the convention bonus
+        self.usage = PopulationUsage(cfg)
+        # How hard the speaker pressures bite, 0..1. A language has to exist
+        # before it can be economised: charged from the first episode, even the
+        # old 0.012 per symbol drove the lineup's describer towards silence long
+        # before the lineup had taken off (ladder2 took off at ~80k episodes).
+        # So the costs are off for the whole first rung and fully on from its
+        # promotion onwards -- including haggle, where the earlier vocabulary
+        # exploded. (A version that ramped them up with the first rung's success
+        # capped it: with lineups that need every field named, success stalled at
+        # ~0.42 with the costs 66% on, where a run with them ~off passed at 0.62.)
+        self.cost_gate = 0.0 if cfg.curriculum.enabled else 1.0
+        self.rung_success = RollingStat(window=2000)
+        self._batch_no = 0
+        self._next_check = cfg.curriculum.check_every
+        self._next_grow: Optional[int] = None
+        self.community_log: list[dict[str, Any]] = []
 
         # ---- the curriculum -------------------------------------------------
         self.curriculum = CurriculumState(ladder(cfg))
         if not cfg.curriculum.enabled:
             self.curriculum.index = len(self.curriculum.phases) - 1
+        elif cfg.curriculum.start_phase:
+            names = [p.name for p in self.curriculum.phases]
+            self.curriculum.index = names.index(cfg.curriculum.start_phase)
         self.referential_world = None
         if cfg.curriculum.enabled:
             g = torch.Generator(device=dev)
@@ -191,8 +224,12 @@ class Trainer:
             "reached_index": cur.phase.index,
             "episodes_in_current_phase": cur.episodes_in_phase,
             "stalled": cur.stalled,
+            "stop_report": cur.stop_report,
+            "community_growth": self.community_log,
+            "budgets": {p.name: list(rung_budget(self.cfg, p)) for p in cur.phases},
             "transitions": cur.transitions,
             "last_promotion_check": cur.last_report,
+            "promotion_checks_run": cur.checks_run,
             "provenance": self.provenance.summary(names),
         }
         reached = cur.phase.index
@@ -200,48 +237,113 @@ class Trainer:
             out.setdefault("inherited", {})[p.name] = self.provenance.inherited(p.name)
             out.setdefault("new_words", {})[p.name] = self.provenance.new_in_phase(p.name)
         # what each newborn was actually shown, which is what decides transmission
-        cov = [r.get("bottleneck", {}).get("word_coverage") or {}
-               for r in self.newborn_reports]
+        bns = [r.get("bottleneck", {}) or {} for r in self.newborn_reports]
+        cov = [b.get("word_coverage") or {} for b in bns]
         cov = [c for c in cov if c]
         if cov:
             def avg(k):
                 vals = [c[k] for c in cov if k in c]
                 return sum(vals) / len(vals) if vals else float("nan")
+            sizes = [b.get("n_samples", 0) for b in bns if b.get("n_samples")]
+            stores = [b.get("store_size", 0) for b in bns if b.get("n_samples")]
+            shares = [b.get("store_coverage", 0.0) for b in bns if b.get("n_samples")]
             out["bottleneck_coverage"] = {
                 "births_measured": len(cov),
                 "common_form_coverage": avg("common_coverage"),
                 "rare_form_coverage": avg("rare_coverage"),
-                "mean_sample_size": avg("vocabulary_shown"),
+                "vocabulary_shown": avg("vocabulary_shown"),
+                "vocabulary_in_population": avg("vocabulary_in_population"),
+                "mean_transcripts_shown": (sum(sizes) / len(sizes)) if sizes else 0.0,
+                "mean_store_size": (sum(stores) / len(stores)) if stores else 0.0,
+                "mean_share_of_store": (sum(shares) / len(shares)) if shares else 0.0,
+                "fixed_cap": self.cfg.bottleneck.n_samples,
+                "coverage_setting": self.cfg.bottleneck.coverage,
+                "max_samples": self.cfg.bottleneck.max_samples,
             }
+        # newborn token accuracy, by role -- the farmer-side bottleneck check
+        by_role: dict[str, list[float]] = {"farmer": [], "buyer": []}
+        silent: dict[str, int] = {"farmer": 0, "buyer": 0}
+        for r in self.newborn_reports:
+            b = r.get("bottleneck", {}) or {}
+            lbl = r.get("role", "?")
+            if lbl not in by_role:
+                continue
+            if b.get("token_accuracy") is not None:
+                by_role[lbl].append(float(b["token_accuracy"]))
+            elif b.get("n_samples"):
+                silent[lbl] += 1
+        out["newborn_token_accuracy"] = {
+            k: {"births": len(v), "mean": (sum(v) / len(v)) if v else None,
+                "min": min(v) if v else None, "max": max(v) if v else None,
+                "births_with_nothing_to_say": silent[k]}
+            for k, v in by_role.items()}
         return out
 
     # ------------------------------------------------------------------
-    def write_lineups(self, batch, rb, episode0: int) -> None:
-        """One row per lineup round: what was shown, what was said, what was picked."""
+    def write_lineups(self, batch, rb, episode0: int, phase) -> None:
+        """One row per lineup / mutual round: what was shown, said and picked."""
+        from .curriculum import H_BELIEF, H_CHOICE, MutualBatch
+        from .env import BUYER as _B, FARMER as _F
         from .render import render_message
         w = self.cfg.world
         stride = max(1, self.cfg.log.ledger_stride)
         L = self.cfg.channel.max_symbols
+
+        def tup(t):
+            return {"variety": w.variety_names[int(t[0])], "quantity": int(t[1]),
+                    "quality": w.quality_names[int(t[2])]}
+
+        f_ids = [self.pop.farmers[int(x)].agent_id for x in batch.f_idx.tolist()]
+        b_ids = [self.pop.buyers[int(x)].agent_id for x in batch.b_idx.tolist()]
         for i in range(len(batch)):
             ep = episode0 + i
             if ep % stride:
                 continue
-
-            def tup(t):
-                return {"variety": w.variety_names[int(t[0])], "quantity": int(t[1]),
-                        "quality": w.quality_names[int(t[2])]}
-
+            if phase.order:
+                msg = [int(x) for x in batch.tokens[i, :L]]
+                self.lineup_log.write({
+                    "episode": ep, "phase": phase.name,
+                    "farmer_id": f_ids[i], "buyer_id": b_ids[i],
+                    "want_variety": w.variety_names[int(rb.want_variety[i])],
+                    "need_qty": int(rb.need_qty[i]),
+                    "filled_variety": w.variety_names[int(batch.f_dec[i, 1])],
+                    "filled_qty": int(batch.f_dec[i, 2]),
+                    "correct": bool(batch.res["success"][i]),
+                    "msg_symbols": msg,
+                    "msg_text": render_message(self.cfg, msg),
+                })
+                continue
+            if isinstance(rb, MutualBatch):
+                msgs = [[int(x) for x in batch.tokens[i, t * L:(t + 1) * L]]
+                        for t in range(phase.n_turns)]
+                rep = list(H_BELIEF[:3])
+                self.lineup_log.write({
+                    "episode": ep, "phase": phase.name,
+                    "farmer_id": f_ids[i], "buyer_id": b_ids[i],
+                    "farmer_meaning": tup(rb.f_meaning[i]),
+                    "buyer_meaning": tup(rb.b_meaning[i]),
+                    "farmer_report": [int(x) for x in batch.f_dec[i, rep]],
+                    "buyer_report": [int(x) for x in batch.b_dec[i, rep]],
+                    "farmer_ok": bool(batch.res["farmer_report_ok"][i]),
+                    "buyer_ok": bool(batch.res["buyer_report_ok"][i]),
+                    "correct": bool(batch.res["success"][i]),
+                    "msg_symbols": msgs,
+                    "msg_text": " | ".join(render_message(self.cfg, m) for m in msgs),
+                })
+                continue
             cands = [tup(rb.meanings[i, k]) for k in range(rb.meanings.shape[1])]
             msg = [int(x) for x in batch.tokens[i, :L]]
+            guess = batch.b_dec if phase.guesser == _B else batch.f_dec
             self.lineup_log.write({
                 "episode": ep,
-                "phase": "refer",
-                "informer_id": self.pop.farmers[int(batch.f_idx[i])].agent_id,
-                "guesser_id": self.pop.buyers[int(batch.b_idx[i])].agent_id,
+                "phase": phase.name,
+                "informer": "farmer" if phase.informer == _F else "buyer",
+                "informer_id": f_ids[i] if phase.informer == _F else b_ids[i],
+                "guesser_id": b_ids[i] if phase.informer == _F else f_ids[i],
                 "true_meaning": tup(rb.true_meaning[i]),
                 "candidates": cands,
                 "target_index": int(rb.target[i]),
-                "chosen_index": int(batch.b_dec[i, 8]),
+                "chosen_index": int(guess[i, H_CHOICE]),
                 "correct": bool(batch.res["success"][i]),
                 "msg_symbols": msg,
                 "msg_text": render_message(self.cfg, msg),
@@ -249,71 +351,288 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def phase_sampler(self, phase):
-        """How this phase draws evaluation rounds -- lineups, or trades."""
-        if phase.referential and self.referential_world is not None:
-            return lambda n, held_out=False: self.referential_world.sample(n)
+        """How one view of a phase draws rounds -- lineups, mutual pairs, or trades."""
+        rw = self.referential_world
+        if phase.referential and rw is not None:
+            return lambda n, held_out=False: rw.sample(n, informer=phase.informer,
+                                                       held_out=bool(held_out))
+        if phase.mutual and rw is not None:
+            return lambda n, held_out=False: rw.sample_mutual(n, held_out=bool(held_out))
         if self.tensor_world is not None:
             return lambda n, held_out=False: self.tensor_world.sample(
                 n, held_out=bool(held_out))
         return None
 
+    def _context_consistency(self, phase) -> dict[str, Any]:
+        """Only meaningful once buyers have spoken in a trade context too."""
+        if phase.tuples:
+            return {"n": 0, "consistency": float("nan"),
+                    "note": "buyers have only spoken in lineups so far"}
+        try:
+            from .metrics import context_consistency
+            return context_consistency(self.cfg, self.pop, device=self.device)
+        except Exception as exc:
+            return {"n": 0, "consistency": float("nan"), "error": str(exc)}
+
+    def language_properties(self, sem=None) -> list[dict[str, Any]]:
+        from .properties import scorecard
+        return scorecard(self.cfg, self.metrics_log.rows, self.curriculum_report(), sem)
+
+    def zero_shot_sampler(self, phase):
+        """Seen versus held-out rounds, drawn the *same* way.
+
+        Held-out lineups use independent distractors (a near-miss cluster built
+        around a held-out target would give the target away), so the seen rounds
+        they are compared with must use independent distractors too.
+        """
+        rw = self.referential_world
+        if phase.referential and rw is not None:
+            return lambda n, held_out=False: rw.sample(n, informer=phase.informer,
+                                                       held_out=bool(held_out),
+                                                       hard_frac=0.0)
+        return self.phase_sampler(phase)
+
     def chance_for(self, phase) -> float:
-        """The floor this phase has to clear."""
+        """The floor this phase has to clear (NaN: measured, not analytic)."""
         if phase.referential:
             return 1.0 / max(2, self.cfg.curriculum.n_candidates)
+        if phase.mutual or phase.order:
+            return float("nan")           # measured against a muted channel instead
         return self.chance
 
-    def consider_promotion(self, row: dict[str, Any]) -> None:
-        """Move up a rung only if this one demonstrably worked."""
+    def gather_evidence(self, phase, *, light: bool) -> dict[str, Any]:
+        lg = self.cfg.log
+        n_eval = lg.ablation_episodes // (2 if light else 1)
+        return phase_evidence(
+            self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
+            n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
+            n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
+            device=self.device, rng=self.eval_rng)
+
+    def consider_promotion(self, evidence: dict[str, Any], source: str) -> None:
+        """Move up a rung only if this one demonstrably worked -- judged per role
+        where the rung is about both roles."""
         cur = self.curriculum
         if not self.cfg.curriculum.enabled or cur.finished:
             return
         phase = cur.phase
-        rule = promotion_for(self.cfg, phase)
-        comp = row.get("compositionality", {}) or {}
-        abl = row.get("channel_ablation", {}) or {}
-        buyer = comp.get("buyer", {}) if isinstance(comp.get("buyer"), dict) else {}
-        passed, checks = rule.evaluate(
-            success=row.get("eval_success", float("nan")),
-            chance=self.chance_for(phase),
-            topsim=comp.get("mean", float("nan")),
-            null=buyer.get("null_mean", float("nan")),
-            transfer=abl.get("information_transfer", float("nan")),
-            episodes_in_phase=cur.episodes_in_phase)
-        cur.last_report = {"phase": phase.name, "passed": passed, "checks": checks}
+        lo, hi = rung_budget(self.cfg, phase)
+        passed, checks = evaluate_rung(self.cfg, phase, evidence, cur.episodes_in_phase)
+        if cur.index > 0 and not self.pop.full_size:
+            # every rung after the first is judged on the whole community
+            p = self.cfg.population
+            checks["community at full size"] = {
+                "met": False,
+                "detail": "%d of %d farmers, %d of %d buyers" % (
+                    len(self.pop.farmers), p.n_farmers, len(self.pop.buyers), p.n_buyers)}
+            passed = False
+        cur.checks_run += 1
+        cur.last_report = {"phase": phase.name, "passed": passed, "checks": checks,
+                           "episode": self.episode, "source": source}
+        slim = {k: v for k, v in evidence.items() if not k.startswith("_")}
+        for sp in slim.get("speakers", {}).values():
+            sp.pop("positional_rows", None)
+        self.promotion_log.write({"episode": self.episode, "phase": phase.name,
+                                  "episodes_in_phase": cur.episodes_in_phase,
+                                  "source": source, "passed": passed,
+                                  "checks": checks, "evidence": slim})
 
         L = self.log
         if passed:
             done_in = cur.episodes_in_phase
             nxt = cur.advance(self.episode, checks)
+            self.rung_success = RollingStat(window=2000)
+            self.cost_gate = 1.0
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
+            try:
+                cur.transitions[-1]["snapshot"] = self.save_snapshot("after-" + phase.name)
+            except Exception as exc:          # a snapshot must never kill a run
+                self.log("  [snapshot] skipped: %s" % exc)
+            cur.transitions[-1]["evidence"] = slim
             L("")
             L("*** PHASE %s -> %s at episode %d ***" % (phase.name, nxt.name, self.episode))
             L("    %s" % nxt.blurb)
-            L("    promoted because, after %s episodes in %s:" % ("{:,}".format(done_in), phase.name))
+            L("    promoted because, after %s episodes in %s (budget %s-%s):"
+              % ("{:,}".format(done_in), phase.name, "{:,}".format(lo), "{:,}".format(hi)))
             for name, c in checks.items():
-                L("      met: %-24s %s" % (name, c["detail"]))
+                L("      met: %-40s %s" % (name, c["detail"]))
             L("    the population carries its weights forward; nothing is reinitialised.")
             L("")
             return
 
-        if cur.episodes_in_phase >= rule.max_episodes:
+        if cur.episodes_in_phase >= hi:
             unmet = [k for k, c in checks.items() if not c["met"]]
             if not cur.stalled:
                 cur.stalled = True
+                cur.stop_report = {
+                    "phase": phase.name, "episode": self.episode,
+                    "episodes_in_phase": cur.episodes_in_phase, "max_episodes": hi,
+                    "unmet": {k: checks[k]["detail"] for k in unmet},
+                    "met": {k: c["detail"] for k, c in checks.items() if c["met"]},
+                    "action": self.cfg.curriculum.on_stall,
+                }
                 L("")
-                L("!!! PHASE %s HAS STALLED at episode %d !!!" % (phase.name, self.episode))
-                L("    %s episodes in this phase without meeting:"
-                  % "{:,}".format(cur.episodes_in_phase))
+                L("!!! RUNG %s EXCEEDED ITS BUDGET at episode %d !!!" % (phase.name, self.episode))
+                L("    %s episodes in this rung (max %s) without meeting:"
+                  % ("{:,}".format(cur.episodes_in_phase), "{:,}".format(hi)))
                 for k in unmet:
-                    L("      unmet: %-24s %s" % (k, checks[k]["detail"]))
-                L("    Not advancing. Building the next phase on top of a phase that")
+                    L("      unmet: %-40s %s" % (k, checks[k]["detail"]))
+                for k, c in checks.items():
+                    if c["met"]:
+                        L("      met:   %-40s %s" % (k, c["detail"]))
+                L("    Not advancing. Building the next rung on top of one that")
                 L("    never converged would only reproduce this failure one rung up.")
                 if self.cfg.curriculum.on_stall == "stop":
-                    L("    on_stall=stop: ending the run here.")
+                    L("    on_stall=stop: ending the run here and writing the report.")
                 L("")
             if self.cfg.curriculum.on_stall == "stop":
                 self._stop_requested = True
+
+    # ------------------------------------------------------------------
+    # snapshots: the whole population and everything it has been saying
+    # ------------------------------------------------------------------
+    def save_snapshot(self, tag: str) -> str:
+        """Write everything needed to carry on from here.
+
+        Taken at every promotion (``after-<rung>.pt``) and at every checkpoint
+        (``latest.pt``). A later rung can then be iterated on without replaying
+        the ones below it, and a pre-empted cloud machine loses at most one
+        checkpoint interval.
+        """
+        from dataclasses import asdict
+
+        def agent_state(a):
+            return {"agent_id": a.agent_id, "role": a.role, "slot": a.slot,
+                    "generation": a.generation, "birth_episode": a.birth_episode,
+                    "lifespan": a.lifespan, "age": a.age, "days_alive": a.days_alive,
+                    "n_success": a.n_success, "n_episodes": a.n_episodes,
+                    "reward_sum": a.reward_sum, "net": a.net.state_dict(),
+                    "opt": a.opt.state_dict()}
+        u = self.usage
+        state = {
+            "version": 1, "episode": self.episode, "config": self.cfg.to_dict(),
+            "curriculum": {"index": self.curriculum.index,
+                           "episodes_in_phase": self.curriculum.episodes_in_phase,
+                           "transitions": self.curriculum.transitions,
+                           "checks_run": self.curriculum.checks_run},
+            "cost_gate": self.cost_gate, "batch_no": self._batch_no,
+            "next_grow": self._next_grow, "community_log": self.community_log,
+            "farmers": [agent_state(a) for a in self.pop.farmers],
+            "buyers": [agent_state(a) for a in self.pop.buyers],
+            "next_id": self.pop._next_id, "deaths": self.pop.deaths,
+            "births": [asdict(e) for e in self.pop.births],
+            "usage": {"scale": u.scale, "words": dict(u.words), "word_total": u.word_total,
+                      "forms": {k: dict(v) for k, v in u.forms.items()},
+                      "form_total": dict(u.form_total), "episodes": u.episodes},
+            "store": {"buf": self.store._buf, "pos": self.store._pos,
+                      "total_added": self.store.total_added,
+                      "meaning_counts": dict(self.store.meaning_counts)},
+            "newborn_reports": self.newborn_reports,
+            "totals": self.totals, "failure_counts": self.failure_counts,
+        }
+        d = os.path.join(self.out_dir, "snapshots")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "%s.pt" % tag)
+        tmp = path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+        return path
+
+    def load_snapshot(self, path: str) -> None:
+        """Continue from a snapshot, under *this* trainer's configuration."""
+        from collections import Counter, defaultdict
+
+        from .agents import make_agent
+        from .population import BirthEvent
+        st = torch.load(path, map_location=self.device, weights_only=False)
+        self.episode = int(st["episode"])
+        cur = self.curriculum
+        cur.index = int(st["curriculum"]["index"])
+        cur.episodes_in_phase = int(st["curriculum"]["episodes_in_phase"])
+        cur.transitions = list(st["curriculum"]["transitions"])
+        cur.checks_run = int(st["curriculum"]["checks_run"])
+        self.cost_gate = float(st["cost_gate"])
+        self._batch_no = int(st["batch_no"])
+        self._next_grow = st["next_grow"]
+        self.community_log = list(st["community_log"])
+
+        def restore(rec):
+            a = make_agent(self.cfg, agent_id=rec["agent_id"], role=rec["role"],
+                           slot=rec["slot"], generation=rec["generation"],
+                           birth_episode=rec["birth_episode"], lifespan=rec["lifespan"],
+                           device=self.device)
+            a.net.load_state_dict(rec["net"])
+            try:
+                a.opt.load_state_dict(rec["opt"])
+            except Exception:
+                pass                    # e.g. a changed learning rate: fresh moments
+            for k in ("age", "days_alive", "n_success", "n_episodes", "reward_sum"):
+                setattr(a, k, rec[k])
+            return a
+        self.pop.farmers = [restore(r) for r in st["farmers"]]
+        self.pop.buyers = [restore(r) for r in st["buyers"]]
+        self.pop._next_id = int(st["next_id"])
+        self.pop.deaths = int(st["deaths"])
+        self.pop.births = [BirthEvent(**b) for b in st["births"]]
+        u = self.usage
+        us = st["usage"]
+        u.scale, u.word_total, u.episodes = us["scale"], us["word_total"], us["episodes"]
+        u.words = defaultdict(float, us["words"])
+        u.forms = defaultdict(lambda: defaultdict(float),
+                              {k: defaultdict(float, v) for k, v in us["forms"].items()})
+        u.form_total = defaultdict(float, us["form_total"])
+        so = st["store"]
+        self.store._buf = list(so["buf"])[:self.store.capacity]
+        self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
+        self.store.total_added = int(so["total_added"])
+        self.store.meaning_counts = Counter(so["meaning_counts"])
+        self.newborn_reports = list(st["newborn_reports"])
+        self.totals = dict(st["totals"])
+        self.failure_counts = dict(st["failure_counts"])
+        self._next_check = self.episode + self.cfg.curriculum.check_every
+        self.resume_note = ("resumed from     : %s at episode %d, rung %s"
+                            % (path, self.episode, cur.phase.name))
+
+    def maybe_grow(self) -> None:
+        """Newcomers join once the founders have a working language."""
+        if self.pop.full_size:
+            return
+        if self._next_grow is None:
+            if self.cfg.curriculum.enabled and self.curriculum.index == 0:
+                return                     # the founders are still inventing it
+            self._next_grow = self.episode
+        if self.episode < self._next_grow:
+            return
+        p = self.cfg.population
+        for role, target in ((FARMER, p.n_farmers), (BUYER, p.n_buyers)):
+            if len(self.pop.pool(role)) < target:
+                self.pop.add_newcomer(role, self.episode, on_birth=self.on_birth)
+        self._next_grow = self.episode + p.grow_every
+        self.community_log.append({"episode": self.episode, "phase": self.curriculum.phase.name,
+                                   "farmers": len(self.pop.farmers),
+                                   "buyers": len(self.pop.buyers)})
+        if self.pop.full_size:
+            self.log("  [community] full size: %d farmers, %d buyers"
+                     % (len(self.pop.farmers), len(self.pop.buyers)))
+
+    def update_cost_gate(self, succ: torch.Tensor) -> None:
+        """Speaker costs: off through the first rung, on once it has been passed."""
+        cur = self.curriculum
+        if cur.index > 0 or not self.cfg.curriculum.enabled:
+            self.cost_gate = 1.0
+
+    def maybe_check_promotion(self) -> None:
+        """The light, frequent check -- so a rung that has worked is left promptly."""
+        cur = self.curriculum
+        if (not self.cfg.curriculum.enabled or cur.finished
+                or self.episode < self._next_check):
+            return
+        self._next_check = self.episode + self.cfg.curriculum.check_every
+        lo, hi = rung_budget(self.cfg, cur.phase)
+        if cur.episodes_in_phase < lo and cur.episodes_in_phase < hi:
+            return                      # cannot pass yet; do not pay for the probe
+        ev = self.gather_evidence(cur.phase, light=True)
+        self.consider_promotion(ev, source="check")
 
     # ------------------------------------------------------------------
     def write_progress(self, state: str = "running") -> None:
@@ -365,16 +684,26 @@ class Trainer:
         L("episodes           : %d  (batch %d -> %d updates)"
           % (c.train.episodes, c.train.batch_size,
              c.train.episodes // max(1, c.train.batch_size)))
-        L("population         : %d farmers, %d buyers"
-          % (c.population.n_farmers, c.population.n_buyers))
+        if c.population.founders_farmers or c.population.founders_buyers:
+            L("population         : founded by %d farmers, %d buyers; grows to %d + %d "
+              "after the first rung (one of each every %s episodes)"
+              % (len(self.pop.farmers), len(self.pop.buyers), c.population.n_farmers,
+                 c.population.n_buyers, "{:,}".format(c.population.grow_every)))
+        else:
+            L("population         : %d farmers, %d buyers"
+              % (c.population.n_farmers, c.population.n_buyers))
         L("turnover           : %s%s" % (
             "ON" if c.population.turnover else "OFF",
             "  (lifespan %d-%d episodes)" % (c.population.lifespan_min, c.population.lifespan_max)
             if c.population.turnover else ""))
+        bn = c.bottleneck
+        regime = ("fixed cap of %d transcripts" % bn.n_samples if bn.n_samples > 0
+                  else "%.0f%% of the store, up to %d transcripts"
+                  % (100 * bn.coverage, bn.max_samples))
         L("bottleneck         : %s%s" % (
-            "ON" if c.bottleneck.enabled else "OFF",
-            "  (%d samples, %d epochs)" % (c.bottleneck.n_samples, c.bottleneck.epochs)
-            if c.bottleneck.enabled else ""))
+            "ON" if bn.enabled else "OFF",
+            "  (%s; store holds %d; %d epochs)" % (regime, bn.store_capacity, bn.epochs)
+            if bn.enabled else ""))
         L("channel            : %d content tokens + <eos>, <= %d tokens/turn, %d turns"
           % (c.channel.vocab_size, c.channel.max_msg_len, c.channel.n_turns))
         L("world              : %d varieties, qty 1-%d, %d quality levels, %d price bins"
@@ -394,6 +723,18 @@ class Trainer:
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))
         L("expected turnover  : ~%.1f generations per lineage" % expected_generations(c))
+        if c.curriculum.enabled:
+            L("curriculum         : " + " -> ".join(
+                "%s [%s-%s]" % (p.name, "{:,}".format(rung_budget(c, p)[0]),
+                                "{:,}".format(rung_budget(c, p)[1])
+                                if rung_budget(c, p)[1] < 10**11 else "open")
+                for p in self.curriculum.phases))
+            L("                     (on a rung's max without meeting its criteria: %s)"
+              % c.curriculum.on_stall)
+        L("speaker pressures  : %.3f per symbol, up to %.3f per novel word, %.3f for "
+          "matching the population's convention" % (c.reward.symbol_cost,
+                                                     c.reward.rarity_cost,
+                                                     c.reward.convention))
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
@@ -411,19 +752,32 @@ class Trainer:
         # before it has played a single live episode.
         probe = newborn_vs_veterans(self.cfg, self.pop, self.world, newborn,
                                     self.cfg.log.intelligibility_episodes // 2,
-                                    device=self.device, rng=self.eval_rng)
+                                    device=self.device, rng=self.eval_rng,
+                                    phase=self.curriculum.phase,
+                                    sampler_for=self.phase_sampler)
         rec = ev.to_dict()
         rec["at_birth_vs_veterans"] = probe
+        rec["phase"] = self.curriculum.phase.name
         self.birth_log.write(rec)
         self.newborn_reports.append(rec)
-        self.log("  [birth] %s %s gen %d replaces agent %d (age %d, success %.3f)"
-                 % (ROLE_NAMES[ev.role], newborn.name, ev.generation,
-                    ev.replaced_agent_id, ev.replaced_age, ev.replaced_success_rate))
+        if ev.kind == "newcomer":
+            self.log("  [join] %s %s joins the community (now %d farmers, %d buyers)"
+                     % (ROLE_NAMES[ev.role], newborn.name, len(self.pop.farmers),
+                        len(self.pop.buyers)))
+        else:
+            self.log("  [birth] %s %s gen %d replaces agent %d (age %d, success %.3f)"
+                     % (ROLE_NAMES[ev.role], newborn.name, ev.generation,
+                        ev.replaced_agent_id, ev.replaced_age, ev.replaced_success_rate))
         if info.get("n_samples"):
-            self.log("          bottleneck: %d transcripts from generations %s, "
-                     "token acc %.3f, decision acc %.3f"
-                     % (info["n_samples"], info["teacher_generations"],
-                        info["token_accuracy"] or 0.0, info["decision_accuracy"] or 0.0))
+            def acc(x):
+                return "%.3f" % x if x is not None else "n/a"
+            self.log("          bottleneck: %d of %d stored transcripts (%s), from "
+                     "generations %s; token acc %s over %d own tokens, decision acc %s"
+                     % (info["n_samples"], info["store_size"],
+                        ", ".join("%s %d" % kv for kv in
+                                  info.get("phases_in_curriculum", {}).items()),
+                        info["teacher_generations"], acc(info["token_accuracy"]),
+                        info.get("own_token_targets", 0), acc(info["decision_accuracy"])))
         else:
             self.log("          bottleneck: %s" % info.get("skipped", "disabled"))
         sr = probe.get("success_rate")
@@ -444,33 +798,52 @@ class Trainer:
         self._last_checkpoint_episode = self.episode
         t0 = time.time()
         phase = self.curriculum.phase
-        sampler = self.phase_sampler(phase)
-        ev = evaluate_success(cfg, self.pop, self.world,
-                              max(200, cfg.log.intelligibility_episodes),
-                              device=self.device, rng=self.eval_rng,
-                              phase=phase, sampler=sampler)
-        comp = compositionality(cfg, self.pop, self.world,
-                                n_samples=cfg.log.topsim_samples,
-                                device=self.device, rng=self.eval_rng)
-        vocab = vocab_stats(cfg, [ev["batch"]])
-        stab = self.stability.measure(self.pop, self.world, device=self.device)
+        views = phase.views()
+        sampler = self.phase_sampler(views[0])
+        n_ev = max(200, cfg.log.intelligibility_episodes)
+        # every view of the rung (both describers, in a swap): sampled play is what
+        # the vocabulary statistics are computed over
+        evs = [evaluate_success(cfg, self.pop, self.world, max(100, n_ev // len(views)),
+                                device=self.device, rng=self.eval_rng,
+                                phase=v, sampler=self.phase_sampler(v)) for v in views]
+        ev = dict(evs[0])
+        for k in ("success_rate", "success_rate_on_viable", "comprehension_rate",
+                  "mean_reward"):
+            vals = [e[k] for e in evs if e[k] == e[k]]
+            ev[k] = sum(vals) / len(vals) if vals else float("nan")
+        batches = [e["batch"] for e in evs]
+        evidence = self.gather_evidence(phase, light=False)
+        comp = evidence["_compositionality"]
+        vocab = vocab_stats(cfg, batches)
+        stab = self.stability.measure(self.pop, self.world, device=self.device, phase=phase)
         zs = zero_shot(cfg, self.pop, self.world, cfg.log.zeroshot_episodes,
-                       device=self.device, rng=self.eval_rng)
+                       device=self.device, rng=self.eval_rng, phase=views[0],
+                       sampler=self.zero_shot_sampler(views[0]),
+                       n_holdout=(int(self.referential_world.holdout.shape[0])
+                                  if phase.tuples and self.referential_world is not None
+                                  else None))
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
                                device=self.device, rng=self.eval_rng,
-                               phase=phase, sampler=sampler)
+                               phase=views[0], sampler=sampler)
         newborn_age = max(200, cfg.population.lifespan_min // 6)
         intel = intelligibility(cfg, self.pop, self.world,
                                 cfg.log.intelligibility_episodes,
                                 newborn_age=newborn_age, device=self.device,
-                                rng=self.eval_rng)
+                                rng=self.eval_rng, phase=phase,
+                                sampler_for=self.phase_sampler)
         # ---- addendum section 3 ------------------------------------------
-        words = word_stats(cfg, [ev["batch"]])
-        lenfreq = length_frequency(cfg, self.pop, self.world, device=self.device)
+        words = word_stats(cfg, batches)
+        overlap = cross_role_overlap(cfg, batches)
+        qty_live = live_encoding(cfg, batches, field=1, given=0)
+        lenfreq = length_frequency(cfg, self.pop, self.world, device=self.device,
+                                   phase=phase)
         buckets = bucketed_analysis(cfg, self.pop, self.world, device=self.device,
-                                    rng=self.eval_rng)
-        forms = (self.forms.observe(self.pop, self.episode, device=self.device)
+                                    rng=self.eval_rng, phase=phase)
+        forms = (self.forms.observe(self.pop, self.episode, device=self.device,
+                                    phase=phase)
                  if self.forms is not None else {})
+        speakers = {k: {kk: vv for kk, vv in v.items()}
+                    for k, v in evidence.get("speakers", {}).items()}
 
         comp_pop = self.pop.composition()
         flags = detect_degenerate(cfg, ev["success_rate"], self.chance, vocab, comp,
@@ -516,8 +889,24 @@ class Trainer:
             "failure_modes": dict(sorted(self.failure_counts.items(),
                                          key=lambda kv: -kv[1])[:10]),
             "degenerate_flags": flags,
+            "rung_evidence": {k: v for k, v in evidence.items() if not k.startswith("_")},
+            "per_role_structure": {
+                k: {"topsim": v.get("topsim"), "null": v.get("null"),
+                    "positional": v.get("positional"),
+                    "posdis": v.get("posdis"), "bosdis": v.get("bosdis"),
+                    "field_coverage": v.get("field_coverage"),
+                    "per_field_coverage": v.get("per_field_coverage"),
+                    "slots": v.get("positional_rows", [])}
+                for k, v in speakers.items()},
+            "context_consistency": self._context_consistency(phase),
+            "cross_role_overlap": overlap,
+            "quantity_encoding_live": qty_live,
+            "usage": self.usage.summary(),
+            "speaker_cost_gate": self.cost_gate,
             "final": final,
         }
+        for sp in row["rung_evidence"].get("speakers", {}).values():
+            sp.pop("positional_rows", None)
         self.provenance.observe(phase.name, self.episode, words.get("word_counts", {}))
         row["vocabulary_provenance"] = self.provenance.summary(
             [p.name for p in self.curriculum.phases])
@@ -542,7 +931,14 @@ class Trainer:
         h.entropy.append(vocab["token_entropy_bits"])
         h.msg_len.append(vocab["mean_msg_len"])
         h.drift.append(stab["drift"])
-        h.coherence.append((stab["coherence_buyer"] + stab["coherence_farmer"]) / 2)
+        h.coherence.append(stab["coherence"])
+        h.coherence_cross.append(stab.get("coherence_cross", float("nan")))
+        h.positional_farmer.append(speakers.get("farmer", {}).get("positional", float("nan")))
+        h.positional_buyer.append(speakers.get("buyer", {}).get("positional", float("nan")))
+        h.cross_role_overlap.append(overlap.get("weighted_overlap", float("nan")))
+        h.mean_word_len.append(words["mean_word_len_atoms"])
+        h.at_length_cap.append(words["at_length_cap_frac"])
+        h.phase_index.append(float(phase.index))
         h.transmission.append(intel["transmission_ratio"])
         h.zeroshot.append(zs["retention"])
         h.ablation_drop.append(abl.get("comprehension_drop", float("nan")))
@@ -579,7 +975,9 @@ class Trainer:
         self.print_summary(row, ev, comp, vocab, stab, zs, intel, comp_pop, flags,
                            time.time() - t0, abl, words, lenfreq, buckets, forms)
         self.archive_examples(ev["batch"])
-        self.consider_promotion(row)
+        if not final:
+            self.consider_promotion(evidence, source="checkpoint")
+            self._next_check = self.episode + cfg.curriculum.check_every
         return row
 
     # ------------------------------------------------------------------
@@ -597,6 +995,40 @@ class Trainer:
              self.curriculum.phase.blurb,
              "{:,}".format(self.curriculum.episodes_in_phase)))
         L("elapsed %.1f min   (metrics took %.1fs)" % (self.log.elapsed() / 60.0, secs))
+
+        ev_rung = row.get("rung_evidence") or {}
+        if ev_rung:
+            L("")
+            L("RUNG EVIDENCE  (%s)" % self.curriculum.phase.name)
+            for v in ev_rung.get("views", []):
+                who = ("%s describes -> %s decodes" % (v["informer"], v["guesser"])
+                       if v.get("informer") else "both")
+                L("  %-32s success %.3f (muted %.3f), %.0f%% of headroom over silence"
+                  % (who, v["success"], v["muted_success"], 100 * (v["transfer"]
+                     if v["transfer"] == v["transfer"] else float("nan"))))
+            for lbl in ("farmer", "buyer"):
+                if "%s_report" % lbl in ev_rung:
+                    L("  %s reports partner's tuple: %.3f (muted %.3f)"
+                      % (lbl, ev_rung["%s_report" % lbl], ev_rung["muted_%s_report" % lbl]))
+            for lbl, sp in (row.get("per_role_structure") or {}).items():
+                L("  %-6s speaking: topsim %.3f vs null %.3f, positional structure %.3f, "
+                  "field coverage %.3f %s"
+                  % (lbl, sp.get("topsim", float("nan")), sp.get("null", float("nan")),
+                     sp.get("positional", float("nan")),
+                     sp.get("field_coverage", float("nan")) if sp.get("field_coverage")
+                     is not None else float("nan"),
+                     [round(x, 2) for x in (sp.get("per_field_coverage") or [])]))
+            ov = row.get("cross_role_overlap") or {}
+            L("  cross-role overlap: %.3f weighted (farmer %.0f%% / buyer %.0f%% of word "
+              "tokens are shared forms; Jaccard %.3f)"
+              % (ov.get("weighted_overlap", float("nan")),
+                 100 * ov.get("farmer_share_shared", float("nan")),
+                 100 * ov.get("buyer_share_shared", float("nan")),
+                 ov.get("jaccard_types", float("nan"))))
+            q = row.get("quantity_encoding_live") or {}
+            if q.get("n", 0) >= 50:
+                L("  quantity in live messages: %.3f bits beyond variety (shuffled-null "
+                  "corrected, %d messages)" % (q["excess_bits"], q["n"]))
 
         L("")
         L("TRADE PERFORMANCE")
@@ -642,9 +1074,18 @@ class Trainer:
         L("  stability         : drift %.3f, %.0f%% of probe messages unchanged"
           % (stab["drift"] if stab["drift"] == stab["drift"] else float("nan"),
              100 * (stab["identical_frac"] if stab["identical_frac"] == stab["identical_frac"] else 0)))
-        L("  shared code       : coherence buyer %.3f / farmer %.3f  (1 = all agents say "
-          "the same thing for the same meaning)"
-          % (stab["coherence_buyer"], stab["coherence_farmer"]))
+        L("  shared code       : coherence buyer %.3f / farmer %.3f / across roles %.3f  "
+          "(1 = all agents say the same thing for the same meaning)"
+          % (stab["coherence_buyer"], stab["coherence_farmer"],
+             stab.get("coherence_cross", float("nan"))))
+        L("  speaker pressures : %s" % ("on" if row.get("speaker_cost_gate", 1.0) >= 1.0
+                                          else "off until the first rung is passed"))
+        us = row.get("usage") or {}
+        if us:
+            L("  recent usage      : %d word types in circulation, %d established; "
+              "%d meanings with a convention"
+              % (us.get("recent_word_types", 0), us.get("established_types", 0),
+                 us.get("meanings_with_convention", 0)))
 
         if abl and abl.get("n"):
             L("")
@@ -727,8 +1168,13 @@ class Trainer:
 
         L("")
         L("GENERALISATION")
-        L("  zero-shot         : seen %.3f -> unseen %.3f  (retention %.2f, %d held-out combos)"
-          % (zs["seen_success"], zs["unseen_success"], zs["retention"], zs["n_holdout_combos"]))
+        if zs.get("suppressed"):
+            L("  zero-shot         : seen %.3f -> unseen %.3f  (retention not reported: %s)"
+              % (zs["seen_success"], zs["unseen_success"], zs["suppressed"]))
+        else:
+            L("  zero-shot         : seen %.3f -> unseen %.3f  (retention %.2f, %d held-out "
+              "combos)" % (zs["seen_success"], zs["unseen_success"], zs["retention"],
+                           zs["n_holdout_combos"]))
         L("  cross-generation  : veteran-veteran %.3f, newcomer-mixed %.3f (ratio %.2f)"
           % (intel["veteran_veteran"], intel["newcomer_mixed"], intel["transmission_ratio"]))
 
@@ -782,15 +1228,23 @@ class Trainer:
         cfg, L = self.cfg, self.log
         self.banner()
         B = cfg.train.batch_size
-        next_ckpt = cfg.log.checkpoint_every
+        every = max(1, cfg.log.checkpoint_every)
+        next_ckpt = (self.episode // every + 1) * every
 
         while self.episode < cfg.train.episodes and not self._stop_requested:
             n = min(B, cfg.train.episodes - self.episode)
-            phase = self.curriculum.phase
+            rung = self.curriculum.phase
+            # A swap rung alternates the describer batch by batch, so every agent
+            # spends half its time describing and half decoding.
+            phase = (rung.with_informer(FARMER if self._batch_no % 2 == 0 else BUYER)
+                     if rung.swaps else rung)
+            self._batch_no += 1
             f_idx, b_idx = self.pop.pair(n, device=self.device)
             if phase.referential:
                 # The lineup game: no market, no stock, no price -- just meanings.
-                scen = self.referential_world.sample(n)
+                scen = self.referential_world.sample(n, informer=phase.informer)
+            elif phase.mutual:
+                scen = self.referential_world.sample_mutual(n)
             elif not phase.use_market:
                 # Price and budget, but scenarios drawn fresh rather than held as
                 # depleting inventory; the economy is the last thing introduced.
@@ -807,13 +1261,16 @@ class Trainer:
                 from .gumbel import run_and_update_gumbel
                 batch, _ = run_and_update_gumbel(
                     cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
-                    frac_done=frac, device=self.device, phase=phase)
+                    frac_done=frac, device=self.device, phase=phase, usage=self.usage,
+                    cost_scale=self.cost_gate)
             else:
                 from .rollout import run_episodes
                 batch = run_episodes(cfg, scen, self.pop.farmers, self.pop.buyers,
                                      f_idx, b_idx, device=self.device, phase=phase)
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
+            if batch.res is not None:
+                self.update_cost_gate(batch.res["success"])
             if phase.use_market and batch.res is not None:
                 settle = self.economy.settle_tensor(f_idx, batch.res)
             elif phase.use_market:
@@ -824,7 +1281,8 @@ class Trainer:
             self.totals["value"] += settle["value"]
             self.totals["profit"] += settle["profit"]
             self.totals["episodes"] += n
-            if batch.res is not None and not phase.referential:
+            lineup_like = phase.referential or phase.mutual or phase.order
+            if batch.res is not None and not lineup_like:
                 from .batched import failure_modes
                 for mode in failure_modes(batch.res):
                     self.failure_counts[mode] = self.failure_counts.get(mode, 0) + 1
@@ -836,10 +1294,11 @@ class Trainer:
                 # The lineup game has one outcome that matters: did the guess land.
                 succ = batch.success_t
                 hits = int(succ.sum())
-                self.failure_counts["lineup_hit"] = (
-                    self.failure_counts.get("lineup_hit", 0) + hits)
-                self.failure_counts["lineup_miss"] = (
-                    self.failure_counts.get("lineup_miss", 0) + (len(batch) - hits))
+                tag = "mutual" if phase.mutual else ("order" if phase.order else "lineup")
+                self.failure_counts[tag + "_hit"] = (
+                    self.failure_counts.get(tag + "_hit", 0) + hits)
+                self.failure_counts[tag + "_miss"] = (
+                    self.failure_counts.get(tag + "_miss", 0) + (len(batch) - hits))
                 self.train_success.extend(succ.float().tolist())
                 self.train_comprehension.extend(succ.float().tolist())
             else:
@@ -853,8 +1312,8 @@ class Trainer:
             self.train_reward.extend(
                 (o.farmer_reward + o.buyer_reward) / 2 for o in batch.outcomes)
 
-            if phase.referential:
-                self.write_lineups(batch, scen, self.episode)
+            if lineup_like:
+                self.write_lineups(batch, scen, self.episode, phase)
             else:
                 self.ledger.write_batch(batch, self.pop, self.episode,
                                         self.economy.season)
@@ -868,13 +1327,21 @@ class Trainer:
             self.episode += n
             self.curriculum.episodes_in_phase += n
             self.pop.turn_over(self.episode, on_birth=self.on_birth)
+            self.maybe_grow()
             self.write_progress()
 
             if self.episode >= next_ckpt:
                 row = self.checkpoint()
                 self.maybe_plot()
                 self.write_interim_report(row)
+                if cfg.log.snapshot_every_checkpoint:
+                    try:
+                        self.save_snapshot("latest")
+                    except Exception as exc:
+                        self.log("  [snapshot] skipped: %s" % exc)
                 next_ckpt += cfg.log.checkpoint_every
+            else:
+                self.maybe_check_promotion()
 
         final = self.checkpoint(final=True)
         self.maybe_plot()
@@ -892,21 +1359,27 @@ class Trainer:
         try:
             from .metrics import analyse_token_semantics, evaluate_success, vocab_stats
             from .report import write_report
+            phase = self.curriculum.phase
             sem = analyse_token_semantics(
                 self.cfg, self.pop, self.world,
                 n_samples=max(200, self.cfg.log.topsim_samples),
-                device=self.device, rng=self.eval_rng)
-            ev = evaluate_success(self.cfg, self.pop, self.world, 400,
-                                  device=self.device, rng=self.eval_rng)
+                device=self.device, rng=self.eval_rng, phase=phase)
+            batches = [evaluate_success(self.cfg, self.pop, self.world,
+                                        400 // len(phase.views()), device=self.device,
+                                        rng=self.eval_rng, phase=v,
+                                        sampler=self.phase_sampler(v))["batch"]
+                       for v in phase.views()]
             row = dict(row)
-            row["token_counts"] = vocab_stats(self.cfg, [ev["batch"]])["token_counts"]
-            row["word_counts"] = word_stats(self.cfg, [ev["batch"]])["word_counts"]
+            row["token_counts"] = vocab_stats(self.cfg, batches)["token_counts"]
+            row["word_counts"] = word_stats(self.cfg, batches)["word_counts"]
             row["length_frequency_rows"] = length_frequency(
-                self.cfg, self.pop, self.world, device=self.device).get("rows", [])[:20]
+                self.cfg, self.pop, self.world, device=self.device,
+                phase=phase).get("rows", [])[:20]
             if self.forms is not None:
                 row["form_events"] = self.forms.report_rows()
                 row["form_timeline"] = self.forms.timeline()
             row["curriculum"] = self.curriculum_report()
+            row["language_properties"] = self.language_properties(sem)
             write_report(self.cfg, self.out_dir, final=row, chance=self.chance, sem=sem,
                          archive=self.archive, totals=self.totals,
                          history=self.history.to_dict(),
@@ -937,6 +1410,7 @@ class Trainer:
         self.metrics_log.close()
         self.birth_log.close()
         self.lineup_log.close()
+        self.promotion_log.close()
         with open(os.path.join(self.out_dir, "history.json"), "w", encoding="utf-8") as fh:
             json.dump(self.history.to_dict(), fh, indent=1)
         self.log.close()

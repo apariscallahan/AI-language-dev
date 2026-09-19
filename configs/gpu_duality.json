@@ -1,7 +1,7 @@
 {
-  "name": "gpu_small",
+  "name": "gpu_duality",
   "world": {
-    "n_varieties": 3,
+    "n_varieties": 12,
     "n_quality": 3,
     "max_qty": 8,
     "n_price_bins": 6,
@@ -30,35 +30,35 @@
     "max_episodes_per_phase": 400000,
     "rung_budgets": {
       "refer": [
-        163840,
-        5120000
+        327680,
+        10240000
       ],
       "refer-swap": [
-        163840,
-        5120000
+        327680,
+        10240000
       ],
       "refer-mutual": [
-        163840,
-        7168000
+        327680,
+        14336000
       ],
       "order": [
-        163840,
-        5120000
+        327680,
+        10240000
       ],
       "haggle": [
-        163840,
-        7168000
+        327680,
+        14336000
       ],
       "bargain": [
-        163840,
-        7168000
+        327680,
+        14336000
       ],
       "market": [
-        163840,
+        327680,
         1000000000000
       ]
     },
-    "check_every": 51200,
+    "check_every": 102400,
     "start_phase": "",
     "refer_min_success": 0.45,
     "trade_min_success": 0.15,
@@ -76,16 +76,16 @@
     "holdout_tuple_frac": 0.1
   },
   "channel": {
-    "atomic_vocab": 16,
-    "max_symbols": 24,
+    "atomic_vocab": 8,
+    "max_symbols": 32,
     "n_turns": 4,
     "enforce_word_grammar": true
   },
   "model": {
-    "d_model": 64,
-    "n_layers": 2,
+    "d_model": 96,
+    "n_layers": 3,
     "n_heads": 4,
-    "d_ff": 128,
+    "d_ff": 256,
     "dropout": 0.0
   },
   "reward": {
@@ -118,15 +118,15 @@
     "convention_gated": true
   },
   "population": {
-    "n_farmers": 16,
-    "n_buyers": 16,
+    "n_farmers": 48,
+    "n_buyers": 48,
     "turnover": true,
-    "lifespan_min": 60000,
-    "lifespan_max": 100000,
+    "lifespan_min": 100000,
+    "lifespan_max": 180000,
     "initial_stagger": true,
     "founders_farmers": 2,
     "founders_buyers": 2,
-    "grow_every": 40000
+    "grow_every": 80000
   },
   "bottleneck": {
     "enabled": true,
@@ -146,17 +146,17 @@
     "algo": "gumbel",
     "gumbel_tau": 1.5,
     "gumbel_tau_final": 0.5,
-    "gumbel_tau_anneal_frac": 0.256,
+    "gumbel_tau_anneal_frac": 0.1024,
     "gumbel_mix_reinforce": 0.1,
     "shaping_reinforce": 0.2,
-    "episodes": 8000000,
-    "batch_size": 2048,
+    "episodes": 40000000,
+    "batch_size": 4096,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
     "entropy_coef": 0.01,
     "entropy_coef_final": 0.002,
-    "entropy_anneal_frac": 0.2048,
+    "entropy_anneal_frac": 0.08192,
     "decision_entropy_coef": 0.02,
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
@@ -172,15 +172,15 @@
     "convention_reinforce": 1.0
   },
   "log": {
-    "ledger_stride": 200,
-    "checkpoint_every": 204800,
-    "summary_every": 204800,
+    "ledger_stride": 500,
+    "checkpoint_every": 409600,
+    "summary_every": 409600,
     "n_example_transcripts": 3,
     "topsim_samples": 200,
     "stability_probes": 32,
-    "intelligibility_episodes": 2048,
-    "zeroshot_episodes": 2048,
-    "ablation_episodes": 2048,
+    "intelligibility_episodes": 4096,
+    "zeroshot_episodes": 4096,
+    "ablation_episodes": 4096,
     "word_analysis_samples": 400,
     "rare_frequent_split": 0.5,
     "track_form_survival": true,
