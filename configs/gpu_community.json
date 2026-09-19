@@ -166,7 +166,7 @@
     "vectorised": true,
     "amp": true,
     "compile": false,
-    "grad_checkpoint": false,
+    "grad_checkpoint": true,
     "tf32": true,
     "log_every_batches": 0,
     "convention_reinforce": 1.0

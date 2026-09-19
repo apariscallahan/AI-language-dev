@@ -147,7 +147,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
             for a_i, ep in groups_of[role]:
-                h = pool[a_i].net.encode(obs[ep], soft[ep], upto=seq_pos,
+                # only the conversation so far, gathered per agent: the gathered
+                # copy is what the backward pass keeps, so it must not carry the
+                # empty remainder of the buffer
+                h = pool[a_i].net.encode(obs[ep], soft[:, :p][ep], upto=seq_pos,
                                          schema=schema_of[role],
                                          self_mask=mask_of[role])[:, -1]
                 logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))

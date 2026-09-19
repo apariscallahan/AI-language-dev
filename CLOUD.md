@@ -42,8 +42,17 @@ scale differs.
 | `gpu_smoke` | 2+2 -> 8+8 | d=64, 2 layers | 87k | 0.5M | 1,024 | 2 |
 | `gpu_small` | 2+2 -> 16+16 | d=64, 2 layers | 87k | 8M | 2,048 | 6 |
 | `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 30M | 4,096 | 6 |
-| `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 8,192 | 6 |
-| `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 4,096 | 6 |
+| `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 4,096 | 6 |
+| `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 2,048 | 6 |
+
+**Memory (24 GB card).** Training backpropagates through every symbol step,
+and each step re-encodes the conversation so far, so activation memory is the
+constraint -- not parameters. All GPU presets use gradient checkpointing, which
+keeps only the tokens fed into each step. Measured memory held for the backward
+pass, per 1,000 episodes: lineup rung ~0.2 GB, mutual ~0.7 GB, full market
+~2.4 GB (duality world: 0.7 / 1.7 / 5.0 GB). Batch sizes are set so the heaviest
+rung stays under ~10 GB on a 24 GB card; on a 40-80 GB card they can be doubled
+(`--batch-size`). Without checkpointing the same batch needed 56-365 GB.
 
 Brains are deliberately small and communities large. A supervised check showed
 the 48k-parameter CPU brain already learns a full compositional code for every

@@ -30,35 +30,35 @@
     "max_episodes_per_phase": 400000,
     "rung_budgets": {
       "refer": [
-        655360,
-        20480000
+        327680,
+        10240000
       ],
       "refer-swap": [
-        655360,
-        20480000
+        327680,
+        10240000
       ],
       "refer-mutual": [
-        655360,
-        28672000
+        327680,
+        14336000
       ],
       "order": [
-        655360,
-        20480000
+        327680,
+        10240000
       ],
       "haggle": [
-        655360,
-        28672000
+        327680,
+        14336000
       ],
       "bargain": [
-        655360,
-        28672000
+        327680,
+        14336000
       ],
       "market": [
-        655360,
+        327680,
         1000000000000
       ]
     },
-    "check_every": 204800,
+    "check_every": 102400,
     "start_phase": "",
     "refer_min_success": 0.45,
     "trade_min_success": 0.15,
@@ -146,17 +146,17 @@
     "algo": "gumbel",
     "gumbel_tau": 1.5,
     "gumbel_tau_final": 0.5,
-    "gumbel_tau_anneal_frac": 0.1024,
+    "gumbel_tau_anneal_frac": 0.0512,
     "gumbel_mix_reinforce": 0.1,
     "shaping_reinforce": 0.2,
     "episodes": 80000000,
-    "batch_size": 8192,
+    "batch_size": 4096,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
     "entropy_coef": 0.01,
     "entropy_coef_final": 0.002,
-    "entropy_anneal_frac": 0.08192,
+    "entropy_anneal_frac": 0.04096,
     "decision_entropy_coef": 0.02,
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
@@ -166,15 +166,15 @@
     "vectorised": true,
     "amp": true,
     "compile": false,
-    "grad_checkpoint": false,
+    "grad_checkpoint": true,
     "tf32": true,
     "log_every_batches": 0,
     "convention_reinforce": 1.0
   },
   "log": {
     "ledger_stride": 1000,
-    "checkpoint_every": 819200,
-    "summary_every": 819200,
+    "checkpoint_every": 409600,
+    "summary_every": 409600,
     "n_example_transcripts": 3,
     "topsim_samples": 200,
     "stability_probes": 32,

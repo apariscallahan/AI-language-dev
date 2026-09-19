@@ -22,6 +22,9 @@ print("gpu:", torch.cuda.get_device_name(0),
       "| bf16:", torch.cuda.is_bf16_supported())
 PY
 
+# Fewer fragmentation OOMs with many differently-sized small tensors.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 CONFIG="${CONFIG:-configs/gpu_community.json}"
 RUN="${RUN:-runs/$(basename "$CONFIG" .json)_$(date +%Y%m%d_%H%M%S)}"
 RESUME=()

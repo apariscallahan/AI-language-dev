@@ -178,7 +178,8 @@ class CommNet(nn.Module):
     # ------------------------------------------------------------------
     def embed(self, obs: torch.Tensor, tokens: torch.Tensor,
               schema: "list[int] | None" = None,
-              self_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+              self_mask: Optional[torch.Tensor] = None,
+              upto: Optional[int] = None) -> torch.Tensor:
         """obs: (B,4) long -> (B, seq_len, d).
 
         ``tokens`` is either (B,D) integer ids, or (B,D,n_token_ids) of
@@ -191,8 +192,16 @@ class CommNet(nn.Module):
         ``self_mask`` (D,) marks the dialogue slots this agent produced. It
         defaults to the trading schedule; a phase with a different speaking order
         passes its own, so an agent's own words are always embedded as its own.
+
+        ``upto`` embeds only the first ``upto`` positions. During generation that
+        is the conversation so far; embedding the whole dialogue buffer and then
+        discarding most of it cost memory (the soft tokens are kept for the
+        backward pass) in proportion to the buffer, at every symbol step.
+        ``tokens`` may be just the dialogue prefix that ``upto`` needs.
         """
         B = obs.shape[0]
+        n = self.seq_len if upto is None else upto
+        n_dial = max(0, min(self.cfg.channel.dialogue_len, n - self.dialogue_offset))
         d = self.d_model
         dev = obs.device
         parts = []
@@ -215,8 +224,9 @@ class CommNet(nn.Module):
 
         parts.append(self.slot_emb.weight[SLOT_SEP].expand(B, 1, d))
 
-        mine = self._self_mask if self_mask is None else self_mask
-        spk = torch.where(mine.to(dev), 0, 1)                            # (D,)
+        mine = (self._self_mask if self_mask is None else self_mask)[:n_dial]
+        spk = torch.where(mine.to(dev), 0, 1)                            # (n_dial,)
+        tokens = tokens[:, :n_dial]
         tok_vec = (self.tok_emb(tokens) if tokens.dtype == torch.long
                    else tokens @ self.tok_emb.weight)
         dial = (tok_vec
@@ -224,37 +234,44 @@ class CommNet(nn.Module):
                 + self.slot_emb.weight[SLOT_DIALOGUE])
         parts.append(dial)
 
-        parts.append(self.slot_emb.weight[SLOT_DECIDE].expand(B, 1, d))
+        if n > self.dialogue_offset + self.cfg.channel.dialogue_len:
+            parts.append(self.slot_emb.weight[SLOT_DECIDE].expand(B, 1, d))
 
-        x = torch.cat(parts, dim=1)
-        return x + self.pos_emb.weight.unsqueeze(0)
+        x = torch.cat(parts, dim=1)[:, :n]
+        return x + self.pos_emb.weight[:x.shape[1]].unsqueeze(0)
 
     def encode(self, obs: torch.Tensor, tokens: torch.Tensor,
                upto: Optional[int] = None,
                schema: "list[int] | None" = None,
                self_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Hidden states for the prefix of length ``upto`` (default: whole sequence)."""
-        x = self.embed(obs, tokens, schema, self_mask)
         n = self.seq_len if upto is None else upto
-        x = x[:, :n]
         mask = self._causal[:n, :n]
         # bf16 autocast on the transformer layers only, and only on CUDA: that
         # is where the arithmetic is, and keeping embeddings, heads and losses in
         # fp32 means nothing downstream has to know. (The flag used to be set by
         # the GPU presets and read by nothing.)
-        amp = self.cfg.train.amp and x.is_cuda
+        amp = self.cfg.train.amp and obs.is_cuda
 
-        def run(t):
+        def run(tok):
+            x = self.embed(obs, tok, schema, self_mask, upto=n)
             if amp:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    return self.encoder(t, mask=mask).float()
-            return self.encoder(t, mask=mask)
-        if self.cfg.train.grad_checkpoint and self.training and x.requires_grad:
+                    h = self.encoder(x, mask=mask).float()
+            else:
+                h = self.encoder(x, mask=mask)
+            return self.norm(h)
+        # Gradient checkpointing covers embedding, layers and the final norm, so
+        # all the backward pass keeps per call is the (soft) tokens that went in.
+        # Generation re-encodes the conversation at every symbol step and the
+        # Gumbel path backpropagates through all of them, so without this the
+        # saved activations grow with steps x prefix length and ran a 24 GB card
+        # out of memory in the first rung. Keyed on grad mode, not train mode:
+        # newborns come out of their apprenticeship in eval mode.
+        if self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
-            h = checkpoint(run, x, use_reentrant=False)
-        else:
-            h = run(x)
-        return self.norm(h)
+            return checkpoint(run, tokens, use_reentrant=False)
+        return run(tokens)
 
     # ------------------------------------------------------------------
     def next_token_logits(self, obs: torch.Tensor, tokens: torch.Tensor,

@@ -158,6 +158,19 @@ trade, but it makes this loop the bottleneck. On a GPU the cost is dominated by
 the *number of calls* (kernel launches), not arithmetic, so it grows linearly
 with agents per role.
 
+**Memory (already fixed, keep it that way).** The first real GPU run
+(`gpu_community`, RTX 4090, 24 GB) ran out of memory in the first training
+batch: every symbol step re-encodes the conversation and the Gumbel path
+backpropagates through all of them, so saved activations were ~14 MB per
+episode in the lineup and ~90 MB in the market (56-365 GB at batch 4,096). Now
+`CommNet.encode` checkpoints embedding + layers + final norm, keyed on grad
+mode (not train mode -- newborns leave their apprenticeship in eval mode), and
+embeds only the conversation so far. Measured: 0.17 / 0.71 / 2.4 MB per episode
+(lineup / mutual / market), so batch 4,096 needs ~10 GB in the market rung. If
+you change the model or buffer, re-measure before raising batch sizes (count
+saved-tensor bytes with `torch.autograd.graph.saved_tensors_hooks` over one
+training step).
+
 **Engineering priority 1 -- batch the agents.** Run every agent of a role in one
 call: stack their parameters (`torch.func.stack_module_state`) and `vmap` a
 `functional_call` over the agent dimension. Pairing is a fixed stride
