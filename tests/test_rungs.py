@@ -678,3 +678,90 @@ class TestWordGrammar(unittest.TestCase):
         c = Config().channel
         self.assertGreaterEqual(c.max_symbols, 16)
         self.assertTrue(c.enforce_word_grammar)
+
+
+class TestReadableTranscripts(unittest.TestCase):
+    def _rounds(self, cfg, phase, scen):
+        from orchard.transcripts import format_round
+        torch.manual_seed(21)
+        f, b = agents(cfg)
+        fi, bi = pairing(16)
+        batch, _ = run_and_update_gumbel(cfg, scen, f, b, fi, bi, phase=phase, train=False)
+        return [format_round(cfg, batch.phase, batch, i, episode=100 + i) for i in range(4)]
+
+    def _check(self, rounds):
+        for lines in rounds:
+            text = "\n".join(lines)
+            self.assertIn("  expected : ", text)
+            self.assertIn("  dialogue : ", text)
+            self.assertIn("  outcome  : ", text)
+            # the three parts are on their own lines, in that order
+            order = [next(k for k, l in enumerate(lines) if l.startswith("  " + tag))
+                     for tag in ("expected", "dialogue", "outcome")]
+            self.assertEqual(order, sorted(order))
+
+    def test_every_rung_kind_reads_as_expected_dialogue_outcome(self):
+        from orchard.batched import TensorWorld
+        cfg = cfg_small()
+        cfg.channel.max_symbols = 8
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(21))
+        tw = TensorWorld(cfg, generator=torch.Generator().manual_seed(21))
+        self._check(self._rounds(cfg, phase_named(cfg, "refer"), rw.sample(16)))
+        self._check(self._rounds(cfg, phase_named(cfg, "refer-swap").with_informer(BUYER),
+                                 rw.sample(16, informer=BUYER)))
+        self._check(self._rounds(cfg, phase_named(cfg, "refer-mutual"), rw.sample_mutual(16)))
+        self._check(self._rounds(cfg, phase_named(cfg, "order"), tw.sample(16)))
+        self._check(self._rounds(cfg, phase_named(cfg, "haggle"), tw.sample(16)))
+
+
+class TestReportSummary(unittest.TestCase):
+    def test_summary_statistics_come_first(self):
+        from orchard.report import _summary_lines
+        lines = _summary_lines(cfg_small(), {"episode": 1000, "started_utc": "2026-01-01 00:00:00 UTC",
+                                             "curriculum": {"phases": ["refer"], "reached": "refer"}},
+                               12.0)
+        self.assertEqual(lines[0], "## Summary statistics")
+        self.assertTrue(any("furthest rung" in l for l in lines))
+
+
+class TestLifespanInUpdates(unittest.TestCase):
+    def test_age_in_updates_does_not_depend_on_batch_size(self):
+        from orchard.population import Population
+        for batch in (64, 4096):
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.population.lifespan_unit = "updates"
+            cfg.population.lifespan_min = cfg.population.lifespan_max = 3
+            cfg.population.initial_stagger = False
+            pop = Population(cfg, random.Random(0))
+            f_idx, b_idx = pop.pair(batch)
+            res = {"success": torch.zeros(batch, dtype=torch.bool),
+                   "farmer_profit": torch.zeros(batch), "buyer_savings": torch.zeros(batch),
+                   "traded_qty": torch.zeros(batch, dtype=torch.long),
+                   "trade_value": torch.zeros(batch)}
+            batch_obj = SimpleNamespace(res=res, f_reward=torch.zeros(batch),
+                                        b_reward=torch.zeros(batch))
+            for step in range(3):
+                self.assertFalse(pop.farmers[0].is_expired("updates"), (batch, step))
+                pop.record_episode_participation(f_idx, b_idx, batch_obj)
+            self.assertEqual(pop.farmers[0].updates, 3)
+            self.assertTrue(pop.farmers[0].is_expired("updates"))
+            self.assertEqual(pop.farmers[0].age, 3 * batch // 2)
+
+    def test_gpu_presets_count_lifespan_in_updates(self):
+        for name in ("gpu_small", "gpu_community", "gpu_full", "gpu_duality"):
+            cfg = Config.from_json(str(Path(__file__).resolve().parents[1] / "configs" / ("%s.json" % name)))
+            self.assertEqual(cfg.population.lifespan_unit, "updates", name)
+            self.assertGreaterEqual(cfg.population.lifespan_min, 500, name)
+
+
+class TestVerdictUsesTheRungsChance(unittest.TestCase):
+    def test_lineup_success_at_one_in_four_is_not_emergence(self):
+        from orchard.report import assess
+        final = {"eval_success": 0.244, "chance_for_phase": 0.25,
+                 "channel_ablation": {"variety_transfer": -0.02, "information_transfer": -0.02,
+                                      "intact_comprehension": 0.246},
+                 "vocab": {"token_entropy_norm": 0.95, "tokens_used": 16}}
+        v = assess(cfg_small(), final, 0.0)       # 0.0: the trading task's chance
+        self.assertEqual(v["verdict"], "NO EMERGENCE")
+        self.assertFalse(v["checks"]["learned_to_trade"])

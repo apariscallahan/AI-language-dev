@@ -20,8 +20,28 @@ from .render import render_tokens
 
 
 # --------------------------------------------------------------------------
+def rung_chance(final: dict[str, Any], trade_chance: float) -> float:
+    """Chance on the rung the run ended on, not the trading task's.
+
+    A lineup is 1/K by chance (0.25 with four candidates); judging a lineup
+    success of 0.244 against the trading task's ~0 called it "far above chance"
+    when it was exactly at chance. Rungs with no analytic chance (mutual, order)
+    use their muted-channel success instead.
+    """
+    c = final.get("chance_for_phase")
+    if isinstance(c, (int, float)) and c == c:
+        return float(c)
+    views = (final.get("rung_evidence") or {}).get("views") or []
+    muted = [v.get("muted_success") for v in views
+             if isinstance(v.get("muted_success"), (int, float))]
+    if muted:
+        return float(sum(muted) / len(muted))
+    return trade_chance
+
+
 def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
     """Grade the run against fixed thresholds.  No hedging, no cherry-picking."""
+    chance = rung_chance(final, chance)
     succ = final.get("eval_success", float("nan"))
     comp = final.get("compositionality", {})
     topsim = comp.get("mean", float("nan"))
@@ -259,12 +279,98 @@ def _position_lines(sem: TokenSemantics) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------
+def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> list[str]:
+    """Headline numbers, one table, at the top of the report."""
+    def f(x, fmt="%.3f"):
+        return fmt % x if isinstance(x, (int, float)) and x == x else "n/a"
+
+    cur = final.get("curriculum") or {}
+    ev = final.get("rung_evidence") or {}
+    st = final.get("stability") or {}
+    w = final.get("words") or {}
+    ov = final.get("cross_role_overlap") or {}
+    zs = final.get("zero_shot") or {}
+    pop = final.get("population") or {}
+    prs = final.get("per_role_structure") or {}
+    nta = cur.get("newborn_token_accuracy") or {}
+    props = final.get("language_properties") or []
+    rows: list[tuple[str, str]] = []
+
+    rows.append(("started", str(final.get("started_utc", "n/a"))))
+    rows.append(("episodes / wall time", "%s in %.1f h"
+                 % ("{:,}".format(int(final.get("episode", 0))), wall_minutes / 60.0)))
+    phases = cur.get("phases") or []
+    reached = cur.get("reached", final.get("phase", "?"))
+    stop = cur.get("stop_report") or {}
+    status = ("stopped: budget exceeded" if stop else
+              "ran to the episode budget" if final.get("final") else "in progress")
+    rows.append(("furthest rung", "**%s** (%s of %d) -- %s"
+                 % (reached, (phases.index(reached) + 1) if reached in phases else "?",
+                    len(phases), status)))
+    passed = ["%s (%s ep)" % (t.get("from"), "{:,}".format(int(t.get("episodes_in_previous_phase") or 0)))
+              for t in cur.get("transitions") or []]
+    rows.append(("rungs passed", ", ".join(passed) or "none"))
+    growth = cur.get("community_growth") or []
+    rows.append(("community", "%d farmers + %d buyers%s; %d births"
+                 % ((pop.get("farmers") or {}).get("n", 0), (pop.get("buyers") or {}).get("n", 0),
+                    (" (founded %d + %d)" % (cfg.population.founders_farmers,
+                                             cfg.population.founders_buyers)
+                     if cfg.population.founders_farmers else ""),
+                    int(pop.get("total_births", 0)))))
+    views = ev.get("views") or []
+    if views:
+        rows.append(("success on the current rung", "; ".join(
+            "%s%s (muted %s)" % ("%s describes: " % v["informer"] if v.get("informer") else "",
+                                 f(v.get("success")), f(v.get("muted_success")))
+            for v in views)))
+    rows.append(("channel carries", "%s of the headroom over a muted channel"
+                 % f(ev.get("transfer"), "%.2f")))
+    for lbl in ("farmer", "buyer"):
+        sp = prs.get(lbl)
+        if sp:
+            cov = sp.get("per_field_coverage") or []
+            rows.append(("%s messages" % lbl,
+                         "topsim %s (null %s); field coverage %s [variety %s, quantity %s, quality %s]"
+                         % (f(sp.get("topsim")), f(sp.get("null")), f(sp.get("field_coverage")),
+                            *[f(x, "%.2f") for x in (cov + [float("nan")] * 3)[:3]])))
+    rows.append(("coherence", "farmer %s, buyer %s, across roles %s"
+                 % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
+                    f(st.get("coherence_cross")))))
+    rows.append(("cross-role vocabulary overlap", f(ov.get("weighted_overlap"))))
+    rows.append(("vocabulary", "%s distinct words, %s atoms per word, %s words and %s symbols "
+                 "per utterance, %s of utterances at the buffer end"
+                 % (w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
+                    f(w.get("mean_words_per_message"), "%.2f"),
+                    f(w.get("mean_symbols_per_message"), "%.2f"),
+                    f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%"))))
+    fm = (nta.get("farmer") or {}).get("mean")
+    bm = (nta.get("buyer") or {}).get("mean")
+    rows.append(("newborn token accuracy", "farmer %s, buyer %s" % (f(fm), f(bm))))
+    ret = zs.get("retention")
+    rows.append(("zero-shot (held-out combinations)",
+                 f(ret, "%.2f") + (" retention (%s)" % zs.get("context", "") if ret == ret else
+                                   " -- %s" % (zs.get("suppressed") or "not measured"))))
+    if props:
+        counts: dict[str, list[str]] = {}
+        for q in props:
+            counts.setdefault(q["verdict"], []).append(q["property"])
+        rows.append(("properties of language", "; ".join(
+            "%s: %s" % (k, ", ".join(v)) for k, v in counts.items())))
+
+    out = ["## Summary statistics", "", "| | |", "|---|---|"]
+    out += ["| %s | %s |" % (k, v.replace("|", "/")) for k, v in rows]
+    out.append("")
+    return out
+
+
 def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
                  chance: float, sem: TokenSemantics, archive: Sequence[dict[str, Any]],
                  totals: dict[str, Any], history: dict[str, Any],
                  newborn_reports: Sequence[dict[str, Any]],
                  ledger_path: str, wall_minutes: float) -> str:
     verdict = assess(cfg, final, chance)
+    chance = rung_chance(final, chance)
     vocab = final.get("vocab", {})
     # vocab in the metrics row drops token_counts; recover from the semantics pass if absent
     if "token_counts" not in vocab:
@@ -278,6 +384,7 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("Run `%s` -- %d episodes, %.1f wall-clock minutes."
       % (cfg.name, final.get("episode", 0), wall_minutes))
     A("")
+    L.extend(_summary_lines(cfg, final, wall_minutes))
     A("> **Verdict: %s**" % verdict["verdict"])
     A(">")
     A("> " + verdict["summary"])

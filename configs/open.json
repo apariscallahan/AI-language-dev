@@ -133,6 +133,8 @@
     "rare_frequent_split": 0.5,
     "track_form_survival": true,
     "plot": true,
-    "flush_every": 200
+    "flush_every": 200,
+    "transcript_stride": 50,
+    "heartbeat_seconds": 60
   }
 }

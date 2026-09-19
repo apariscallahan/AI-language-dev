@@ -414,8 +414,14 @@ class PopulationConfig:
     founders_buyers: int = 0
     grow_every: int = 10_000
     turnover: bool = True                 # master switch for birth/death (spec 9)
-    lifespan_min: int = 6000              # in episodes *this agent* participated in
+    lifespan_min: int = 6000              # in lifespan_unit (below)
     lifespan_max: int = 12000
+    # What an agent's age counts. "episodes": episodes it played. "updates":
+    # training updates it took part in -- how much it has actually learned, the
+    # same at any batch size or population size. With "episodes", a 4,096-episode
+    # batch shared by 2 founders ages each founder 2,048 episodes per update, 16x
+    # the CPU runs': founders lived ~50 updates and never learned the lineup.
+    lifespan_unit: str = "episodes"
     # At t=0 every agent would otherwise die at the same time; stagger the first
     # cohort's lifespans so deaths are spread out rather than synchronised.
     initial_stagger: bool = True
@@ -482,6 +488,10 @@ class TrainConfig:
     # units as the task advantage. Through the Gumbel path they have no route at
     # all -- the straight-through gradient only carries what the listener did.
     shaping_reinforce: float = 0.5
+    # Batch multiplier per rung, e.g. {"refer": 2}. Rungs with one short turn use
+    # little memory, so a larger batch there buys lower-noise updates for almost
+    # no extra time per update. Absent rungs use 1.
+    rung_batch_scale: dict = field(default_factory=dict)
     # The convention bonus gets its own coefficient on the same route: it has to
     # be strong enough to seed a shared code before the task pays anything,
     # whereas the costs have to be weak enough not to silence a young channel.
@@ -558,6 +568,12 @@ class LogConfig:
     # Overwrite snapshots/latest.pt at every checkpoint (promotions always
     # snapshot). Resume with ``python -m orchard.run --resume <file>``.
     snapshot_every_checkpoint: bool = True
+    # Every Nth episode is written to transcripts.txt as expected / dialogue /
+    # outcome lines. 0 turns the file off.
+    transcript_stride: int = 50
+    # With --quiet (as cloud_run.sh runs), print one status line this often, plus
+    # rung transitions, checkpoint headlines and the verdict. 0 = never.
+    heartbeat_seconds: int = 60
 
 
 @dataclass
@@ -751,6 +767,7 @@ def validate(cfg: Config) -> None:
     assert cfg.bottleneck.frequency_skew >= 0.0
     assert cfg.curriculum.n_candidates >= 2
     assert cfg.curriculum.on_stall in ("hold", "stop")
+    assert cfg.population.lifespan_unit in ("episodes", "updates")
     assert 0.0 < cfg.bottleneck.coverage <= 1.0
     assert cfg.model.d_model % cfg.model.n_heads == 0
     w = cfg.world

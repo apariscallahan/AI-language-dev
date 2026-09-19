@@ -3,7 +3,7 @@
 #
 #   bash cloud_run.sh                                    # gpu_community preset
 #   CONFIG=configs/gpu_full.json bash cloud_run.sh       # another preset
-#   RUN=runs/my_run bash cloud_run.sh                    # fixed output dir (resumable)
+#   RUN=runs/<existing folder> bash cloud_run.sh         # resume that run
 #   bash cloud_run.sh --set train.seed=3                 # any orchard.run flags
 #
 # Resuming is automatic: if $RUN/snapshots/latest.pt exists (the run was
@@ -26,7 +26,10 @@ PY
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 CONFIG="${CONFIG:-configs/gpu_community.json}"
-RUN="${RUN:-runs/$(basename "$CONFIG" .json)_$(date +%Y%m%d_%H%M%S)}"
+# A new run gets a folder named for its start time in UTC and the preset:
+#   runs/2026-09-18_14-03-12UTC_gpu_community
+# To resume an interrupted run, pass that folder: RUN=runs/<that folder>.
+RUN="${RUN:-runs/$(date -u +%Y-%m-%d_%H-%M-%SUTC)_$(basename "$CONFIG" .json)}"
 RESUME=()
 if [[ -f "$RUN/snapshots/latest.pt" ]]; then
     echo "found $RUN/snapshots/latest.pt -- resuming"

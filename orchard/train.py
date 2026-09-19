@@ -54,8 +54,11 @@ def expected_generations(cfg: Config) -> float:
     """
     if not cfg.population.turnover:
         return 0.0
-    per_agent = cfg.train.episodes / max(1, cfg.population.n_farmers)
     mean_life = (cfg.population.lifespan_min + cfg.population.lifespan_max) / 2.0
+    if cfg.population.lifespan_unit == "updates":
+        # every agent takes part in (nearly) every update
+        return (cfg.train.episodes / max(1, cfg.train.batch_size)) / max(1.0, mean_life)
+    per_agent = cfg.train.episodes / max(1, cfg.population.n_farmers)
     return per_agent / max(1.0, mean_life)
 
 
@@ -117,7 +120,7 @@ class History:
 
 class Trainer:
     def __init__(self, cfg: Config, out_dir: str, *, quiet: bool = False,
-                 resume_note: str = ""):
+                 resume_note: str = "", started_utc: Optional[str] = None):
         self.cfg = cfg
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
@@ -207,6 +210,11 @@ class Trainer:
         self.newborn_reports: list[dict[str, Any]] = []
         self._stop_requested = False
         self.resume_note = resume_note
+        self.started_utc = started_utc or time.strftime("%Y-%m-%d %H:%M:%S UTC",
+                                                        time.gmtime())
+        from .transcripts import TranscriptWriter
+        self.transcripts = TranscriptWriter(cfg, out_dir)
+        self._beat = (time.time(), 0)
         self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
@@ -449,15 +457,16 @@ class Trainer:
             except Exception as exc:          # a snapshot must never kill a run
                 self.log("  [snapshot] skipped: %s" % exc)
             cur.transitions[-1]["evidence"] = slim
-            L("")
-            L("*** PHASE %s -> %s at episode %d ***" % (phase.name, nxt.name, self.episode))
-            L("    %s" % nxt.blurb)
-            L("    promoted because, after %s episodes in %s (budget %s-%s):"
+            A = L.always
+            A("")
+            A("*** PHASE %s -> %s at episode %d ***" % (phase.name, nxt.name, self.episode))
+            A("    %s" % nxt.blurb)
+            A("    promoted because, after %s episodes in %s (budget %s-%s):"
               % ("{:,}".format(done_in), phase.name, "{:,}".format(lo), "{:,}".format(hi)))
             for name, c in checks.items():
-                L("      met: %-40s %s" % (name, c["detail"]))
-            L("    the population carries its weights forward; nothing is reinitialised.")
-            L("")
+                A("      met: %-40s %s" % (name, c["detail"]))
+            A("    the population carries its weights forward; nothing is reinitialised.")
+            A("")
             return
 
         if cur.episodes_in_phase >= hi:
@@ -471,20 +480,21 @@ class Trainer:
                     "met": {k: c["detail"] for k, c in checks.items() if c["met"]},
                     "action": self.cfg.curriculum.on_stall,
                 }
-                L("")
-                L("!!! RUNG %s EXCEEDED ITS BUDGET at episode %d !!!" % (phase.name, self.episode))
-                L("    %s episodes in this rung (max %s) without meeting:"
+                A = L.always
+                A("")
+                A("!!! RUNG %s EXCEEDED ITS BUDGET at episode %d !!!" % (phase.name, self.episode))
+                A("    %s episodes in this rung (max %s) without meeting:"
                   % ("{:,}".format(cur.episodes_in_phase), "{:,}".format(hi)))
                 for k in unmet:
-                    L("      unmet: %-40s %s" % (k, checks[k]["detail"]))
+                    A("      unmet: %-40s %s" % (k, checks[k]["detail"]))
                 for k, c in checks.items():
                     if c["met"]:
-                        L("      met:   %-40s %s" % (k, c["detail"]))
-                L("    Not advancing. Building the next rung on top of one that")
-                L("    never converged would only reproduce this failure one rung up.")
+                        A("      met:   %-40s %s" % (k, c["detail"]))
+                A("    Not advancing. Building the next rung on top of one that")
+                A("    never converged would only reproduce this failure one rung up.")
                 if self.cfg.curriculum.on_stall == "stop":
-                    L("    on_stall=stop: ending the run here and writing the report.")
-                L("")
+                    A("    on_stall=stop: ending the run here and writing the report.")
+                A("")
             if self.cfg.curriculum.on_stall == "stop":
                 self._stop_requested = True
 
@@ -505,6 +515,7 @@ class Trainer:
             return {"agent_id": a.agent_id, "role": a.role, "slot": a.slot,
                     "generation": a.generation, "birth_episode": a.birth_episode,
                     "lifespan": a.lifespan, "age": a.age, "days_alive": a.days_alive,
+                    "updates": a.updates,
                     "n_success": a.n_success, "n_episodes": a.n_episodes,
                     "reward_sum": a.reward_sum, "net": a.net.state_dict(),
                     "opt": a.opt.state_dict()}
@@ -568,6 +579,7 @@ class Trainer:
                 pass                    # e.g. a changed learning rate: fresh moments
             for k in ("age", "days_alive", "n_success", "n_episodes", "reward_sum"):
                 setattr(a, k, rec[k])
+            a.updates = int(rec.get("updates", 0))
             return a
         self.pop.farmers = [restore(r) for r in st["farmers"]]
         self.pop.buyers = [restore(r) for r in st["buyers"]]
@@ -612,8 +624,9 @@ class Trainer:
                                    "farmers": len(self.pop.farmers),
                                    "buyers": len(self.pop.buyers)})
         if self.pop.full_size:
-            self.log("  [community] full size: %d farmers, %d buyers"
-                     % (len(self.pop.farmers), len(self.pop.buyers)))
+            self.log.always("  [community] full size: %d farmers, %d buyers at episode %s"
+                            % (len(self.pop.farmers), len(self.pop.buyers),
+                               "{:,}".format(self.episode)))
 
     def update_cost_gate(self, succ: torch.Tensor) -> None:
         """Speaker costs: off through the first rung, on once it has been passed."""
@@ -680,6 +693,7 @@ class Trainer:
         L = self.log
         L.rule("ORCHARD: emergent language in an apple-trading world")
         L("run name           : %s" % c.name)
+        L("started            : %s" % self.started_utc)
         L("output directory   : %s" % os.path.abspath(self.out_dir))
         L("episodes           : %d  (batch %d -> %d updates)"
           % (c.train.episodes, c.train.batch_size,
@@ -694,7 +708,8 @@ class Trainer:
               % (c.population.n_farmers, c.population.n_buyers))
         L("turnover           : %s%s" % (
             "ON" if c.population.turnover else "OFF",
-            "  (lifespan %d-%d episodes)" % (c.population.lifespan_min, c.population.lifespan_max)
+            "  (lifespan %d-%d %s)" % (c.population.lifespan_min, c.population.lifespan_max,
+                                       c.population.lifespan_unit)
             if c.population.turnover else ""))
         bn = c.bottleneck
         regime = ("fixed cap of %d transcripts" % bn.n_samples if bn.n_samples > 0
@@ -819,13 +834,18 @@ class Trainer:
         zs = zero_shot(cfg, self.pop, self.world, cfg.log.zeroshot_episodes,
                        device=self.device, rng=self.eval_rng, phase=views[0],
                        sampler=self.zero_shot_sampler(views[0]),
+                       chance=(self.chance_for(views[0])
+                               if self.chance_for(views[0]) == self.chance_for(views[0])
+                               else 0.0),
                        n_holdout=(int(self.referential_world.holdout.shape[0])
                                   if phase.tuples and self.referential_world is not None
                                   else None))
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
                                device=self.device, rng=self.eval_rng,
                                phase=views[0], sampler=sampler)
-        newborn_age = max(200, cfg.population.lifespan_min // 6)
+        newborn_age = (max(20, cfg.population.lifespan_min // 6)
+                       if cfg.population.lifespan_unit == "updates"
+                       else max(200, cfg.population.lifespan_min // 6))
         intel = intelligibility(cfg, self.pop, self.world,
                                 cfg.log.intelligibility_episodes,
                                 newborn_age=newborn_age, device=self.device,
@@ -903,6 +923,7 @@ class Trainer:
             "quantity_encoding_live": qty_live,
             "usage": self.usage.summary(),
             "speaker_cost_gate": self.cost_gate,
+            "started_utc": self.started_utc,
             "final": final,
         }
         for sp in row["rung_evidence"].get("speakers", {}).values():
@@ -972,6 +993,7 @@ class Trainer:
             "flags": flags,
         }
         self.write_progress()
+        self.checkpoint_headline(row)
         self.print_summary(row, ev, comp, vocab, stab, zs, intel, comp_pop, flags,
                            time.time() - t0, abl, words, lenfreq, buckets, forms)
         self.archive_examples(ev["batch"])
@@ -1200,40 +1222,104 @@ class Trainer:
         L.rule()
         L("")
 
-    def _pick_examples(self, batch, n: int) -> list[int]:
-        succ = [i for i, o in enumerate(batch.outcomes) if o.success]
-        fail = [i for i, o in enumerate(batch.outcomes) if not o.success]
-        picks: list[int] = []
-        for pool in (succ, fail):
-            for i in pool[:max(1, n // 2 + 1)]:
-                if len(picks) < n:
-                    picks.append(i)
-        return picks
+    def _format_examples(self, batch, n: int) -> list[tuple[bool, str]]:
+        from .transcripts import format_round, pick_examples
+        phase = getattr(batch, "phase", None) or self.curriculum.phase
+        out = []
+        for i in pick_examples(batch, n):
+            try:
+                text = "\n".join(format_round(self.cfg, phase, batch, i, pop=self.pop,
+                                               episode=self.episode))
+            except Exception as exc:
+                text = "(could not format round %d: %s)" % (i, exc)
+            ok = bool(batch.res["success"][i]) if batch.res is not None else False
+            out.append((ok, text))
+        return out
 
     def print_examples(self, batch) -> None:
-        for i in self._pick_examples(batch, self.cfg.log.n_example_transcripts):
-            self.log(render_transcript(self.cfg, batch.transcript(i), indent="    "))
+        for _, text in self._format_examples(batch, self.cfg.log.n_example_transcripts):
+            self.log(text)
             self.log("")
 
     def archive_examples(self, batch) -> None:
-        for i in self._pick_examples(batch, 2):
-            self.archive.append({
-                "episode": self.episode,
-                "rendered": render_transcript(self.cfg, batch.transcript(i), indent="    "),
-                "success": batch.outcomes[i].success,
-            })
+        for ok, text in self._format_examples(batch, 2):
+            self.archive.append({"episode": self.episode, "rendered": text, "success": ok})
+
+    # ------------------------------------------------------------------
+    def heartbeat(self, force: bool = False) -> None:
+        """One status line, printed even in quiet mode, every heartbeat_seconds."""
+        every = self.cfg.log.heartbeat_seconds
+        now = time.time()
+        t0, e0 = self._beat
+        if not force and (every <= 0 or now - t0 < every):
+            return
+        self._beat = (now, self.episode)
+        rate = (self.episode - e0) / max(1e-9, now - t0)
+        total = self.cfg.train.episodes
+        eta = (total - self.episode) / rate / 3600 if rate > 0 else float("nan")
+        cur = self.curriculum
+        gpu = ""
+        if self.torch_device.type == "cuda":
+            peak = torch.cuda.max_memory_allocated(self.torch_device) / 1e9
+            cap = torch.cuda.get_device_properties(self.torch_device).total_memory / 1e9
+            torch.cuda.reset_peak_memory_stats(self.torch_device)
+            gpu = " | GPU peak %.1f / %.0f GB" % (peak, cap)
+        self.log.always(
+            "[%s] %s / %s episodes (%.1f%%) | rung %s (%d/%d, %s in rung) | %s eps/s | "
+            "ETA %.1f h | rolling success %.3f | community %d+%d | births %d%s"
+            % (time.strftime("%H:%M:%S UTC", time.gmtime()), "{:,}".format(self.episode),
+               "{:,}".format(total), 100.0 * self.episode / max(1, total), cur.phase.name,
+               cur.phase.index + 1, len(cur.phases), "{:,}".format(cur.episodes_in_phase),
+               "{:,.0f}".format(rate), eta, self.train_success.mean,
+               len(self.pop.farmers), len(self.pop.buyers), len(self.pop.births), gpu))
+
+    def checkpoint_headline(self, row: dict[str, Any]) -> None:
+        """Two lines per checkpoint for the terminal; the full block goes to run.log."""
+        def f(x, fmt="%.3f"):
+            return fmt % x if isinstance(x, (int, float)) and x == x else "n/a"
+        ev = row.get("rung_evidence") or {}
+        views = ev.get("views") or []
+        succ = " / ".join("%s (muted %s)" % (f(v.get("success")), f(v.get("muted_success")))
+                          for v in views) or f(row.get("eval_success"))
+        roles = []
+        for lbl, sp in (row.get("per_role_structure") or {}).items():
+            cov = sp.get("per_field_coverage") or []
+            roles.append("%s coverage %s [%s]" % (lbl, f(sp.get("field_coverage")),
+                                                  " ".join(f(x, "%.2f") for x in cov)))
+        st = row.get("stability") or {}
+        w = row.get("words") or {}
+        ov = row.get("cross_role_overlap") or {}
+        self.log.always(
+            "[checkpoint %s] rung %s | success %s | channel %s of headroom | %s"
+            % ("{:,}".format(self.episode), row.get("phase"), succ, f(ev.get("transfer"), "%.2f"),
+               "; ".join(roles) or "no speakers probed"))
+        self.log.always(
+            "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "
+            "%s words/utterance, %s at buffer end"
+            % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
+               f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
+               w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
+               f(w.get("mean_words_per_message"), "%.2f"),
+               f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%")))
+
+    def batch_size_for(self, rung) -> int:
+        scale = float((self.cfg.train.rung_batch_scale or {}).get(rung.name, 1))
+        return max(1, int(round(self.cfg.train.batch_size * scale)))
 
     # ------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
         cfg, L = self.cfg, self.log
         self.banner()
-        B = cfg.train.batch_size
         every = max(1, cfg.log.checkpoint_every)
         next_ckpt = (self.episode // every + 1) * every
+        L.always("run %s started %s -> %s  (full log: %s)"
+                 % (cfg.name, self.started_utc, os.path.abspath(self.out_dir),
+                    os.path.join(os.path.abspath(self.out_dir), "run.log")))
 
         while self.episode < cfg.train.episodes and not self._stop_requested:
-            n = min(B, cfg.train.episodes - self.episode)
             rung = self.curriculum.phase
+            B = self.batch_size_for(rung)
+            n = min(B, cfg.train.episodes - self.episode)
             # A swap rung alternates the describer batch by batch, so every agent
             # spends half its time describing and half decoding.
             phase = (rung.with_informer(FARMER if self._batch_no % 2 == 0 else BUYER)
@@ -1318,6 +1404,7 @@ class Trainer:
                 self.ledger.write_batch(batch, self.pop, self.episode,
                                         self.economy.season)
             self.store.add_batch(batch, self.pop.farmers, self.pop.buyers, self.episode)
+            self.transcripts.write_batch(batch, phase, self.episode, self.pop)
 
             if cfg.train.algo != "gumbel":
                 from .rollout import update_agents
@@ -1329,6 +1416,7 @@ class Trainer:
             self.pop.turn_over(self.episode, on_birth=self.on_birth)
             self.maybe_grow()
             self.write_progress()
+            self.heartbeat()
 
             if self.episode >= next_ckpt:
                 row = self.checkpoint()
@@ -1411,6 +1499,7 @@ class Trainer:
         self.birth_log.close()
         self.lineup_log.close()
         self.promotion_log.close()
+        self.transcripts.close()
         with open(os.path.join(self.out_dir, "history.json"), "w", encoding="utf-8") as fh:
             json.dump(self.history.to_dict(), fh, indent=1)
         self.log.close()

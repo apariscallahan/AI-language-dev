@@ -186,6 +186,8 @@
     "track_form_survival": true,
     "plot": true,
     "flush_every": 200,
-    "snapshot_every_checkpoint": true
+    "snapshot_every_checkpoint": true,
+    "transcript_stride": 50,
+    "heartbeat_seconds": 60
   }
 }

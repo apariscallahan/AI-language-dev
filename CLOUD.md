@@ -41,7 +41,7 @@ scale differs.
 |---|---|---|---|---|---|---|
 | `gpu_smoke` | 2+2 -> 8+8 | d=64, 2 layers | 87k | 0.5M | 1,024 | 2 |
 | `gpu_small` | 2+2 -> 16+16 | d=64, 2 layers | 87k | 8M | 2,048 | 6 |
-| `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 30M | 4,096 | 6 |
+| `gpu_community` | 2+2 -> 48+48 | d=96, 3 layers | 294k | 60M | 4,096 | 12 |
 | `gpu_full` | 2+2 -> 128+128 | d=96, 3 layers | 294k | 80M | 4,096 | 6 |
 | `gpu_duality` | 2+2 -> 48+48 | d=96, 3 layers | 301k | 40M | 2,048 | 6 |
 
@@ -53,6 +53,14 @@ pass, per 1,000 episodes: lineup rung ~0.2 GB, mutual ~0.7 GB, full market
 ~2.4 GB (duality world: 0.7 / 1.7 / 5.0 GB). Batch sizes are set so the heaviest
 rung stays under ~10 GB on a 24 GB card; on a 40-80 GB card they can be doubled
 (`--batch-size`). Without checkpointing the same batch needed 56-365 GB.
+
+**Lifespans are counted in training updates** (`population.lifespan_unit =
+"updates"`, 900-1,600 per agent in the community presets), so an agent's life
+is the same amount of learning whatever the batch size or community size. The
+first GPU run counted episodes: a 4,096-episode batch shared by the 2 + 2
+founders aged each founder 2,048 episodes per update, 16x the CPU runs, so
+founders lived ~50 updates, reached their 8th generation in 1.6M episodes, and
+the lineup never left chance (the CPU runs needed ~550 updates).
 
 Brains are deliberately small and communities large. A supervised check showed
 the 48k-parameter CPU brain already learns a full compositional code for every
@@ -103,18 +111,47 @@ CPU runs that worked. An earlier version annealed over a fraction of the whole
 run, so giving a run more episodes silently slowed its learning -- a 2.4M-episode
 run was still at temperature 1.36 after 200k episodes and never left chance.
 
+## 2a. What you see while it runs
+
+`cloud_run.sh` keeps the terminal quiet except for:
+
+- one **status line a minute**: time (UTC), episodes done / total, rung, episodes
+  per second, ETA, rolling success, community size, births, peak GPU memory;
+- a **two-line headline at every checkpoint**: success against the muted
+  channel, share of headroom the channel carries, each role's field coverage
+  (variety / quantity / quality), coherence, cross-role overlap, word counts;
+- **rung transitions** and **budget stops** with every criterion;
+- the **final verdict** and the report path.
+
+Everything else goes to the run folder:
+
+| file | what it is |
+|---|---|
+| `run.log` | the complete console history, including the long checkpoint blocks |
+| `transcripts.txt` | every `log.transcript_stride`-th round as *expected / dialogue / outcome* lines, with a banner at each rung |
+| `report.md` | rewritten at every checkpoint; **summary statistics** at the top |
+| `promotions.jsonl` | every promotion check, passed or not, with its evidence |
+| `progress.json` | a one-line status, for scripts |
+
+Run folders are named for their start time in UTC and the preset:
+`runs/2026-09-18_14-03-12UTC_gpu_community`.
+
 ## 2b. Interruptions, snapshots and resuming
 
 A snapshot of the whole community -- weights, optimiser state, recent usage, the
 transcript store, the curriculum record -- is written to
 `<run>/snapshots/latest.pt` at every checkpoint and to `after-<rung>.pt` at every
 promotion. `cloud_run.sh` resumes automatically when `latest.pt` exists, so on a
-spot or pre-emptible instance just rerun the same command with the same `RUN`:
+spot or pre-emptible instance, rerun it pointing `RUN` at the run's folder:
 
 ```bash
-RUN=runs/community CONFIG=configs/gpu_community.json bash cloud_run.sh   # starts
-RUN=runs/community CONFIG=configs/gpu_community.json bash cloud_run.sh   # resumes
+CONFIG=configs/gpu_community.json bash cloud_run.sh        # starts runs/<UTC time>_gpu_community
+RUN=runs/2026-09-18_14-03-12UTC_gpu_community CONFIG=configs/gpu_community.json bash cloud_run.sh   # resumes it
 ```
+
+A resumed run picks up whatever code and config it is started with, so this is
+also how to move a running experiment onto newer code: stop it just after a
+checkpoint (the snapshot is written then), update, and resume.
 
 Resume by hand, or branch a new experiment off any rung, under any config:
 

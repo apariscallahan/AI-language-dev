@@ -56,6 +56,14 @@ class RunLogger:
         self.fh.write(line + "\n")
         self.fh.flush()
 
+    def always(self, msg: str = "") -> None:
+        """Log a line and print it even in quiet mode: heartbeats and milestones."""
+        line = str(msg)
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        self.fh.write(line + "\n")
+        self.fh.flush()
+
     def rule(self, title: str = "", width: int = 78) -> None:
         if title:
             pad = max(0, width - len(title) - 4)

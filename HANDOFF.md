@@ -13,9 +13,9 @@ what is proven, what is not, and what to do next**.
 git clone https://github.com/apariscallahan/AI-language-dev.git && cd AI-language-dev
 pip install torch --index-url https://download.pytorch.org/whl/cu121   # match the driver
 pip install -r requirements.txt
-python -m unittest discover -s tests -q        # expect: Ran 139 tests ... OK
+python -m unittest discover -s tests -q        # expect: all tests OK (141 at handoff)
 python -m orchard.run --config configs/gpu_smoke.json --benchmark      # episodes/sec on CUDA
-CONFIG=configs/gpu_smoke.json RUN=runs/smoke bash cloud_run.sh         # minutes; proves the pipeline
+CONFIG=configs/gpu_smoke.json bash cloud_run.sh                        # minutes; proves the pipeline
 ```
 
 The GPU code path (bf16 autocast on the transformer layers, TF32, the batched
@@ -109,17 +109,33 @@ transmission bottleneck (newborns learn from transcripts, never weights).
    already looked right: `a6-a4 a3`, `a4-a4 a11 a0 a13`. CPU throughput with the
    longer buffer was ~4k episodes/min, which is why the work moved to a GPU.
 
+9. **First GPU run (`gpu_community`, RTX 4090): stuck at chance in `refer`
+   after 1.6M episodes, founders already at generation 7-8.** Lifespans were
+   counted in episodes; a 4,096 batch shared by 2 + 2 founders aged each founder
+   2,048 episodes per update (16x the CPU runs), so each lived ~50 updates --
+   far too short to invent a code (CPU needed ~550 updates). Fixed: lifespans
+   are counted in training updates in every GPU preset (900-1,600). Also fixed:
+   the report judged a lineup success of 0.244 against the *trading* chance
+   (~0) and called it "far above chance"; it now uses the rung's own chance.
+   **Rule of thumb: anything counted in episodes must be checked against the
+   batch size and the number of agents sharing it.**
+
 ## 5. What is NOT validated yet -- your first job
 
 In order of importance. The first run to do is **`gpu_small`** (16 + 16,
 ~8M episodes): it is the validation the CPU could not finish.
 
 ```bash
-CONFIG=configs/gpu_small.json RUN=runs/small bash cloud_run.sh
-tail -f runs/small/run.log | grep -E "PHASE|RUNG|RUNG EVIDENCE|speaking|reports partner|coverage"
+CONFIG=configs/gpu_small.json bash cloud_run.sh      # folder: runs/<UTC start>_gpu_small
 ```
 
-What to check, rung by rung (`runs/small/promotions.jsonl` has every check):
+The terminal gets a status line a minute, a two-line headline per checkpoint
+(success vs muted, channel headroom, per-role field coverage, coherence, words),
+rung transitions and the verdict. `run.log` has the full checkpoint blocks,
+`transcripts.txt` has sampled rounds as expected / dialogue / outcome lines, and
+`report.md` opens with a summary-statistics table.
+
+What to check, rung by rung (`promotions.jsonl` in the run folder has every check):
 
 - **`refer`**: lift-off in *updates* (the CPU runs took ~550 updates of 256
   episodes; with batch 2048 it may take a different number of episodes). Farmer

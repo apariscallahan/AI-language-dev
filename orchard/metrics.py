@@ -698,7 +698,8 @@ ZS_MIN_SEEN_RATE = 0.05
 
 def zero_shot(cfg: Config, pop: Population, world: World, n: int,
               device: str = "cpu", rng: Optional[random.Random] = None,
-              phase=None, sampler=None, n_holdout: Optional[int] = None) -> dict[str, Any]:
+              phase=None, sampler=None, n_holdout: Optional[int] = None,
+              chance: float = 0.0) -> dict[str, Any]:
     """Success on (variety, quantity) combinations never sampled during training.
 
     Retention is unseen / seen, which is meaningless when "seen" is a handful of
@@ -731,6 +732,11 @@ def zero_shot(cfg: Config, pop: Population, world: World, n: int,
         why = ("suppressed: only %d successes (rate %.3f) on seen combinations; need "
                "%d and %.2f for the ratio to mean anything"
                % (n_seen_succ, s_rate, ZS_MIN_SEEN_SUCCESSES, ZS_MIN_SEEN_RATE))
+    elif s_rate < chance + 0.10:
+        # unseen / seen is ~1 when both are chance: that is no language, not
+        # perfect generalisation
+        why = ("suppressed: seen success %.3f is at chance (%.3f); there is nothing yet "
+               "to generalise" % (s_rate, chance))
     else:
         retention = u_rate / s_rate
     return {
@@ -1012,10 +1018,14 @@ def intelligibility(cfg: Config, pop: Population, world: World, n: int,
     private cipher that newcomers cannot acquire.
     """
     rng = rng or random.Random(0)
-    new_f = [i for i, a in enumerate(pop.farmers) if a.age <= newborn_age]
-    new_b = [i for i, a in enumerate(pop.buyers) if a.age <= newborn_age]
-    vet_f = [i for i, a in enumerate(pop.farmers) if a.age > newborn_age]
-    vet_b = [i for i, a in enumerate(pop.buyers) if a.age > newborn_age]
+    by_updates = cfg.population.lifespan_unit == "updates"
+
+    def age(a):
+        return a.updates if by_updates else a.age
+    new_f = [i for i, a in enumerate(pop.farmers) if age(a) <= newborn_age]
+    new_b = [i for i, a in enumerate(pop.buyers) if age(a) <= newborn_age]
+    vet_f = [i for i, a in enumerate(pop.farmers) if age(a) > newborn_age]
+    vet_b = [i for i, a in enumerate(pop.buyers) if age(a) > newborn_age]
 
     res: dict[str, Any] = {"n_newborn_farmers": len(new_f), "n_newborn_buyers": len(new_b),
                            "n_veteran_farmers": len(vet_f), "n_veteran_buyers": len(vet_b)}

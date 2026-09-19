@@ -133,6 +133,9 @@ class Population:
         """Age every agent by the episodes it actually played, and tally its results."""
         if getattr(batch, "res", None) is not None:
             return self._record_from_tensors(f_idx, b_idx, batch)
+        for idx, pool in ((f_idx, self.farmers), (b_idx, self.buyers)):
+            for a_i in set(int(x) for x in idx.tolist()):
+                pool[a_i].updates += 1            # took part in this update
         for i in range(len(batch)):
             o = batch.outcomes[i]
             fa = self.farmers[int(f_idx[i])]
@@ -176,6 +179,8 @@ class Population:
                     apples.tolist(), value.tolist(), profit.tolist()):
                 a.age += int(c)
                 a.n_episodes += int(c)
+                if c > 0:
+                    a.updates += 1            # took part in this update
                 a.reward_sum += r
                 a.n_success += int(sx)
                 a.apples_traded += int(ap)
@@ -193,7 +198,7 @@ class Population:
         for role in (FARMER, BUYER):
             pool = self.pool(role)
             for slot, agent in enumerate(pool):
-                if not agent.is_expired():
+                if not agent.is_expired(self.cfg.population.lifespan_unit):
                     continue
                 newborn = self._spawn(role, slot, agent.generation + 1, episode)
                 ev = BirthEvent(

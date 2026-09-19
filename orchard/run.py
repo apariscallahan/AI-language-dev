@@ -139,50 +139,66 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
     rw = ReferentialWorld(cfg, device=str(dev),
                           generator=torch.Generator(device=dev).manual_seed(1))
 
-    def one_step(phase):
+    def one_step(phase, n):
+        fi, bi = pop.pair(n, device=str(dev))
         if phase.referential:
-            sb = rw.sample(B, informer=phase.informer)
+            sb = rw.sample(n, informer=phase.informer)
         elif phase.mutual:
-            sb = rw.sample_mutual(B)
+            sb = rw.sample_mutual(n)
         else:
-            sb = tw.sample(B)
+            sb = tw.sample(n)
         if cfg.train.algo == "gumbel":
-            run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
+            run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, fi, bi,
                                   frac_done=0.1, device=str(dev), phase=phase)
         else:
-            batch = run_episodes(cfg, sb, pop.farmers, pop.buyers, f_idx, b_idx,
+            batch = run_episodes(cfg, sb, pop.farmers, pop.buyers, fi, bi,
                                  device=str(dev), phase=phase)
             update_agents(cfg, batch, pop.farmers, pop.buyers, frac_done=0.1,
                           device=str(dev))
 
     # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
     # dialogue in the market. Time a light, a middle and the heaviest rung, at
-    # full community size (an upper bound: founders are cheaper).
+    # full community size (an upper bound: founders are cheaper). On a GPU, also
+    # at twice the batch: memory is rarely the limit here -- the number of
+    # per-agent calls is -- so a bigger batch often buys episodes almost free.
+    # Use the numbers to set train.batch_size / train.rung_batch_scale.
     rates = {}
+    scales = (1, 2) if dev.type == "cuda" else (1,)
     for name in ("refer", "refer-mutual", "market"):
         phase = phase_named(cfg, name)
-        one_step(phase)                        # warm-up
-        if dev.type == "cuda":
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-        t0 = time.time()
-        for _ in range(n_batches):
-            one_step(phase)
-        if dev.type == "cuda":
-            torch.cuda.synchronize()
-        dt = (time.time() - t0) / n_batches
-        rates[name] = B / dt
-        print("\n  %-17s : %.3f s per batch, %s episodes/sec"
-              % (name, dt, "{:,.0f}".format(rates[name])))
-        if dev.type == "cuda":
-            print("  peak GPU memory   : %.2f GB" % (torch.cuda.max_memory_allocated() / 1e9))
-    eps = rates["refer-mutual"]
-    total_h = cfg.train.episodes / eps / 3600
+        base = int(B * float((cfg.train.rung_batch_scale or {}).get(name, 1)))
+        cells = []
+        for s in scales:
+            n = base * s
+            try:
+                one_step(phase, n)                 # warm-up
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                t0 = time.time()
+                for _ in range(n_batches):
+                    one_step(phase, n)
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                cells.append("batch %s: out of memory" % "{:,}".format(n))
+                continue
+            dt = (time.time() - t0) / n_batches
+            if s == 1:
+                rates[name] = n / dt
+            mem = (", peak %.1f GB" % (torch.cuda.max_memory_allocated() / 1e9)
+                   if dev.type == "cuda" else "")
+            cells.append("batch %s: %.2f s/update, %s eps/s%s"
+                         % ("{:,}".format(n), dt, "{:,.0f}".format(n / dt), mem))
+        print("\n  %-13s %s" % (name, "\n                ".join(cells)))
+    def hours(name):
+        r = rates.get(name)
+        return cfg.train.episodes / r / 3600 if r else float("nan")
     print("\n  configured run    : %s episodes -> ~%.1f hours at the middle rung's rate "
           "(%.1f at the lineup's, %.1f at the market's)"
-          % ("{:,}".format(cfg.train.episodes), total_h,
-             cfg.train.episodes / rates["refer"] / 3600,
-             cfg.train.episodes / rates["market"] / 3600))
+          % ("{:,}".format(cfg.train.episodes), hours("refer-mutual"), hours("refer"),
+             hours("market")))
     n_ck = max(1, cfg.train.episodes // max(1, cfg.log.checkpoint_every))
     print("  plus %d checkpoints; the metric suite replays episodes three times "
           "for the\n  channel ablation, so allow roughly %.0f%% on top."
@@ -303,11 +319,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.benchmark:
         return benchmark(cfg, args.benchmark)
 
-    out = args.out or os.path.join("runs", cfg.name)
+    # Default folder: when it started (UTC), then the preset, e.g.
+    # runs/2026-09-18_14-03-12UTC_gpu_community -- sorts by time, says what it is.
+    now = time.gmtime()
+    out = args.out or os.path.join(
+        "runs", "%s_%s" % (time.strftime("%Y-%m-%d_%H-%M-%SUTC", now), cfg.name))
     os.makedirs(out, exist_ok=True)
     t0 = time.time()
 
-    trainer = Trainer(cfg, out, quiet=args.quiet)
+    trainer = Trainer(cfg, out, quiet=args.quiet,
+                      started_utc=time.strftime("%Y-%m-%d %H:%M:%S UTC", now))
     if args.resume:
         trainer.load_snapshot(args.resume)
     try:
@@ -351,18 +372,18 @@ def main(argv: list[str] | None = None) -> int:
             ledger_path=os.path.join(out, "trades.jsonl"),
             wall_minutes=(time.time() - t0) / 60.0)
 
-        trainer.log("")
-        trainer.log("wrote final report: %s" % path)
+        trainer.log.always("")
+        trainer.log.always("wrote final report: %s" % path)
         trainer.log("ledger rows written: %d" % trainer.ledger.n_written)
 
         # Print the verdict last so it is the thing a human sees.
         from .report import assess
         v = assess(cfg, final, trainer.chance)
-        trainer.log("")
-        trainer.log("=" * 78)
-        trainer.log("VERDICT: %s" % v["verdict"])
-        trainer.log(v["summary"])
-        trainer.log("=" * 78)
+        trainer.log.always("")
+        trainer.log.always("=" * 78)
+        trainer.log.always("VERDICT: %s" % v["verdict"])
+        trainer.log.always(v["summary"])
+        trainer.log.always("=" * 78)
     except KeyboardInterrupt:
         trainer.log("\ninterrupted -- flushing logs")
     finally:

@@ -376,6 +376,7 @@ class Agent:
     birth_episode: int
     lifespan: int
     age: int = 0                  # episodes this agent has participated in
+    updates: int = 0              # training updates it has taken part in
     days_alive: int = 0
     # running tallies, reported in per-generation summaries
     n_success: int = 0
@@ -394,8 +395,8 @@ class Agent:
     def success_rate(self) -> float:
         return self.n_success / self.n_episodes if self.n_episodes else 0.0
 
-    def is_expired(self) -> bool:
-        return self.age >= self.lifespan
+    def is_expired(self, unit: str = "episodes") -> bool:
+        return (self.updates if unit == "updates" else self.age) >= self.lifespan
 
 
 def make_agent(cfg: Config, *, agent_id: int, role: int, slot: int, generation: int,

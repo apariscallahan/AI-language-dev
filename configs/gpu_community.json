@@ -121,12 +121,13 @@
     "n_farmers": 48,
     "n_buyers": 48,
     "turnover": true,
-    "lifespan_min": 80000,
-    "lifespan_max": 140000,
+    "lifespan_min": 900,
+    "lifespan_max": 1600,
     "initial_stagger": true,
     "founders_farmers": 2,
     "founders_buyers": 2,
-    "grow_every": 80000
+    "grow_every": 80000,
+    "lifespan_unit": "updates"
   },
   "bottleneck": {
     "enabled": true,
@@ -146,17 +147,17 @@
     "algo": "gumbel",
     "gumbel_tau": 1.5,
     "gumbel_tau_final": 0.5,
-    "gumbel_tau_anneal_frac": 0.13653,
+    "gumbel_tau_anneal_frac": 0.06827,
     "gumbel_mix_reinforce": 0.1,
     "shaping_reinforce": 0.2,
-    "episodes": 30000000,
+    "episodes": 60000000,
     "batch_size": 4096,
     "lr": 0.0003,
     "grad_clip": 1.0,
     "value_coef": 0.5,
     "entropy_coef": 0.01,
     "entropy_coef_final": 0.002,
-    "entropy_anneal_frac": 0.10923,
+    "entropy_anneal_frac": 0.05461,
     "decision_entropy_coef": 0.02,
     "decision_entropy_coef_final": 0.002,
     "normalise_adv": true,
@@ -169,7 +170,12 @@
     "grad_checkpoint": true,
     "tf32": true,
     "log_every_batches": 0,
-    "convention_reinforce": 1.0
+    "convention_reinforce": 1.0,
+    "rung_batch_scale": {
+      "refer": 2,
+      "refer-swap": 2,
+      "order": 2
+    }
   },
   "log": {
     "ledger_stride": 500,
@@ -187,6 +193,8 @@
     "plot": true,
     "flush_every": 200,
     "snapshot_every_checkpoint": true,
-    "max_agents_probed": 8
+    "max_agents_probed": 8,
+    "transcript_stride": 2000,
+    "heartbeat_seconds": 60
   }
 }

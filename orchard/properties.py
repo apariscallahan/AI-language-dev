@@ -275,16 +275,23 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
             % ("yes" if passed else "no", cx if cx is not None else float("nan")))
 
     # ---- generic ---------------------------------------------------------
+    # Disentanglement of a code that carries almost nothing is noise, so only
+    # roles whose messages cover the fields at all (coverage >= 0.2) count.
+    def informative(v):
+        return _num(v.get("field_coverage")) >= 0.2
+
     pdis, _ = _latest(rows, lambda r: max(
         [_num(v.get("posdis")) for v in (r.get("per_role_structure") or {}).values()
-         if _num(v.get("posdis")) == _num(v.get("posdis"))] or [float("nan")]))
+         if informative(v) and _num(v.get("posdis")) == _num(v.get("posdis"))]
+        or [float("nan")]))
     bdis, _ = _latest(rows, lambda r: max(
         [_num(v.get("bosdis")) for v in (r.get("per_role_structure") or {}).values()
-         if _num(v.get("bosdis")) == _num(v.get("bosdis"))] or [float("nan")]))
+         if informative(v) and _num(v.get("bosdis")) == _num(v.get("bosdis"))]
+        or [float("nan")]))
     g = max([x for x in (pdis, bdis) if x is not None and x == x] or [float("nan")])
     add("generic", "disentanglement: a position or symbol names one attribute value "
-        "whatever the others are (posdis / bosdis, best role)", g,
-        PRESENT if g >= 0.3 else (PARTIAL if g >= 0.1 else ABSENT),
+        "whatever the others are (posdis / bosdis, best role with field coverage >= 0.2)",
+        g, PRESENT if g >= 0.3 else (PARTIAL if g >= 0.1 else ABSENT),
         "posdis %.3f, bosdis %.3f" % (pdis if pdis is not None else float("nan"),
                                        bdis if bdis is not None else float("nan")))
 
