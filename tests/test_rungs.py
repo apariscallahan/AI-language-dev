@@ -823,6 +823,101 @@ def _grammatical(cfg, seg):
     return c.is_atom(body[-1])
 
 
+class TestNoEmptyTurns(unittest.TestCase):
+    """Silence is the muted control; no speaker may say it.
+
+    Measured on the GPU: with no length cost, speakers went silent in 24-55% of
+    lineup rounds, because silence is the shortest, most reliable message there
+    is. It is also exactly what the muted control feeds the listener, so a code
+    that used it as a word was invisible to every channel measurement.
+    """
+
+    def _scheduled_turns(self, cfg, phase, tokens, active):
+        """Every (row, first position) of a turn the rung actually scheduled."""
+        L = cfg.channel.max_msg_len
+        for turn in range(min(phase.n_turns, cfg.channel.n_turns)):
+            p = turn * L
+            for i in range(tokens.shape[0]):
+                if bool(active[i, p]):
+                    yield i, int(tokens[i, p])
+
+    def test_no_training_batch_on_any_rung_starts_a_turn_with_silence(self):
+        from orchard.batched import TensorWorld
+        cfg = cfg_small()
+        torch.manual_seed(21)
+        f, b = agents(cfg)
+        gen = torch.Generator().manual_seed(21)
+        rw = ReferentialWorld(cfg, generator=gen)
+        tw = TensorWorld(cfg, device="cpu", generator=gen)
+        n = 96
+        fi, bi = pairing(n)
+        for phase in ladder(cfg):
+            if phase.referential:
+                scen = rw.sample(n, informer=phase.informer, mix=phase.mix)
+            elif phase.mutual:
+                scen = rw.sample_mutual(n)
+            else:
+                scen = tw.sample(n)
+            batch, _ = run_and_update_gumbel(cfg, scen, f, b, fi, bi, phase=phase)
+            for i, first in self._scheduled_turns(cfg, phase, batch.tokens, batch.active):
+                self.assertTrue(cfg.channel.is_atom(first),
+                                "%s: a turn opened with %d, not a word" % (phase.name, first))
+
+    def test_evaluation_play_is_held_to_it_too(self):
+        from orchard.rollout import run_episodes
+        cfg = cfg_small()
+        torch.manual_seed(22)
+        f, b = agents(cfg)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(22))
+        fi, bi = pairing(128)
+        phase = phase_named(cfg, "name-fruit")
+        batch = run_episodes(cfg, rw.sample(128), f, b, fi, bi, phase=phase)
+        for i, first in self._scheduled_turns(cfg, phase, batch.tokens, batch.active):
+            self.assertTrue(cfg.channel.is_atom(first))
+
+    def test_silence_is_only_possible_when_the_config_asks_for_it(self):
+        from orchard.env import grammar_allowed
+        cfg = Config()
+        prev = torch.zeros(4, dtype=torch.long)
+        self.assertFalse(bool(grammar_allowed(cfg, prev, 0)[:, cfg.channel.end_id].any()))
+        cfg.channel.allow_silence = True
+        self.assertTrue(bool(grammar_allowed(cfg, prev, 0)[:, cfg.channel.end_id].all()))
+        # and an utterance can still stop after its first word either way
+        cfg.channel.allow_silence = False
+        after = grammar_allowed(cfg, torch.tensor([3, 3, 3, 3]), 1)
+        self.assertTrue(bool(after[:, cfg.channel.end_id].all()))
+
+    def test_a_silent_lesson_in_the_store_is_skipped_not_taught(self):
+        """A resumed run carries silent turns from before the rule; they must not
+        reach a newborn as targets on a masked logit (cross-entropy ~1e9)."""
+        cfg = cfg_small()
+        cfg.bottleneck.epochs = 1
+        cfg.bottleneck.only_successful = False
+        torch.manual_seed(23)
+        f, b = agents(cfg)
+        phase = phase_named(cfg, "name-fruit")
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(23))
+        fi, bi = pairing(64)
+        batch, _ = run_and_update_gumbel(cfg, rw.sample(64), f, b, fi, bi,
+                                         phase=phase, update=500)
+        # every describer turn made silent, the way the store of an older run holds it
+        L = cfg.channel.max_msg_len
+        for p in phase.own_positions(cfg, phase.informer):
+            k = p % L
+            batch.tokens[:, p] = cfg.channel.end_id if k == 0 else cfg.channel.pad_id
+            batch.active[:, p] = (k == 0)
+        store = TranscriptStore(cfg)
+        store.add_batch(batch, f, b, 0)
+        newborn = agents(cfg, 1)[0][0]
+        info = train_newborn(cfg, newborn, store, random.Random(0))
+        for name, v in info.items():
+            if isinstance(v, float) and "loss" in name:
+                self.assertTrue(math.isfinite(v) and v < 1e3,
+                                "%s = %r: a silent lesson was taught" % (name, v))
+        for prm in newborn.net.parameters():
+            self.assertTrue(bool(torch.isfinite(prm).all()))
+
+
 class TestWordGrammar(unittest.TestCase):
     def test_every_utterance_alternates_atoms_and_marks(self):
         cfg = cfg_small()

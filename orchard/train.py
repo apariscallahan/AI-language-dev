@@ -298,7 +298,9 @@ class Trainer:
         L = self.cfg.channel.max_symbols
 
         def tup(t):
-            return {"variety": w.variety_names[int(t[0])], "quantity": int(t[1]),
+            # a thing is (fruit, colour, quality); the middle field was logged as
+            # "quantity" for as long as the world has had colours
+            return {"fruit": w.variety_names[int(t[0])], "colour": w.color_names[int(t[1])],
                     "quality": w.quality_names[int(t[2])]}
 
         f_ids = [self.pop.farmers[int(x)].agent_id for x in batch.f_idx.tolist()]

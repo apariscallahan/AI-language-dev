@@ -107,15 +107,16 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 - **two lines at every checkpoint** (every 100 updates):
 
 ```
-[checkpoint 96] rung name-all | success 0.315 (muted 0.335) / 0.370 (muted 0.345) | channel 0.00 of headroom | buyer coverage 0.052 [0.04 0.09 0.03]; farmer coverage 0.064 [0.07 0.09 0.03]
-    coherence farmer 0.278 buyer 0.278 across 0.519 | overlap 0.546 | 107 words, 1.43 atoms/word, 1.67 words/utterance, 4% silent, 0% at buffer end
+[checkpoint 96] rung name-all | success 0.315 (muted 0.345) / 0.375 (muted 0.340) | channel 0.00 of headroom | buyer coverage 0.071 [0.08 0.03 0.11]; farmer coverage 0.081 [0.08 0.06 0.11]
+    coherence farmer 0.278 buyer 0.278 across 0.519 | overlap 0.535 | 107 words, 1.43 atoms/word, 1.73 words/utterance, 0% silent, 0% at buffer end
 ```
 
   (That one is from a 96-update test run, so it is still at chance.) The two
   success numbers are the two views of a swap rung (each role decoding),
   each against its own muted baseline. Coverage is per field: **fruit, colour,
-  quality**. `silent` and `at buffer end` should both be near 0 — the first means
-  agents saying nothing, the second means babbling into the cap.
+  quality**. `silent` is always 0% — every turn has to open with a word, because
+  silence is what the muted control sounds like — and `at buffer end` should be
+  near 0; if it climbs, agents are babbling into the cap.
 
   On a request rung the same line also names each field of the order and how
   often it arrived, which is the number to watch there:
@@ -242,6 +243,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `channel.atomic_vocab` | how many meaningless atoms words are built from (16). |
 | `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 — a buffer, not a pressure; the length cost sets length) and the number of turns (4). |
 | `channel.enforce_word_grammar` | atoms and marks alternate, so `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |
+| `channel.allow_silence` | whether a turn may be empty (false). Silence is what the muted control sounds like, so a speaker may not say it. |
 | `bottleneck.coverage` | how much of the parent generation a newborn sees (1.0 — essentially all of it; lowering it puts *common* forms back at risk). |
 | `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
 | `world.zipf_alpha` | how skewed demand is. **Read §9 before raising it.** |
@@ -392,7 +394,7 @@ grep -E "rung|PHASE" runs/<run>/run.log | tail -20
 python -m unittest discover -s tests
 ```
 
-178 tests, about two minutes. Worth doing on the GPU box, not just locally:
+182 tests, about two minutes. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
 readable scalar one, and `tests/test_config.py` that there is one configuration
 and no device-specific arithmetic.
@@ -406,7 +408,8 @@ and no device-specific arithmetic.
 | `$'\r': command not found` from `cloud_run.sh` | the file was checked out with CRLF. `.gitattributes` pins `*.sh` to LF; re-clone or `dos2unix cloud_run.sh`. |
 | "No CUDA device visible" | `cloud_run.sh` only runs on a GPU. Use `python -m orchard.run` for a CPU run. |
 | success at chance past ~1,000 updates in `name-fruit` | a real failure, not slowness. Check the header: speaker costs and hindsight should be off, the pool should be 2 + 2. |
-| `silent` climbing, ~1 word per utterance | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
+| `silent` above 0% | it cannot be: every turn has to open with a word (`channel.allow_silence`). Check the header's method line for a change to it. |
+| ~1 word per utterance on a rung that is still inventing words | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
 | a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
 | a rung stops the run | read the criteria it names in the log and in `promotions.jsonl`. Do not relax them to make it pass — they are the experiment. |
 | out of memory in the first batch | `--set train.grad_checkpoint=true`, then a smaller batch. See §10. |

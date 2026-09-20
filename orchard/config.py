@@ -184,6 +184,18 @@ class ChannelConfig:
     max_symbols: int = 24      # buffer per turn; generous on purpose (the cost sets length)
     n_turns: int = 4           # alternating turns per negotiation; buyer speaks first
     enforce_word_grammar: bool = True   # atoms and HYPHEN/SPACE must alternate
+    # Whether a turn may be empty. It may not. Measured on the GPU, speakers with
+    # no length cost at all went silent in 24-55% of lineup rounds while the code
+    # was forming: silence is the shortest message there is -- one decision, with
+    # nothing after it to get wrong -- so {silence, a3, a7, a12} names four fruits
+    # more reliably than any spoken code. But silence is also exactly what the
+    # muted control feeds the listener (END, then nothing), and a word identical
+    # to the control cannot be measured by it: whatever silence meant would count
+    # as zero in every channel number. So a turn is at least one word, the way a
+    # word is atoms joined by hyphens -- a property of the medium, not a rule
+    # about which words to use. The muted control keeps its meaning: nothing a
+    # speaker can say sounds like it.
+    allow_silence: bool = False
 
     # ---- symbol ids ----------------------------------------------------
     @property

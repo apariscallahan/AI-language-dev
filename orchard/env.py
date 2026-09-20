@@ -407,17 +407,22 @@ def grammar_allowed(cfg: Config, prev: torch.Tensor, k: int) -> torch.Tensor:
     """(B, n_emittable) bool: which symbols may come next in a turn.
 
     ``prev`` is the previous symbol of this turn (ignored at ``k == 0``). At the
-    start: an atom, or END (silence). After an atom: HYPHEN, SPACE or END. After a
-    HYPHEN or SPACE: an atom. In the last slot of the buffer an atom is followed
-    by END, so no utterance ends on a dangling mark.
+    start: an atom -- or END, an empty turn, only if ``channel.allow_silence``.
+    After an atom: HYPHEN, SPACE or END. After a HYPHEN or SPACE: an atom. In the
+    last slot of the buffer an atom is followed by END, so no utterance ends on a
+    dangling mark.
     """
     c = cfg.channel
     E = c.n_emittable
     dev = prev.device
     if not c.enforce_word_grammar:
-        return torch.ones((prev.shape[0], E), dtype=torch.bool, device=dev)
+        out = torch.ones((prev.shape[0], E), dtype=torch.bool, device=dev)
+        if k == 0 and not c.allow_silence:
+            out[:, c.end_id] = False
+        return out
     start, atoms, after_atom, closing = _grammar_rows(c.atomic_vocab, c.hyphen_id,
-                                                      c.space_id, c.end_id, E, str(dev))
+                                                      c.space_id, c.end_id, E, str(dev),
+                                                      c.allow_silence)
     if k == 0:
         return start.unsqueeze(0).expand(prev.shape[0], E)
     after = closing if k >= c.max_symbols - 1 else after_atom
@@ -428,16 +433,18 @@ def grammar_allowed(cfg: Config, prev: torch.Tensor, k: int) -> torch.Tensor:
 _GRAMMAR_CACHE: dict = {}
 
 
-def _grammar_rows(A: int, hyphen: int, space: int, end: int, E: int, dev: str):
+def _grammar_rows(A: int, hyphen: int, space: int, end: int, E: int, dev: str,
+                  allow_silence: bool = False):
     """The four fixed legal-next-symbol rows, built once per device (they are
     consulted at every symbol step of every rollout)."""
-    key = (A, hyphen, space, end, E, dev)
+    key = (A, hyphen, space, end, E, dev, allow_silence)
     hit = _GRAMMAR_CACHE.get(key)
     if hit is None:
         atoms = torch.zeros(E, dtype=torch.bool, device=dev)
         atoms[:A] = True
         start = atoms.clone()
-        start[end] = True
+        if allow_silence:
+            start[end] = True
         after_atom = torch.zeros(E, dtype=torch.bool, device=dev)
         after_atom[[hyphen, space, end]] = True
         closing = torch.zeros(E, dtype=torch.bool, device=dev)

@@ -258,6 +258,11 @@ preserves and which, with an open vocabulary, is a usable channel in its own
 right. Transfer is therefore reported against silence, with scrambled-versus-muted
 showing how much of the work length alone was doing.
 
+Because muted means silence, **no agent is allowed to be silent**: a speaker
+that used silence as a word would be saying something the control cannot tell
+apart from saying nothing, and whatever that word meant would count as zero in
+every channel number.
+
 A pair exploiting base rates rather than talking scores identically in all three
 conditions. This is what caught the sampler bug above, and what the verdict in
 every report leans on hardest.
@@ -297,6 +302,13 @@ The vocabulary is open — far more possible words than atoms — while the chan
 stays discrete. `channel.max_symbols` (24 per turn) is a **buffer, not a limit**
 anyone should feel: the report flags any utterance that reaches it, and the
 share at the buffer end should be ~0.
+
+**A turn is at least one word** (`channel.allow_silence` = false): the first
+symbol of every turn must be an atom. That is the one hard rule besides the word
+grammar, and it exists because silence is taken — it is exactly what the muted
+control feeds the listener ([§2](#the-control-that-cannot-be-fooled)). See
+[§11](#silence-was-the-shortest-word-and-it-was-the-control) for how that was
+found.
 
 ### What keeps utterances short is a cost, not a rule
 
@@ -843,6 +855,29 @@ transmission on its own. The cap has since been raised to a generous buffer (24
 symbols per turn) because a small cap does worse damage: at 4 symbols, 100% of
 utterances were hitting it once every field had to be named.
 
+### Silence was the shortest word, and it was the control
+
+The first GPU run of the current ladder had speakers silent in **24–55%** of
+lineup rounds while the fruit code was forming — with the speaker costs *off*,
+so nothing in the reward preferred short messages at all. Silence won anyway
+because it is the most reliable message there is: one decision, with nothing
+after it to get wrong. A code of `{silence, a3, a7, a12}` names four fruits, and
+the silent share *rose* (20% → 42%) as success rose (0.37 → 0.45), which is what
+a code using silence as a word looks like, not one giving up.
+
+Penalising it was considered and rejected. A penalty for silence and a bonus
+for "any attempt" are the same signal once advantages are centred, and either
+would reach the one decision that matters — END as the first symbol — only
+through the small score-function term, for the reason given below. It would
+need tuning, and silence would still be used wherever it was worth more than
+the penalty. Instead an empty turn is simply not a message the medium has.
+
+That also closed a second hole. The muted control *is* silence, so a word made
+of silence was unmeasurable; and a newborn apprenticed on stored transcripts
+with silent turns would have been taught a target the grammar now masks, at a
+cross-entropy of 1e9 — the bottleneck now skips any lesson the current grammar
+forbids.
+
 ### Straight-through Gumbel cannot feel a length cost on its own
 
 Under ST-Gumbel the symbol policy gets gradient only through the listener's
@@ -921,7 +956,7 @@ chance); one configuration on every device with no device-specific arithmetic;
 every schedule in updates; gradient checkpointing changing nothing. Every rung
 of the ladder plays a real training step, passes on perfect evidence and fails
 on empty evidence — the check that would have caught the trading rungs going
-unexercised for as long as they did. 178 tests, about two minutes.
+unexercised for as long as they did. 182 tests, about two minutes.
 
 **Demonstrated in runs.** Founding at 2 + 2 and growing gets a lineup code off
 chance where 6 + 6 never does; the code forms suddenly and late (~300–600

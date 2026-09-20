@@ -374,6 +374,11 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
             m = act[:, own_pos]
             safe = torch.where(m, tgt, torch.zeros_like(tgt))
             gram = grammar_mask_for_positions(cfg, toks, own_pos)
+            # A lesson the grammar now forbids is not taught. The store can hold
+            # transcripts from before a change to the medium -- a resumed run
+            # carries silent turns from before silence was ruled out -- and its
+            # target would sit on a masked logit, where the cross-entropy is ~1e9.
+            m = m & gram.gather(-1, safe.unsqueeze(-1)).squeeze(-1)
         else:
             tgt = m = safe = gram = None
         plans.append({
