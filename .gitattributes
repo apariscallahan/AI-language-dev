@@ -1,0 +1,3 @@
+# The GPU launcher is run by bash on Linux, where a CRLF checkout dies
+# before it runs a line. Keep shell scripts LF on every platform.
+*.sh text eol=lf

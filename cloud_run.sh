@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Orchard on a GPU box.
 #
-#   bash cloud_run.sh                                  # the configuration (orchard/config.py)
+#   bash cloud_run.sh                                  # the reference scale
+#   CONFIG=configs/gpu_community.json bash cloud_run.sh   # a bigger scale (see configs/)
 #   CONFIG=configs/duality.json bash cloud_run.sh      # a named experiment
 #   RUN=runs/<existing folder> bash cloud_run.sh       # resume that run
 #   bash cloud_run.sh --seed 3                         # any orchard.run flags
 #
-# There is one configuration, and it is the same on a GPU and a CPU: this script
-# only checks the GPU is visible and picks a folder. The identical run on a CPU
-# (slower, same result) is
-#   python -m orchard.run
+# One method, at whatever scale the preset asks for: the presets in configs/
+# change the community, the brain, the batch and the run length, never what is
+# simulated. This script only checks the GPU is visible and picks a folder; the
+# same run on a CPU (slower, same rules) is
+#   python -m orchard.run [--config configs/<preset>.json]
 #
 # Resuming is automatic: if $RUN/snapshots/latest.pt exists (the run was
 # interrupted -- a pre-empted spot instance, a dropped SSH session), the run

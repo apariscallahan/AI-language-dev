@@ -22,38 +22,72 @@ memory.
 
 ---
 
-## 2. The configuration -- the only one
+## 2. One method, four scales
 
-**There is one configuration: the defaults in `orchard/config.py`.** A GPU and
-a CPU run exactly the same thing -- the same agents, brains, batch, schedule and
-arithmetic (fp32 on every device; there is no GPU-only precision mode). The GPU
-is simply faster: about 100 training updates a minute on an RTX 4090. That is
-the point: a check on a CPU tests exactly what a GPU run does, so nothing can
-work on one and fail on the other.
+**What is simulated lives in one place: the defaults in `orchard/config.py`.**
+The world, the ladder, the rewards, the channel, the schedules -- every run uses
+them, on a GPU or a CPU, in the same fp32 arithmetic. There is no GPU-only code
+path: a check on a CPU therefore tests what a GPU run does, and nothing can work
+on one and fail on the other.
+
+**How big it runs is a separate choice**, and that is what the presets in
+`configs/` are for. A preset may change the community size, the brain, the
+batch, the run length and how much output there is -- and nothing else.
+`tests/test_config.py` fails if one touches the method, and the run header
+prints the two lines apart:
+
+```
+scale              : pool of 2 growing to 32, then 32 + 32 once trading starts; d=96 x 3 layers, batch 4,096, 60,000,000 episodes
+method             : the one configuration -- size aside, nothing simulated was changed
+```
+
+| preset | community | brain | batch | episodes | what it is for |
+|---|---|---|---|---|---|
+| *(none)* | 2 -> 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M | the reference scale, and the one a CPU can check |
+| `gpu_small` | 2 -> 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
+| `gpu_community` | 2 -> 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M | the main run: a community big enough that a code has to work for strangers |
+| `gpu_large` | 2 -> 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M | the big one; benchmark before committing to it |
+
+Every agent, at every scale, is one pre-norm causal transformer over its private
+situation and the dialogue so far, with a head per decision and a GELU
+feed-forward four times the model width. Only its size changes.
+
+```bash
+CONFIG=configs/gpu_community.json bash cloud_run.sh
+```
+
+Every community is **founded by 2 agents and grows**, whatever the preset:
+6 + 6 from scratch never got a code off chance, and 64 + 64 certainly would not.
+The founders take the naming rungs alone; newcomers start arriving at `mutual`
+(`population.grow_from_rung`), one every 40 updates, each taught from the store
+of what the community has already said. Growing earlier filled the community
+with apprentices of a code that was about to be replaced -- 2 -> 15 across the
+colour rung, at chance throughout. No rung's budget counts while it is still
+filling up.
+
+**Run `--benchmark` before a big preset.** It times a naming rung, `mutual` and
+`market` at full community size, reports peak GPU memory, and estimates the
+hours -- the per-agent loop is the cost here, so wall time grows with the
+community, not with the batch.
+
+### The method, at any scale
 
 | | |
 |---|---|
-| ladder | `name-fruit` -> `name-color` -> `name-quality` -> `name-all` -> `describe-one` -> `mutual` -> `order` -> `haggle` -> `bargain` -> `market` |
+| ladder | `name-fruit` -> `name-color` -> `name-quality` -> `name-all` -> `mutual` -> `order` -> `haggle` -> `bargain` -> `market` |
+| naming rungs | each adds a kind of round and keeps drawing the ones below it; judged on the kind it adds, and on still naming the rest |
+| speaker costs | off until `mutual` (`reward.costs_from_rung`): length, rarity, coining and the convention bonus are pressures on words that exist |
 | things to name | 4 fruits x 4 colours x 4 qualities = 64 combinations, of which 16 are reserved and never trained on |
 | population | one pool until `order`, where each agent is copied into a farmer and a buyer, both fluent in the language the pool learned |
-| community | founded by 2 farmers + 2 buyers; a newcomer of each role joins every 40 updates after the first rung, up to 6 + 6 |
-| brain | 2-layer transformer, width 48, ~52k parameters, randomly initialised |
-| batch | 256 episodes per training update, every rung |
 | lifespan | 900-1,600 training updates |
 | channel | atoms + hyphen / space / end; words are hyphen-joined atoms, an utterance is space-separated words; a 24-symbol buffer, not a cap |
-| run ceiling | 6M episodes (~23k updates); each rung has its own budget, and a rung that exhausts it stops the run with a report |
+| length cost | per atom after the first in a word, plus a tenth of that per word: short words, not short sentences |
+| promotion | per seat, on evidence; `name-all` and `mutual` also need success on the reserved combinations |
 
-These are the sizes the CPU runs that worked were made at. The configuration has
-to be one a CPU can test, and a larger size on the GPU would be a second version
-again.
-
-**A run may change only how long it runs, its seed, its device and its output**
-(`RUN_KEYS` in `config.py`). Anything else -- sizes included -- is printed as a
-**method change** in the run header and in the report's summary statistics, so
-a run that changed what is simulated cannot be mistaken for one that did not.
-`configs/` holds only named experiments (`duality.json`: 12 varieties and 8
-atoms, so no atom can name a whole meaning -- unvalidated; treat it as the
-experiment, not the baseline). `tests/test_config.py` enforces all of this.
+**Anything outside the scale keys is a method change**, and both the run header
+and the report's summary statistics name it. `configs/duality.json` is a
+declared experiment (12 fruits against 8 atoms, so no atom can name a whole
+thing -- unvalidated; treat it as the experiment, not the baseline).
 
 **Everything that means an amount of learning is counted in training updates**
 (one update = one batch): rung budgets, promotion checks (every 25), checkpoints
@@ -175,7 +209,8 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | setting | what it does |
 |---|---|
 | `--curriculum on\|off` | the referential-then-trading ladder. Off means the full task from random weights, which has not been made to work. |
-| `population.founders_farmers/_buyers`, `population.grow_every_updates` | found the community small and grow it after the first rung. 0 founders = start at full size. |
+| `population.founders_farmers/_buyers`, `population.grow_from_rung`, `population.grow_every_updates` | found the community small and grow it from the named rung on. 0 founders = start at full size. |
+| `reward.costs_from_rung` | the rung from which the speaker pays for length, rarity and coining, and is paid for agreeing. Off below it. |
 | `curriculum.hard_distractor_frac` | share of lineup rounds built as one-field near misses, so every field (quantity included) has to be named. |
 | `curriculum.holdout_tuple_frac` | share of (variety, quantity, quality) combinations never trained on: the productivity test. |
 | `curriculum.min_field_transfer`, `curriculum.mutual_qty_tol` | the mutual rung checks every field for every role, quantity exactly. |
@@ -205,11 +240,12 @@ Runs start on a lineup game and work up to the full market. Nothing is
 reinitialised between rungs; the same population carries its weights forward.
 
 Each rung has its own (min, max) budget in training updates -- 80 to 2,500 for
-the single-field naming rungs, 80 to 2,500 for `name-all`, `describe-one` and
-`order`, 80 to 3,500 for `mutual`, `haggle` and `bargain`, open for `market`.
-Promotion needs success clear of chance and the muted-channel control showing a
-real drop; in every lineup rung and `mutual` that is checked separately for each
-seat. `name-all` and `mutual` additionally need structure (topsim clear of its
+the naming rungs and `order`, 80 to 3,500 for `mutual`, `haggle` and `bargain`,
+open for `market`. Promotion needs success clear of chance and the muted-channel
+control showing a real drop; in every lineup rung and `mutual` that is checked
+separately for each seat. A rung that mixes kinds of round is measured on the
+kind it introduced, and every kind it rehearses has its own `still names ...`
+check. `name-all` and `mutual` additionally need structure (topsim clear of its
 shuffled null, coverage of every field) and **success on the reserved
 combinations** -- at least 60% of the rate on trained ones. That last one is
 what a code of whole-thing names cannot pass.

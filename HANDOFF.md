@@ -18,18 +18,26 @@ python -m orchard.run --benchmark              # this machine's speed per rung
 bash cloud_run.sh                              # the run
 ```
 
-The user runs **GPU only**, and wants the CPU and GPU versions to be **exactly
-the same**. So there is **one configuration**: the defaults in
-`orchard/config.py`, sizes included (2 + 2 founders growing to 6 + 6, d48 L2,
-batch 256 -- the scale of the CPU runs that worked, and one a CPU can test). A
-GPU runs it faster; that is the only difference. There is no device-specific
-arithmetic (bf16 and TF32 were removed; `hardware.setup` pins fp32). A run may
-change only `RUN_KEYS` (length, seed, device, output); anything else, sizes
-included, is printed as a method change in the header and the report.
-`configs/` holds only named experiments (`duality.json`). **Test on the CPU with
-exactly the configuration the GPU runs** (`python -m orchard.run`), never with a
-smaller "CPU version"; `tests/test_config.py` enforces the rest. Every schedule
-is counted in training updates (section 4 item 10).
+The user runs **GPU only** and wants no *functional* difference between what a
+CPU check runs and what the GPU runs -- but does want GPU-sized runs. So the
+split is:
+
+* **the method** -- world, ladder, rewards, channel, schedules -- lives in the
+  defaults in `orchard/config.py` and is identical everywhere. No device-specific
+  arithmetic (bf16 and TF32 were removed; `hardware.setup` pins fp32), no
+  device-specific code path outside printing.
+* **the scale** -- community, brain, batch, run length, output volume
+  (`SCALE_KEYS`) -- is chosen by a preset in `configs/`: `gpu_small` (12 + 12),
+  `gpu_community` (32 + 32), `gpu_large` (64 + 64), or none for the reference
+  scale (6 + 6, batch 256), which is the one a CPU can check in reasonable time.
+
+The run header prints a `scale` line and a `method` line separately, and
+`tests/test_config.py` fails if a preset changes anything but scale, as well as
+checking that every preset runs the same ladder, world and held-out set. **When
+testing behaviour on a CPU, use the reference scale** (`python -m orchard.run`)
+and say which scale any claim was measured at. Every schedule is counted in
+training updates (section 4 item 10), so they mean the same thing at every batch
+size.
 
 ---
 
@@ -69,7 +77,8 @@ transmission bottleneck (newborns learn from transcripts, never weights).
 
 | piece | where | why |
 |---|---|---|
-| rungs: `name-fruit`, `name-color`, `name-quality`, `name-all`, `describe-one`, `mutual`, `order`, `haggle`, `bargain`, `market` | `curriculum.py` | naming is taught one field at a time before anything is traded; `order` (farmer fills the buyer's order with its deal heads) was added because `haggle` needed deal heads nothing had trained |
+| rungs: `name-fruit`, `name-color`, `name-quality`, `name-all`, `mutual`, `order`, `haggle`, `bargain`, `market` | `curriculum.py` | naming is taught one field at a time before anything is traded, each rung *adding* its field to the ones already drilled (`Phase.mix`) rather than swapping to it; `order` (farmer fills the buyer's order with its deal heads) was added because `haggle` needed deal heads nothing had trained |
+| speaker costs and newcomers wait for `mutual` | `reward.costs_from_rung`, `population.grow_from_rung` | with the costs on from the second rung the population collapsed onto one one-atom word and colour never left chance; with the community growing through that rung every newcomer apprenticed on a code that was about to be replaced |
 | a thing is **(fruit, colour, quality)**, 4 x 4 x 4, and a quarter of the combinations (a Latin square) are never trained on | `world.ComboHoldout` | separate fields are what make an adjective worth inventing; the reserved combinations are the productivity test, and the Latin square keeps every lineup free of candidates that could not be the answer |
 | **one pool of agents** until `order`, then each is copied into a farmer and a buyer | `Population.split_roles` | one language rather than two to reconcile |
 | length charged **per atom after the first in a word**, much less per word | `env.length_cost` | a fused name is one long word; naming the parts is several short ones, and must not be taxed for it |
@@ -215,9 +224,10 @@ What to check, rung by rung (`promotions.jsonl` in the run folder has every chec
   success on reserved ones. A code of whole-thing names shows a wide gap and
   will stall here -- that is the gate doing its job, not a bug. Also watch each
   seat's **field coverage** (fruit / colour / quality).
-- **`describe-one`**: one word has to mean a colour whichever round it is asked
-  in. If `name-all` passed and this stalls, the code is positional rather than
-  lexical (the report's word-classes row will show it).
+- **rehearsal**: every mixed rung prints a `still names fruit` / `still names
+  colour` check alongside its own. A rung whose own kind climbs while a
+  rehearsed one falls back to chance is forgetting, not learning -- the mixture
+  weights in `Phase.mix` are the dial for that.
 - **`mutual`**: both report the other's thing; gated on held-out too. This is
   where hindsight feedback switches on -- the first rung whose behaviour it can
   explain.

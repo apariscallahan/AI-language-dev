@@ -363,6 +363,16 @@ class RewardConfig:
     # chance -- a population that size needs founding small (see
     # population.founders_*), after which the bonus is fully on anyway.
     convention_gated: bool = True
+    # The rung from which the speaker pays for length, rarity and coining, and is
+    # paid for agreeing. Off below it. Measured: with the costs on from the
+    # second rung, the population collapsed onto one one-atom word (coherence
+    # 1.000, 1.0 atoms per word, 17 distinct words among 15 speakers) and colour
+    # never left chance -- the cheapest way to agree, before a word for colour
+    # exists, is for everyone to say the same short nothing. The naming rungs are
+    # where the words have to be invented; the pressure to make them short and
+    # shared belongs after that, and `mutual` is where two speakers first have to
+    # understand each other at once.
+    costs_from_rung: str = "mutual"
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -407,7 +417,6 @@ class CurriculumConfig:
         "name-color": [80, 1500],
         "name-quality": [80, 1500],
         "name-all": [80, 2500],
-        "describe-one": [80, 2500],
         "mutual": [80, 3500],
         "order": [80, 2500],
         "haggle": [80, 3500],
@@ -477,6 +486,13 @@ class PopulationConfig:
     # and two invent one in ~80k. 0 = start at full size.
     founders_farmers: int = 2
     founders_buyers: int = 2
+    # The rung from which newcomers start arriving. Every newborn is taught from
+    # the store of what the community has said, so growing during a rung whose
+    # words do not exist yet fills the community with apprentices of a code that
+    # is about to be replaced: the GPU run grew 2 -> 15 across the colour rung
+    # and stayed at chance throughout. The founders take the naming rungs; the
+    # community arrives to inherit a language that already works.
+    grow_from_rung: str = "mutual"
     grow_every_updates: int = 40
     turnover: bool = True                 # master switch for birth/death (spec 9)
     # In training updates the agent took part in: how much it has learned, the
@@ -964,6 +980,8 @@ def validate(cfg: Config) -> None:
     assert p.lifespan_min <= p.lifespan_max
     from .curriculum import phase_named
     phase_named(cfg, cfg.train.hindsight_from_rung)          # must name a rung
+    phase_named(cfg, cfg.reward.costs_from_rung)
+    phase_named(cfg, cfg.population.grow_from_rung)
     for name, (lo, hi) in dict(cfg.curriculum.rung_budget_updates).items():
         assert 0 <= int(lo) <= int(hi), "rung %s: budget must be (min, max) updates" % name
     assert cfg.curriculum.check_every_updates >= 1

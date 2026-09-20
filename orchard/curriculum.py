@@ -102,12 +102,16 @@ class Phase:
     # Who describes in a lineup rung, alternated batch by batch via
     # :meth:`with_informer` so every agent does both jobs.
     informer: int = FARMER
-    # Which field a lineup round turns on: 0 fruit, 1 colour, 2 quality; None
-    # means the candidates differ in any of them. ``mixed_query`` draws it per
-    # round instead -- the rung where one word has to serve whichever field is
-    # asked, which is where an adjective earns its keep.
-    query: "int | None" = None
-    mixed_query: bool = False
+    # What kinds of round this rung is made of, as weights over
+    # (fruit, colour, quality, all-fields). A naming rung *adds* a kind and keeps
+    # rehearsing the ones below it: switching outright cost the run its fruit
+    # code and its gradient at once -- the messages still carried fruit
+    # (coverage 0.40) and nothing else, at chance, for 500 updates.
+    mix: tuple = (0.0, 0.0, 0.0, 1.0)
+    # The kind this rung introduces: 0 fruit, 1 colour, 2 quality, 3 all fields.
+    # Promotion is judged on *this* kind, so acing the rehearsal cannot carry a
+    # rung whose new job is not being done.
+    primary: int = 3
 
     # ---- what kind of game this is --------------------------------------
     @property
@@ -136,6 +140,32 @@ class Phase:
     def naming(self) -> bool:
         """A rung whose whole job is learning to name things."""
         return self.referential or self.mutual
+
+    @property
+    def query(self) -> "int | None":
+        """The single field this rung is about, if it is about one."""
+        return None if self.primary >= ASK_ALL else self.primary
+
+    @property
+    def mixed_query(self) -> bool:
+        """Does this rung ask about different fields in different rounds?"""
+        return sum(1 for w in self.mix if w > 0) > 1
+
+    @property
+    def kinds(self) -> tuple:
+        """The kinds of round this rung draws, commonest first."""
+        return tuple(sorted((i for i, w in enumerate(self.mix) if w > 0),
+                            key=lambda i: -self.mix[i]))
+
+    @property
+    def rehearsed(self) -> tuple:
+        """The kinds carried over from earlier rungs -- what must not be lost."""
+        return tuple(k for k in self.kinds if k != self.primary)
+
+    @property
+    def whole(self) -> bool:
+        """Is this rung's own job to name a whole (fruit, colour, quality)?"""
+        return self.naming and self.primary >= ASK_ALL
 
     @property
     def trading(self) -> bool:
@@ -238,31 +268,32 @@ def ladder(cfg: Config) -> list[Phase]:
     return [
         Phase("name-fruit", 0, 1, True, False, False,
               "lineup game over fruit alone: the candidates share colour and "
-              "quality, so only the fruit needs saying", kind=KIND_SWAP, query=0),
+              "quality, so only the fruit needs saying",
+              kind=KIND_SWAP, mix=(1.0, 0.0, 0.0, 0.0), primary=0),
         Phase("name-color", 1, 1, True, False, False,
-              "the same, over colour alone: same fruit, same quality, different "
-              "colours -- a word for a colour and nothing else", kind=KIND_SWAP, query=1),
+              "colour rounds added to fruit ones: a word for a colour and nothing "
+              "else, while the fruit words stay in use and stay needed",
+              kind=KIND_SWAP, mix=(0.4, 0.6, 0.0, 0.0), primary=1),
         Phase("name-quality", 2, 1, True, False, False,
-              "the same, over quality alone", kind=KIND_SWAP, query=2),
+              "quality rounds added: every round still asks about one field, but "
+              "which field changes, so a word has to mean the same thing wherever "
+              "it appears", kind=KIND_SWAP, mix=(0.25, 0.25, 0.5, 0.0), primary=2),
         Phase("name-all", 3, 1, True, False, False,
-              "candidates differing in any field, mostly one-field near misses: "
-              "the whole (fruit, colour, quality) has to be named at once",
-              kind=KIND_SWAP),
-        Phase("describe-one", 4, 1, True, False, False,
-              "the asked-about field changes round by round, so one word has to "
-              "mean a colour wherever it appears -- including on combinations "
-              "never seen in training", kind=KIND_SWAP, mixed_query=True),
-        Phase("mutual", 5, 2, True, False, False,
+              "rounds where the candidates differ in any field, mostly one-field "
+              "near misses, so the whole (fruit, colour, quality) has to be named "
+              "at once -- with single-field rounds still mixed in",
+              kind=KIND_SWAP, mix=(0.1, 0.1, 0.1, 0.7), primary=3),
+        Phase("mutual", 4, 2, True, False, False,
               "both hold a private thing and each must report the other's; "
               "no price, no accept/reject", kind=KIND_MUTUAL),
-        Phase("order", 6, 1, False, False, False,
+        Phase("order", 5, 1, False, False, False,
               "trading begins: the buyer asks for a fruit, a colour and a "
               "quantity; the farmer must fill the order exactly", kind=KIND_ORDER),
-        Phase("haggle", 7, 2, False, True, False,
+        Phase("haggle", 6, 2, False, True, False,
               "price and budget appear; one message each, then accept or walk"),
-        Phase("bargain", 8, full, False, True, False,
+        Phase("bargain", 7, full, False, True, False,
               "several turns, so counter-offers are possible"),
-        Phase("market", 9, full, False, True, True,
+        Phase("market", 8, full, False, True, True,
               "the full economy: stock, restocking, viability"),
     ]
 
@@ -279,6 +310,16 @@ def hindsight_applies(cfg: Config, phase: Phase) -> bool:
     if cfg.train.hindsight_coef <= 0:
         return False
     return phase.index >= phase_named(cfg, cfg.train.hindsight_from_rung).index
+
+
+def costs_apply(cfg: Config, phase: Phase) -> bool:
+    """Does the speaker pay for what it says in this rung? (``reward.costs_from_rung``)"""
+    return phase.index >= phase_named(cfg, cfg.reward.costs_from_rung).index
+
+
+def growth_applies(cfg: Config, phase: Phase) -> bool:
+    """May newcomers join in this rung? (``population.grow_from_rung``)"""
+    return phase.index >= phase_named(cfg, cfg.population.grow_from_rung).index
 
 
 def rung_budget(cfg: Config, phase: Phase) -> tuple[int, int]:
@@ -341,17 +382,27 @@ class Promotion:
         return passed, {k: {"met": v[0], "detail": v[1]} for k, v in checks.items()}
 
 
+def round_chance(cfg: Config, kind: Optional[int]) -> float:
+    """One in how many candidates, by luck alone, in a round of this kind.
+
+    A lineup cannot be wider than the field it varies: over four colours a
+    colour round is one in three only because three candidates were asked for.
+    """
+    K = max(2, cfg.curriculum.n_candidates)
+    if kind is not None and int(kind) < ASK_ALL:
+        span = (cfg.world.n_varieties, cfg.world.n_colors, cfg.world.n_quality)
+        K = min(K, span[int(kind)])
+    return 1.0 / K
+
+
 def promotion_for(cfg: Config, phase: Phase) -> Promotion:
     c = cfg.curriculum
     lo, hi = rung_budget(cfg, phase)
     if phase.referential:
-        span = (cfg.world.n_varieties, cfg.world.n_colors, cfg.world.n_quality)
-        K = max(2, c.n_candidates)
-        if phase.query is not None:
-            K = min(K, span[phase.query])
-        elif phase.mixed_query:
-            K = min([K] + [span[f] for f in range(3)])
-        chance = 1.0 / K
+        # Judged on the kind the rung introduces, not on its mixture: by then the
+        # rehearsal is easy, and pooled success would carry a rung that never did
+        # its own job. What the rehearsal has to show is checked separately.
+        chance = round_chance(cfg, phase.primary)
         return Promotion(
             min_success=max(c.refer_min_success, 2.0 * chance),
             min_success_over_chance=c.min_success_over_chance,
@@ -424,7 +475,7 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     # once. A rung that varies one field has nothing to be compositional *about*:
     # what it has to show is that the word works, and keeps working on
     # combinations never trained on (the held-out check below).
-    whole_thing = phase.swaps and phase.query is None and not phase.mixed_query
+    whole_thing = phase.swaps and phase.whole
     for role, label in ((FARMER, "farmer"), (BUYER, "buyer")):
         d = ev.get("speakers", {}).get(label, {})
         ts, nl, pos = _num(d.get("topsim")), _num(d.get("null")), _num(d.get("positional"))
@@ -480,6 +531,20 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
                     t == t and t >= c.min_field_transfer,
                     "%s of headroom over a muted channel, need %.2f"
                     % (_fmt(t), c.min_field_transfer))
+    # Nothing learned lower down may be dropped to pick this rung up. Every kind
+    # of round the rung rehearses is scored on its own and has to stay clearly
+    # above chance: forgetting the fruit words while learning colour is not
+    # progress, and one pooled number hides it.
+    by_kind = ev.get("by_kind") or {}
+    for kind in phase.rehearsed:
+        d = by_kind.get(kind, by_kind.get(str(kind)))
+        if not d:
+            continue
+        s, ch = _num(d.get("success")), round_chance(cfg, kind)
+        checks["still names %s" % ROUND_NAMES[kind]] = (
+            s == s and s >= k * ch,
+            "%s on %s rounds, need %.1fx chance %.3f"
+            % (_fmt(s), ROUND_NAMES[kind], k, ch))
     if phase.mutual:
         succ, chance = _num(ev.get("success")), _num(ev.get("chance"))
         checks["both decode in the same round"] = (
@@ -487,8 +552,7 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
             and (chance != chance or succ >= k * chance),
             "%s, need %.3f and %.1fx the muted rate %s"
             % (_fmt(succ), rule.min_success, k, _fmt(chance)))
-    whole = (phase.mutual or (phase.swaps and phase.query is None
-                              and not phase.mixed_query))
+    whole = phase.whole
     if whole:
         # The productivity gate, on the rungs that describe a whole thing. Every
         # candidate in a held-out round is a combination nobody ever trained on,
@@ -541,6 +605,7 @@ def phase_schema(cfg: Config, role: int, phase: Phase) -> list[int]:
 # the lineup game
 # ==========================================================================
 ASK_ALL = 3          # the query slot's value when the whole thing is asked for
+ROUND_NAMES = ("fruit", "colour", "quality", "whole things")
 
 
 @dataclass
@@ -647,10 +712,8 @@ class ReferentialWorld:
         return K
 
     def chance(self, phase) -> float:
-        """One in how many, by luck alone, on this rung."""
-        if phase.mixed_query:
-            return 1.0 / min(self._n_candidates(f) for f in range(3))
-        return 1.0 / self._n_candidates(phase.query)
+        """One in how many, by luck alone, on the kind this rung is judged on."""
+        return round_chance(self.cfg, getattr(phase, "primary", None))
 
     def sample_mutual(self, n: int, held_out: bool = False) -> "MutualBatch":
         """Two private things per round, drawn independently."""
@@ -787,37 +850,49 @@ class ReferentialWorld:
         return torch.cat(members, dim=1)
 
     def sample(self, n: int, informer: int = FARMER, held_out: bool = False,
-               hard_frac: Optional[float] = None,
+               hard_frac: Optional[float] = None, mix: "tuple | None" = None,
                query: "int | None" = None, mixed_query: bool = False
                ) -> ReferentialBatch:
-        """One batch of lineup rounds.
+        """One batch of lineup rounds, mixed as the rung asks.
 
-        ``query`` fixes the field the round turns on (a naming rung);
-        ``mixed_query`` draws it per round (the rung where one word has to serve
-        whichever field is asked); neither means an open round.
+        ``mix`` weights the four kinds of round -- fruit, colour, quality, all
+        fields -- and is how a rung adds a field without dropping the ones
+        below it. ``query`` forces a single kind (used by the probes, which ask
+        about one field at a time).
         """
-        if mixed_query:
-            # One lineup width for every field, so a round cannot be told apart by
-            # how many candidates it has.
-            K = min(self._n_candidates(f) for f in range(3))
-            q = torch.randint(0, 3, (n,), device=self.device, generator=self.gen)
-            cand = torch.zeros((n, K, 3), dtype=torch.long, device=self.device)
-            target = torch.zeros(n, dtype=torch.long, device=self.device)
-            for f in range(3):
-                m = q == f
-                k = int(m.sum())
-                if not k:
-                    continue
-                c, t = self._query_round(k, f, held_out)
-                cand[m] = c[:, :K]
-                target[m] = t
-        elif query is None:
-            p = self.cfg.curriculum.hard_distractor_frac if hard_frac is None else hard_frac
-            cand, target = self._open_round(n, held_out, 0.0 if held_out else p)
-            q = torch.full((n,), ASK_ALL, dtype=torch.long, device=self.device)
-        else:
-            q = torch.full((n,), int(query), dtype=torch.long, device=self.device)
-            cand, target = self._query_round(n, int(query), held_out)
+        if query is not None:
+            mix = tuple(1.0 if i == int(query) else 0.0 for i in range(4))
+        elif mixed_query and mix is None:
+            mix = (1 / 3, 1 / 3, 1 / 3, 0.0)
+        elif mix is None:
+            mix = (0.0, 0.0, 0.0, 1.0)
+        total = float(sum(mix)) or 1.0
+        counts = [int(round(n * w / total)) for w in mix]
+        counts[max(range(4), key=lambda i: counts[i])] += n - sum(counts)
+
+        K = min([self._n_candidates(f) for f in range(3)] + [self._n_candidates(None)])
+        cand = torch.zeros((n, K, 3), dtype=torch.long, device=self.device)
+        target = torch.zeros(n, dtype=torch.long, device=self.device)
+        q = torch.zeros(n, dtype=torch.long, device=self.device)
+        at = 0
+        for kind, k in enumerate(counts):
+            if k <= 0:
+                continue
+            sl = slice(at, at + k)
+            if kind == ASK_ALL:
+                p = (self.cfg.curriculum.hard_distractor_frac if hard_frac is None
+                     else hard_frac)
+                c, t = self._open_round(k, held_out, 0.0 if held_out else p)
+            else:
+                c, t = self._query_round(k, kind, held_out)
+            cand[sl] = c[:, :K]
+            target[sl] = t
+            q[sl] = kind
+            at += k
+        # Shuffle so a round's kind is not its position in the batch: the agents
+        # are paired by index, and a sorted batch would hand each agent one kind.
+        order = torch.randperm(n, device=self.device, generator=self.gen)
+        cand, target, q = cand[order], target[order], q[order]
         rows = torch.arange(n, device=self.device)
         truth = cand[rows, target]
         return ReferentialBatch(meanings=cand, target=target, query=q,

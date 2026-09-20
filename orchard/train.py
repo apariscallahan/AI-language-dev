@@ -35,8 +35,9 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
-from .curriculum import (CurriculumState, ReferentialWorld, evaluate_rung, ladder,
-                         promotion_for, rung_budget)
+from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
+                         evaluate_rung, growth_applies, ladder, promotion_for,
+                         rung_budget)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -359,18 +360,46 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def phase_sampler(self, phase):
-        """How one view of a phase draws rounds -- lineups, mutual pairs, or trades."""
+        """How a *measurement* of this rung draws rounds.
+
+        A naming rung mixes kinds of round -- the one it introduces and the ones
+        it rehearses -- but it is judged on the one it introduces, so this draws
+        that kind alone. Training draws the whole mixture
+        (:meth:`train_sampler`); the rehearsal is measured kind by kind
+        (:meth:`kind_sampler`).
+        """
         rw = self.referential_world
         if phase.referential and rw is not None:
             return lambda n, held_out=False: rw.sample(
                 n, informer=phase.informer, held_out=bool(held_out),
-                query=phase.query, mixed_query=phase.mixed_query)
+                query=phase.primary)
         if phase.mutual and rw is not None:
             return lambda n, held_out=False: rw.sample_mutual(n, held_out=bool(held_out))
         if self.tensor_world is not None:
             return lambda n, held_out=False: self.tensor_world.sample(
                 n, held_out=bool(held_out))
         return None
+
+    def train_sampler(self, phase):
+        """How training draws rounds: the rung's whole mixture.
+
+        Adding a kind of round rather than swapping to it is what keeps the words
+        already learned in use -- and keeps a gradient flowing while the new kind
+        is still at chance.
+        """
+        rw = self.referential_world
+        if phase.referential and rw is not None:
+            return lambda n, held_out=False: rw.sample(
+                n, informer=phase.informer, held_out=bool(held_out), mix=phase.mix)
+        return self.phase_sampler(phase)
+
+    def kind_sampler(self, phase, kind: int):
+        """One kind of round only, for measuring a rung's parts apart."""
+        rw = self.referential_world
+        if not (phase.referential and rw is not None):
+            return None
+        return lambda n, held_out=False: rw.sample(
+            n, informer=phase.informer, held_out=bool(held_out), query=int(kind))
 
     def _context_consistency(self, phase) -> dict[str, Any]:
         """Only meaningful once buyers have spoken in a trade context too."""
@@ -398,7 +427,7 @@ class Trainer:
         if phase.referential and rw is not None:
             return lambda n, held_out=False: rw.sample(
                 n, informer=phase.informer, held_out=bool(held_out), hard_frac=0.0,
-                query=phase.query, mixed_query=phase.mixed_query)
+                query=phase.primary)
         return self.phase_sampler(phase)
 
     def holdout_sampler(self, phase):
@@ -423,6 +452,7 @@ class Trainer:
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
+            kind_sampler_for=(None if light else self.kind_sampler),
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
             device=self.device, rng=self.eval_rng)
@@ -436,7 +466,7 @@ class Trainer:
         phase = cur.phase
         lo, hi = rung_budget(self.cfg, phase)
         passed, checks = evaluate_rung(self.cfg, phase, evidence, cur.updates_in_phase)
-        if cur.index > 0 and not self.pop.full_size:
+        if self.growing_now:
             # every rung after the first is judged on the whole community
             p = self.cfg.population
             checks["community at full size"] = {
@@ -463,7 +493,7 @@ class Trainer:
             done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
             self.rung_success = RollingStat(window=2000)
-            self.cost_gate = 1.0
+            self.update_cost_gate()
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
             cur.transitions[-1]["updates_in_previous_phase"] = done_updates
             cur.transitions[-1]["update"] = self.updates
@@ -642,9 +672,10 @@ class Trainer:
         """Newcomers join once the founders have a working language."""
         if self.pop.full_size:
             return
+        if self.cfg.curriculum.enabled and not growth_applies(
+                self.cfg, self.curriculum.phase):
+            return                         # the founders are still inventing it
         if self._next_grow is None:
-            if self.cfg.curriculum.enabled and self.curriculum.index == 0:
-                return                     # the founders are still inventing it
             self._next_grow = self.updates
         if self.updates < self._next_grow:
             return
@@ -683,11 +714,30 @@ class Trainer:
                                    "farmers": len(self.pop.farmers),
                                    "buyers": len(self.pop.buyers)})
 
-    def update_cost_gate(self, succ: torch.Tensor) -> None:
-        """Speaker costs: off through the first rung, on once it has been passed."""
-        cur = self.curriculum
-        if cur.index > 0 or not self.cfg.curriculum.enabled:
+    @property
+    def growing_now(self) -> bool:
+        """Is the community still filling up, in a rung where it may?
+
+        Nothing charges a rung for the time it spends growing: a bigger
+        community would otherwise stall on growth alone (32 newcomers at one
+        every 40 updates is 1,280 updates), and cannot be judged before the
+        strangers it has to work for have arrived.
+        """
+        return (self.cfg.curriculum.enabled and not self.pop.full_size
+                and growth_applies(self.cfg, self.curriculum.phase))
+
+    def update_cost_gate(self, succ: torch.Tensor = None) -> None:
+        """Speaker costs: off until ``reward.costs_from_rung``, on from there.
+
+        Nothing is charged for while the words are still being invented. Making
+        a word short, rare-free and shared is a pressure on a word that exists;
+        applied earlier it is a pressure to say as little as possible, which the
+        population can satisfy completely without naming anything.
+        """
+        if not self.cfg.curriculum.enabled:
             self.cost_gate = 1.0
+            return
+        self.cost_gate = 1.0 if costs_apply(self.cfg, self.curriculum.phase) else 0.0
 
     def maybe_check_promotion(self) -> None:
         """The light, frequent check -- so a rung that has worked is left promptly."""
@@ -757,17 +807,19 @@ class Trainer:
         if c.population.founders_farmers or c.population.founders_buyers:
             if self.pop.shared:
                 L("population         : one pool of %d agents, both seats of every "
-                  "lineup; grows to %d after the first rung (one every %d updates), "
+                  "lineup; grows to %d from `%s` on (one every %d updates), "
                   "then splits at `%s` into %d farmers + %d buyers"
                   % (len(self.pop.farmers), max(c.population.n_farmers,
                                                 c.population.n_buyers),
-                     c.population.grow_every_updates, c.curriculum.split_roles_at,
+                     c.population.grow_from_rung, c.population.grow_every_updates,
+                     c.curriculum.split_roles_at,
                      c.population.n_farmers, c.population.n_buyers))
             else:
-                L("population         : %d farmers, %d buyers; grows to %d + %d "
-                  "(one of each every %d updates)"
+                L("population         : %d farmers, %d buyers; grows to %d + %d from "
+                  "`%s` on (one of each every %d updates)"
                   % (len(self.pop.farmers), len(self.pop.buyers), c.population.n_farmers,
-                     c.population.n_buyers, c.population.grow_every_updates))
+                     c.population.n_buyers, c.population.grow_from_rung,
+                     c.population.grow_every_updates))
         else:
             L("population         : %d farmers, %d buyers"
               % (c.population.n_farmers, c.population.n_buyers))
@@ -819,9 +871,10 @@ class Trainer:
               "%d updates; on a rung's max without meeting its criteria: %s)"
               % (c.curriculum.check_every_updates, c.curriculum.on_stall))
         L("speaker pressures  : %.3f per atom after the first in a word, %.3f per word, "
-          "up to %.3f per novel word, %.3f for matching the population's convention"
+          "up to %.3f per novel word, %.3f for matching the population's convention; "
+          "all of it from `%s` on, off while the words are still being invented"
           % (c.reward.atom_cost, c.reward.word_cost, c.reward.rarity_cost,
-             c.reward.convention))
+             c.reward.convention, c.reward.costs_from_rung))
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
@@ -1344,8 +1397,7 @@ class Trainer:
         total = self.cfg.train.episodes
         eta = (total - self.episode) / rate / 3600 if rate > 0 else float("nan")
         cur = self.curriculum
-        growing = ("" if self.pop.full_size or cur.index == 0 else
-                   ", budget waits for full size")
+        growing = ", budget waits for full size" if self.growing_now else ""
         gpu = ""
         if self.torch_device.type == "cuda":
             peak = torch.cuda.max_memory_allocated(self.torch_device) / 1e9
@@ -1385,11 +1437,12 @@ class Trainer:
                "; ".join(roles) or "no speakers probed"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "
-            "%s words/utterance, %s at buffer end"
+            "%s words/utterance, %s silent, %s at buffer end"
             % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
                w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
                f(w.get("mean_words_per_message"), "%.2f"),
+               f(100 * w.get("silent_frac", float("nan")), "%.0f%%"),
                f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%")))
 
     def batch_size_for(self, rung) -> int:
@@ -1418,8 +1471,7 @@ class Trainer:
             if phase.referential:
                 # A lineup: no market, no stock, no price -- just things to name.
                 scen = self.referential_world.sample(
-                    n, informer=phase.informer, query=phase.query,
-                    mixed_query=phase.mixed_query)
+                    n, informer=phase.informer, mix=phase.mix)
             elif phase.mutual:
                 scen = self.referential_world.sample_mutual(n)
             elif not phase.use_market:
@@ -1490,11 +1542,10 @@ class Trainer:
             self.updates += 1
             self.episode += n
             self.curriculum.episodes_in_phase += n
-            if self.curriculum.index == 0 or self.pop.full_size:
-                # A rung after the first cannot pass until the community is at
-                # full size, so the time spent growing does not come out of its
-                # budget -- otherwise a bigger community would stall on growth
-                # alone (128 + 128 takes ~2,500 updates to grow).
+            if not self.growing_now:
+                # A rung that the community is still joining cannot pass until
+                # everyone has arrived, so that time does not come out of its
+                # budget (see `growing_now`).
                 self.curriculum.updates_in_phase += 1
             self.pop.turn_over(self.episode, on_birth=self.on_birth)
             self.maybe_grow()

@@ -34,32 +34,35 @@ a setting. `cloud_run.sh` only checks that a GPU is visible, writes to
 `runs/<UTC start time>_orchard/`, and resumes from that folder's latest snapshot
 if it is run again.
 
-### One configuration, on every device
+### One method, chosen scale
 
-**There is one configuration: the defaults in `orchard/config.py`.** A GPU and a
-CPU run exactly the same thing -- the same agents, brains, batch and schedule,
-in the same arithmetic (fp32 everywhere; there is no GPU-only precision mode).
-The GPU is just faster: about 100 training updates a minute on an RTX 4090,
-against 10-15 on a laptop CPU. So a CPU check tests exactly what a GPU run does,
-and nothing can work on one and not the other.
+**What is simulated lives in one place: the defaults in `orchard/config.py`** --
+the world, the ladder, the rewards, the channel and every schedule. A GPU and a
+CPU run the same code in the same fp32 arithmetic, with no device-specific path,
+so a CPU check tests what a GPU run does.
 
-The sizes are the ones the CPU runs that worked were made at, because the
-configuration has to be one a CPU can test:
+**How big it runs is a separate, declared choice.** The presets in `configs/`
+change the community, the brain, the batch, the run length and the amount of
+output -- and nothing else:
 
-| | |
-|---|---|
-| community | founded by 2 farmers + 2 buyers, grows to 6 + 6 after the first rung |
-| brain | 2-layer transformer, width 48, ~52k parameters, randomly initialised |
-| batch | 256 episodes per training update |
-| run ceiling | 6M episodes (~23k updates); each rung has its own budget |
+| preset | community | brain | batch | episodes |
+|---|---|---|---|---|
+| *(none)* | 2 -> 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M |
+| `gpu_small` | 2 -> 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M |
+| `gpu_community` | 2 -> 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M |
+| `gpu_large` | 2 -> 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M |
 
-A run may change how long it runs, its seed, its device and its output
-(`RUN_KEYS`). **Anything else -- sizes included -- is printed as a method change**
-in the run header and in the report's summary statistics, so a run that changed
-what is simulated cannot be mistaken for one that did not. `configs/` holds only
-named experiments that change a few settings on purpose (`duality.json`: 12
-varieties and 8 atoms, so an atom cannot name a whole meaning).
-`tests/test_config.py` enforces all of this.
+Every agent is the same shape at every scale: a pre-norm causal transformer
+(GELU feed-forward at four times the model width, learned positions, one
+attention mask over observation and dialogue) reading its private situation and
+everything said so far, with a head per decision. Randomly initialised, always.
+
+The run header prints the two separately -- a `scale` line and a `method` line
+-- so a big run and a small one can be compared, and neither can quietly become
+a different experiment. `tests/test_config.py` fails if a preset touches the
+method, and checks that every preset runs the same ladder, the same world and
+the same held-out set. `configs/duality.json` is a declared experiment (12
+fruits against 8 atoms) and says so in its header.
 
 **Everything that means an amount of learning is counted in training updates**
 (one update = one batch): rung budgets, how often promotion is checked,
@@ -397,19 +400,31 @@ comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
 
 So the task is built up, and a rung is only left behind once it has worked:
 
-Five of the ten rungs are about naming, and nothing is traded until they are
-done. Each is a lineup: the describer sees one thing, the guesser sees the
-candidates and picks. The describer alternates batch by batch, and below the
-trading rungs **both seats are filled from one pool of agents**, so there is one
-language rather than two that have to be reconciled afterwards.
+Four of the nine rungs are about naming, and nothing is traded until they are
+done. Each is a lineup: the describer sees one thing and which field it is being
+asked about, the guesser sees the candidates and picks. The describer alternates
+batch by batch, and below the trading rungs **both seats are filled from one pool
+of agents**, so there is one language rather than two that have to be reconciled
+afterwards.
 
-| rung | what is added | chance rate |
-|---|---|---|
-| `name-fruit` | a lineup whose candidates share colour and quality and differ only in fruit: only the fruit needs saying | 1/3 |
-| `name-color` | the same over colour alone -- same fruit, same quality, different colours. A word for a colour and nothing else. | 1/3 |
-| `name-quality` | the same over quality alone | 1/3 |
-| `name-all` | candidates differing in any field, mostly one-field near misses, so the whole (fruit, colour, quality) has to be named at once | 1/3 |
-| `describe-one` | the field being asked about changes round by round, so one word has to mean a colour *wherever* it appears | 1/3 |
+**A naming rung adds a kind of round; it never swaps to one.** `name-color` is
+60% colour rounds and 40% fruit rounds, so the fruit words stay in use and stay
+needed while the colour words are being invented. Swapping outright was tried
+and cost the run both things at once: the messages still carried fruit
+(coverage 0.40, 0.00, 0.00) because nothing asked for anything else, and colour
+sat at chance for 500 updates with almost no gradient to move it.
+
+Each rung is **promoted on the kind it introduces** -- by then the rehearsal is
+easy, and one pooled number would let a rung pass on work it did last time --
+and it must also show it **still names** everything below it, scored round-kind
+by round-kind. Forgetting fruit to learn colour is not progress.
+
+| rung | what is added | mixture | chance rate |
+|---|---|---|---|
+| `name-fruit` | a lineup whose candidates share colour and quality and differ only in fruit: only the fruit needs saying | all fruit | 1/3 |
+| `name-color` | colour rounds -- same fruit, same quality, different colours. A word for a colour and nothing else. | 60% colour, 40% fruit | 1/3 |
+| `name-quality` | quality rounds. Every round still asks one field, but which field changes, so a word has to mean the same thing wherever it appears. | 50/25/25 | 1/3 |
+| `name-all` | rounds where the candidates differ in any field, mostly one-field near misses, so the whole (fruit, colour, quality) is named at once | 70% all, 10% each single field | 1/3 |
 | `mutual` | both hold a private thing and each must report the other's; still no price, no accept/reject | measured (muted channel) |
 | `order` | trading begins and the pool splits into farmers and buyers, each carrying the language it learned: the buyer asks for a fruit, a colour and a quantity, and the farmer must fill the order exactly | measured (muted channel) |
 | `haggle` | price and budget, so accept/reject has a payoff — still one message each | ~0 |

@@ -306,14 +306,16 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
     rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
-    q = ASK_ALL
-    if phase is not None and getattr(phase, "query", None) is not None:
-        q = int(phase.query)
+    mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
+    total = float(sum(mix)) or 1.0
+    # The probe asks the fields the rung asks, as often as the rung asks them.
+    asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
+    asks = (asks + [ASK_ALL] * n)[:n]
+    perm = torch.randperm(n, generator=g).tolist()
+    asks = [asks[i] for i in perm]
     out = []
     for i, r in enumerate(rows):
-        if phase is not None and getattr(phase, "mixed_query", False):
-            q = i % 3                      # every field equally often
-        row = tuple(r) + (q,)
+        row = tuple(r) + (asks[i],)
         out.append(row + (0,) * (width - len(row)))
     return out
 
@@ -943,7 +945,8 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    sampler_for, n_eval: int, n_topsim: int, n_semantics: int,
                    chance: float, device: str = "cpu",
                    rng: Optional[random.Random] = None,
-                   holdout_sampler_for=None) -> dict[str, Any]:
+                   holdout_sampler_for=None,
+                   kind_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
     * per view (both describers, in a swap rung): intact / muted success and the
@@ -1022,6 +1025,28 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
+    # Each kind of round in the rung's mixture, scored on its own. A rung that
+    # adds colour to fruit is promoted on colour and has to show it can still do
+    # fruit; one number over both would let either hide behind the other.
+    out["by_kind"] = {}
+    if kind_sampler_for is not None and len(getattr(phase, "kinds", ())) > 1:
+        for kind in phase.kinds:
+            rates = []
+            for v in phase.views():
+                sam = kind_sampler_for(v, kind)
+                if sam is None:
+                    continue
+                try:
+                    r = evaluate_success(cfg, pop, world, max(128, n_eval // 3),
+                                         device=device, rng=rng, phase=v, sampler=sam)
+                except Exception:
+                    continue
+                if r.get("n"):
+                    rates.append(r["success_rate"])
+            if rates:
+                out["by_kind"][int(kind)] = {"success": sum(rates) / len(rates),
+                                             "views": len(rates)}
+
     if (phase.mutual or phase.order) and out["views"]:
         # no analytic chance for "report / fill a whole tuple": silence is the floor
         out["chance"] = out["views"][0]["muted_success"]

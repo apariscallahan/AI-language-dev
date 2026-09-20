@@ -32,11 +32,48 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
     def test_the_rungs_come_in_the_intended_order(self):
         cfg = Config()
         names = [p.name for p in ladder(cfg)]
-        self.assertEqual(names[:6], ["name-fruit", "name-color", "name-quality",
-                                     "name-all", "describe-one", "mutual"])
-        self.assertEqual([p.query for p in ladder(cfg)[:3]], [0, 1, 2])
-        self.assertIsNone(phase_named(cfg, "name-all").query)
-        self.assertTrue(phase_named(cfg, "describe-one").mixed_query)
+        self.assertEqual(names[:5], ["name-fruit", "name-color", "name-quality",
+                                     "name-all", "mutual"])
+        self.assertEqual([p.primary for p in ladder(cfg)[:4]], [0, 1, 2, 3])
+        self.assertTrue(phase_named(cfg, "name-all").whole)
+
+    def test_each_rung_adds_a_kind_of_round_and_keeps_the_ones_below_it(self):
+        """The scaffolding: nothing a rung taught is dropped by the next one."""
+        cfg = Config()
+        rungs = ladder(cfg)[:4]
+        for i, p in enumerate(rungs):
+            self.assertEqual(p.primary, i)
+            self.assertGreater(p.mix[i], 0.0, "%s does not draw its own kind" % p.name)
+            self.assertEqual(set(p.rehearsed), set(range(i)),
+                             "%s should rehearse %s" % (p.name, list(range(i))))
+            self.assertAlmostEqual(sum(p.mix), 1.0, places=6)
+            for j in range(i + 1, 4):
+                self.assertEqual(p.mix[j], 0.0,
+                                 "%s draws a kind it has not taught" % p.name)
+
+    def test_a_rung_draws_its_kinds_in_the_proportions_it_asks_for(self):
+        cfg = Config()
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
+        for p in ladder(cfg)[:4]:
+            rb = rw.sample(4096, mix=p.mix)
+            for kind, want in enumerate(p.mix):
+                got = float((rb.query == kind).float().mean())
+                self.assertAlmostEqual(got, want, places=2,
+                                       msg="%s: %s rounds" % (p.name, kind))
+
+    def test_costs_and_newcomers_wait_for_the_words_to_exist(self):
+        """Neither pressure applies while a rung's words are still being invented."""
+        from orchard.curriculum import costs_apply, growth_applies
+        cfg = Config()
+        for p in ladder(cfg):
+            if p.naming and p.primary < 3 or p.name == "name-all":
+                self.assertFalse(costs_apply(cfg, p),
+                                 "%s charges for speaking" % p.name)
+                self.assertFalse(growth_applies(cfg, p),
+                                 "%s grows the community" % p.name)
+        self.assertTrue(costs_apply(cfg, phase_named(cfg, "mutual")))
+        self.assertTrue(growth_applies(cfg, phase_named(cfg, "mutual")))
+        self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
 
     def test_a_query_round_varies_only_the_field_it_asks_about(self):
         cfg = Config()

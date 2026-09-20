@@ -16,6 +16,7 @@ import dataclasses
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -97,10 +98,24 @@ class TestOneConfiguration(unittest.TestCase):
         self.assertEqual(torch.get_float32_matmul_precision(), "highest")
 
     def test_the_launcher_uses_the_configuration(self):
+        """The launcher may pick a scale; it may not set anything itself."""
         sh = (ROOT / "cloud_run.sh").read_text(encoding="utf-8")
-        self.assertNotIn("configs/gpu_", sh)
-        self.assertNotIn(b"\r\n", (ROOT / "cloud_run.sh").read_bytes(),
-                         "cloud_run.sh must keep Unix line endings")
+        for preset in ("configs/gpu_small.json", "configs/gpu_community.json"):
+            self.assertTrue((ROOT / preset.split("/")[-1]).exists()
+                            or (ROOT / preset).exists(), "%s is missing" % preset)
+        # every --flag it passes has to be one a run may change
+        flags = set(re.findall(r"--([a-z-]+)", sh))
+        self.assertTrue(flags <= {"config", "out", "device", "quiet", "resume",
+                                  "seed", "benchmark", "episodes"},
+                        "cloud_run.sh passes %s" % sorted(flags))
+        # What a Linux GPU box checks out, not what this machine has: git
+        # converts to CRLF on a Windows checkout (core.autocrlf), and a CRLF
+        # cloud_run.sh dies on the box before it runs a line of it.
+        blob = subprocess.run(["git", "cat-file", "blob", "HEAD:cloud_run.sh"],
+                              cwd=str(ROOT), capture_output=True)
+        if blob.returncode == 0:
+            self.assertNotIn(b"\r\n", blob.stdout,
+                             "cloud_run.sh must be committed with Unix line endings")
 
 
 class TestSchedulesCountUpdates(unittest.TestCase):
@@ -115,6 +130,8 @@ class TestSchedulesCountUpdates(unittest.TestCase):
                     continue
                 if f.name.startswith("lifespan_"):
                     continue                    # documented as updates; tested below
+                if f.name.endswith("_from_rung"):
+                    continue                    # names a rung, not an amount of learning
                 self.assertTrue(f.name.endswith("_updates"),
                                 "%s.%s looks like a schedule but is not in updates"
                                 % (sect, f.name))
@@ -146,6 +163,7 @@ class TestGrowthDoesNotSpendTheBudget(unittest.TestCase):
         cfg.population.n_farmers = cfg.population.n_buyers = 3
         cfg.population.founders_farmers = cfg.population.founders_buyers = 1
         cfg.population.grow_every_updates = 2
+        cfg.population.grow_from_rung = "name-all"     # the rung this test runs in
         cfg.population.turnover = False
         cfg.bottleneck.enabled = False
         cfg.curriculum.start_phase = "name-all"
