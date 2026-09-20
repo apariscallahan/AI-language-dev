@@ -104,8 +104,8 @@ def render_transcript(cfg: Config, tr: Transcript, *, semantics=None,
     barn = barn_text(w, f)
     lines.append("%sFARMER sees: barn holds %s; will not sell below %.2f"
                  % (indent, barn, w.price_values[f.reservation]))
-    lines.append("%sBUYER  sees: wants %s x%d, quality >= %s, cannot pay above %.2f" % (
-        indent, w.variety_names[b.want_variety], b.need_qty,
+    lines.append("%sBUYER  sees: wants %s %s x%d, quality >= %s, cannot pay above %.2f" % (
+        indent, w.color_names[b.want_color], w.variety_names[b.want_variety], b.need_qty,
         w.quality_names[b.min_quality], w.price_values[b.max_price]))
     lines.append("%s--- channel ---" % indent)
     for turn in range(cfg.channel.n_turns):

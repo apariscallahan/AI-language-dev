@@ -1,188 +1,191 @@
-# Running Orchard on a GPU
+# Running Orchard
 
-Orchard runs on a GPU. Start a run over SSH, close the laptop, and come back to
-a report.
+Everything about *what* Orchard is and why it works the way it does is in
+**[README.md](README.md)**. This document is how to run it: the commands, what
+the output means, and what to do when something looks wrong.
+
+Orchard is meant for a GPU box. Start a run over SSH, close the laptop, come back
+to a report. The same code runs on a CPU, slower, and that is how it is tested.
 
 ---
 
-## 1. Ninety seconds to first output
+## 1. Install and first output
 
 ```bash
-git clone <your remote> orchard && cd orchard
-pip install torch numpy scipy matplotlib        # matplotlib is optional; see §8
-
-python -m orchard.run --smoke                   # no learning: checks the world
-python -m orchard.run --benchmark               # this machine's speed, per rung
-bash cloud_run.sh                               # the run
+git clone https://github.com/apariscallahan/AI-language-dev.git && cd AI-language-dev
 ```
 
-`--benchmark` reports **this machine's** episodes per second for the
-configuration, what the full run will therefore cost in hours, and peak GPU
-memory.
+Install the CUDA build of torch that matches the driver first, then the rest:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+```bash
+pip install -r requirements.txt
+```
+
+`scipy` and `matplotlib` are optional — there is a pure-Python Spearman and a
+dependency-free SVG plot writer without them.
+
+Three commands, in this order:
+
+```bash
+python -m orchard.run --smoke
+```
+
+No learning at all: scripted agents, the chance baseline (0.0000), an oracle
+pair's upper bound (~0.67), and one rendered episode. If this looks wrong,
+nothing above it will work.
+
+```bash
+python -m orchard.run --benchmark
+```
+
+**This machine's** episodes per second for each rung at full community size, peak
+GPU memory, and what the full run will therefore cost in hours. Run it before
+committing to a big preset.
+
+```bash
+bash cloud_run.sh
+```
+
+The run. `cloud_run.sh` checks a GPU is visible, writes to
+`runs/<UTC start time>_orchard/`, and auto-resumes from that folder if it is run
+again.
 
 ---
 
-## 2. One method, four scales
+## 2. Choosing a scale
 
-**What is simulated lives in one place: the defaults in `orchard/config.py`.**
-The world, the ladder, the rewards, the channel, the schedules -- every run uses
-them, on a GPU or a CPU, in the same fp32 arithmetic. There is no GPU-only code
-path: a check on a CPU therefore tests what a GPU run does, and nothing can work
-on one and fail on the other.
+One method, four sizes. A preset changes the community, the brain, the batch, the
+run length and how much output there is — and nothing else
+([README §14](README.md#14-one-method-declared-scale)).
 
-**How big it runs is a separate choice**, and that is what the presets in
-`configs/` are for. A preset may change the community size, the brain, the
-batch, the run length and how much output there is -- and nothing else.
-`tests/test_config.py` fails if one touches the method, and the run header
-prints the two lines apart:
+| preset | community | brain | batch | episodes | what it is for |
+|---|---|---|---|---|---|
+| *(none)* | 2 → 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M | the reference scale, and the one a CPU can check |
+| `gpu_small` | 2 → 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
+| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M | the main run: a community big enough that a code has to work for strangers |
+| `gpu_large` | 2 → 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M | the big one; benchmark before committing to it |
+
+```bash
+CONFIG=configs/gpu_community.json bash cloud_run.sh
+```
+
+```bash
+CONFIG=configs/duality.json bash cloud_run.sh
+```
+
+`duality` is a declared *experiment*, not a scale: 12 fruits against 8 atoms, so
+no single atom can name a whole meaning. Unvalidated — treat it as the
+experiment, not the baseline.
+
+The header prints scale and method apart, and the method line should read that
+nothing simulated was changed:
 
 ```
 scale              : pool of 2 growing to 32, then 32 + 32 once trading starts; d=96 x 3 layers, batch 4,096, 60,000,000 episodes
 method             : the one configuration -- size aside, nothing simulated was changed
 ```
 
-| preset | community | brain | batch | episodes | what it is for |
-|---|---|---|---|---|---|
-| *(none)* | 2 -> 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M | the reference scale, and the one a CPU can check |
-| `gpu_small` | 2 -> 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
-| `gpu_community` | 2 -> 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M | the main run: a community big enough that a code has to work for strangers |
-| `gpu_large` | 2 -> 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M | the big one; benchmark before committing to it |
+Every community is **founded by 2 agents** whatever the preset, and the founders
+take all four naming rungs alone; newcomers start arriving at `mutual`, one every
+40 updates. A rung that is still filling up does not spend its budget and cannot
+pass, so growth never eats a rung's time.
 
-Every agent, at every scale, is one pre-norm causal transformer over its private
-situation and the dialogue so far, with a head per decision and a GELU
-feed-forward four times the model width. Only its size changes.
+---
 
-```bash
-CONFIG=configs/gpu_community.json bash cloud_run.sh
-```
-
-Every community is **founded by 2 agents and grows**, whatever the preset:
-6 + 6 from scratch never got a code off chance, and 64 + 64 certainly would not.
-The founders take the naming rungs alone; newcomers start arriving at `mutual`
-(`population.grow_from_rung`), one every 40 updates, each taught from the store
-of what the community has already said. Growing earlier filled the community
-with apprentices of a code that was about to be replaced -- 2 -> 15 across the
-colour rung, at chance throughout. No rung's budget counts while it is still
-filling up.
-
-**Run `--benchmark` before a big preset.** It times a naming rung, `mutual` and
-`market` at full community size, reports peak GPU memory, and estimates the
-hours -- the per-agent loop is the cost here, so wall time grows with the
-community, not with the batch.
-
-### The method, at any scale
-
-| | |
-|---|---|
-| ladder | `name-fruit` -> `name-color` -> `name-quality` -> `name-all` -> `mutual` -> `order` -> `haggle` -> `bargain` -> `market` |
-| naming rungs | each adds a kind of round and keeps drawing the ones below it; judged on the kind it adds, and on still naming the rest |
-| speaker costs | off until `mutual` (`reward.costs_from_rung`): length, rarity, coining and the convention bonus are pressures on words that exist |
-| things to name | 4 fruits x 4 colours x 4 qualities = 64 combinations, of which 16 are reserved and never trained on |
-| population | one pool until `order`, where each agent is copied into a farmer and a buyer, both fluent in the language the pool learned |
-| lifespan | 900-1,600 training updates |
-| channel | atoms + hyphen / space / end; words are hyphen-joined atoms, an utterance is space-separated words; a 24-symbol buffer, not a cap |
-| length cost | per atom after the first in a word, plus a tenth of that per word: short words, not short sentences |
-| promotion | per seat, on evidence; `name-all` and `mutual` also need success on the reserved combinations |
-
-**Anything outside the scale keys is a method change**, and both the run header
-and the report's summary statistics name it. `configs/duality.json` is a
-declared experiment (12 fruits against 8 atoms, so no atom can name a whole
-thing -- unvalidated; treat it as the experiment, not the baseline).
-
-**Everything that means an amount of learning is counted in training updates**
-(one update = one batch): rung budgets, promotion checks (every 25), checkpoints
-(every 100), the temperature and entropy anneals (1,000 and 800), growth,
-lifespans, and how long the population remembers what it has been saying (80).
-The first GPU run counted lifespans in episodes, and every founder died after
-~50 updates.
-
-**Why founded small.** Six farmers and six buyers starting from random weights
-never got the lineup game off chance: each farmer kept its own drifting code
-(coherence 0.04-0.09), so no buyer could learn to read any of them. Two and two
-invent a code; newcomers then learn it through the transmission bottleneck. Every
-rung after the first waits for, and is judged on, the full community, and its
-budget only starts counting once the community is full.
-
-**Hindsight feedback starts at `mutual`.** With it on from the first rung,
-a listener told the answer learned that the still-random messages carried
-nothing, went near-uniform, and the speaker's gradient died with it: no code
-ever formed. The rungs where a code has to form from nothing run without it.
-
-## 2a. What you see while it runs
+## 3. What you see while it runs
 
 `cloud_run.sh` keeps the terminal quiet except for:
 
-- one **status line a minute**: time (UTC), episodes done / total, the update
-  count, rung and how many of its maximum updates it has used, episodes per
-  second, ETA, rolling success, community size, births, peak GPU memory;
-- a **two-line headline at every checkpoint**: success against the muted
-  channel, share of headroom the channel carries, each role's field coverage
-  (fruit / colour / quality), coherence, cross-role overlap, word counts;
-- **rung transitions** and **budget stops** with every criterion;
+- **one status line a minute**: time (UTC), episodes done / total, the update
+  count, the rung and how much of its maximum it has used, episodes per second,
+  ETA, rolling success, community size, births, peak GPU memory;
+- **two lines at every checkpoint** (every 100 updates):
+
+```
+[checkpoint 96] rung name-all | success 0.315 (muted 0.335) / 0.370 (muted 0.345) | channel 0.00 of headroom | buyer coverage 0.052 [0.04 0.09 0.03]; farmer coverage 0.064 [0.07 0.09 0.03]
+    coherence farmer 0.278 buyer 0.278 across 0.519 | overlap 0.546 | 107 words, 1.43 atoms/word, 1.67 words/utterance, 4% silent, 0% at buffer end
+```
+
+  (That one is from a 96-update test run, so it is still at chance.) The two
+  success numbers are the two views of a swap rung (each role decoding),
+  each against its own muted baseline. Coverage is per field: **fruit, colour,
+  quality**. `silent` and `at buffer end` should both be near 0 — the first means
+  agents saying nothing, the second means babbling into the cap.
+- **rung transitions**, with every criterion, passed or not;
+- **budget stops**, naming exactly what was unmet;
 - the **final verdict** and the report path.
 
-The header's `method` line should read `the one configuration (nothing simulated
-was changed)`.
+### Reading the rungs
 
-**Expect chance for a while.** The lineup code forms suddenly, and late: the
-runs that worked sat at 0.25 (chance) until ~300-600 updates, then climbed past
-0.4 within about 50 updates. Chance at update 200 is normal; chance at update
-1,500 is not.
-
-Everything else goes to the run folder:
-
-| file | what it is |
+| rung | what to look for |
 |---|---|
-| `run.log` | the complete console history, including the long checkpoint blocks |
-| `transcripts.txt` | every `log.transcript_stride`-th round as *expected / dialogue / outcome* lines, with a banner at each rung |
-| `report.md` | rewritten at every checkpoint; **summary statistics** at the top |
-| `promotions.jsonl` | every promotion check, passed or not, with its evidence |
-| `progress.json` | a one-line status, for scripts |
+| `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. |
+| `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
+| `name-all` | the first rung gated on **held-out combinations**. Watch trained-vs-reserved success in the checks: a code of whole-thing names shows a wide gap and stalls here. That is the gate working, not a bug. Watch each seat's field coverage too. |
+| `mutual` | both report the other's thing; held-out gated. Speaker costs, community growth and hindsight feedback all switch on here. |
+| `order` | the pool splits into farmers and buyers (the log says so). The farmer must fill fruit, colour and quantity exactly. |
+| `haggle` | channel transfer well above zero, not just success from base rates. Exact price-bin agreement is the likely bottleneck. |
+| throughout | the report's **word classes** row (do separate words specialise to separate fields? — the adjective question), cross-role overlap (should stay high: one pool, one language), and the share of utterances at the buffer end (~0). |
 
-Run folders are named for their start time in UTC and the run:
-`runs/2026-09-18_14-03-12UTC_orchard`.
+**Expect chance for a while.** The first code forms suddenly and late: the runs
+that worked sat at chance until ~300–600 updates, then climbed past 0.4 within
+about 50. Chance at update 200 is normal; chance at update 1,500 is not.
 
-## 2b. Interruptions, snapshots and resuming
+Run folders are named for their start time in UTC and the preset:
+`runs/2026-09-18_14-03-12UTC_gpu_community`.
 
-A snapshot of the whole community -- weights, optimiser state, recent usage, the
-transcript store, the curriculum record -- is written to
+---
+
+## 4. Interruptions, snapshots and resuming
+
+A snapshot of the whole community — weights, optimiser state, recent usage, the
+transcript store, the curriculum record — is written to
 `<run>/snapshots/latest.pt` at every checkpoint and to `after-<rung>.pt` at every
 promotion. `cloud_run.sh` resumes automatically when `latest.pt` exists, so on a
-spot or pre-emptible instance, rerun it pointing `RUN` at the run's folder:
+spot or pre-emptible instance, rerun it pointing `RUN` at the same folder:
 
 ```bash
-bash cloud_run.sh                                               # starts runs/<UTC time>_orchard
-RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh       # resumes it
+RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh
 ```
 
 A resumed run picks up whatever code it is started with, so this is also how to
-move a running experiment onto newer code: stop it just after a checkpoint (the
-snapshot is written then), update, and resume. Older snapshots load too.
+move a running experiment onto newer code: stop it just after a checkpoint,
+update, resume. Older snapshots load too.
 
-Branch an experiment off any rung (the header will list what you changed):
+Branch an experiment off any rung — the header will list what you changed:
 
 ```bash
-python -m orchard.run --out runs/branch \
-    --resume runs/<run>/snapshots/after-name-all.pt \
-    --set curriculum.order_min_success=0.6
+python -m orchard.run --out runs/branch --resume runs/<run>/snapshots/after-name-all.pt --set curriculum.order_min_success=0.6
 ```
 
-## 2c. Measuring a saved community
+Iterating on one rung with `--resume` and a few hundred updates is the cheapest
+way to test a change. Several full runs have been lost to problems a ten-minute
+experiment would have caught.
+
+---
+
+## 5. Measuring a saved community
 
 ```bash
 python -m orchard.analyse --snapshot runs/<run>/snapshots/after-name-all.pt
 ```
 
 Runs the full metric suite on the rung the snapshot closed and prints the
-**language-properties scorecard** (reference, productivity, intentionality,
-decontextualised, displaced, interchangeable, generic, perspectives, cultural
-transmission, duality of patterning), each with how it is measured, the value,
-and present / partial / absent / not testable. No training happens; it runs
-on a laptop against a snapshot copied down from the box.
+**language-properties scorecard** (reference, productivity, word classes,
+intentionality, decontextualised, displaced, interchangeable, generic,
+perspectives, cultural transmission, duality of patterning), each with how it is
+measured, its value, and present / partial / absent / untestable. No training
+happens, so this runs on a laptop against a snapshot copied down from the box.
 
-## 3. Changing settings
+---
 
-**Run settings** -- nothing simulated changes:
+## 6. Changing settings
+
+**Run settings** — nothing simulated changes:
 
 ```bash
 bash cloud_run.sh --episodes 2000000 --seed 3 --device cuda:1 --ledger-stride 100
@@ -192,13 +195,15 @@ bash cloud_run.sh --episodes 2000000 --seed 3 --device cuda:1 --ledger-stride 10
 common ones, and `--set section.key=value` reaches any field:
 
 ```bash
-bash cloud_run.sh --bottleneck off                       # the headline ablation
-bash cloud_run.sh --n-farmers 16 --n-buyers 16           # a bigger community
+bash cloud_run.sh --bottleneck off
+```
+
+```bash
 bash cloud_run.sh --set world.zipf_alpha=0.0 --set reward.understood=0.6
 ```
 
-Every run writes the exact configuration it used to `<out>/config.json`, so a
-run is always reproducible from its own directory:
+Every run writes the exact configuration it used to `<out>/config.json`, so a run
+is always reproducible from its own directory:
 
 ```bash
 python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
@@ -208,108 +213,70 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 
 | setting | what it does |
 |---|---|
-| `--curriculum on\|off` | the referential-then-trading ladder. Off means the full task from random weights, which has not been made to work. |
-| `population.founders_farmers/_buyers`, `population.grow_from_rung`, `population.grow_every_updates` | found the community small and grow it from the named rung on. 0 founders = start at full size. |
-| `reward.costs_from_rung` | the rung from which the speaker pays for length, rarity and coining, and is paid for agreeing. Off below it. |
-| `curriculum.hard_distractor_frac` | share of lineup rounds built as one-field near misses, so every field (quantity included) has to be named. |
-| `curriculum.holdout_tuple_frac` | share of (variety, quantity, quality) combinations never trained on: the productivity test. |
-| `curriculum.min_field_transfer`, `curriculum.mutual_qty_tol` | the mutual rung checks every field for every role, quantity exactly. |
-| `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). |
-| `curriculum.min_holdout_ratio` | how well a rung must do on combinations it never trained on, as a share of how well it does on trained ones (0.60). The productivity gate. |
-| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`order`). |
-| `world.holdout_combo_frac` | share of (fruit, colour, quality) combinations reserved (0.25, a Latin square). |
-| `reward.atom_cost`, `reward.word_cost` | length is charged per atom after the first in a word, and much less per word: short words, not short sentences. |
-| `--on-stall hold\|stop` | what to do if a rung never converges (a run setting). |
-| `bottleneck.coverage` | how much of the parent generation a newborn sees. 1.0 means essentially all of it; lowering it puts common forms back at risk. |
-| `--n-farmers`, `--n-buyers` | community size per role. |
-| `--episodes` | run length (a run setting). Generations fall out of this -- see §4. |
+| `--curriculum on\|off` | the naming-then-trading ladder. Off means the full task from random weights, which has never been made to work. |
+| `--on-stall hold\|stop` | what to do when a rung never converges. Keep `stop` (the default): holding just burns money on a rung that is not working, and stopping leaves a report naming the unmet criteria. |
 | `--bottleneck on\|off` | the transmission bottleneck. Turning it off is the headline ablation. |
 | `--turnover on\|off` | births and deaths. Off means one fixed cohort forever. |
-| `channel.atomic_vocab` | how many meaningless atoms words are built from. |
-| `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24: a buffer, not a pressure -- the symbol cost sets length) and the number of turns. |
-| `channel.enforce_word_grammar` | atoms and marks alternate: `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |
-| `world.zipf_alpha` | how skewed demand is. **Read §7 before raising it.** |
-| `reward.decode`, `reward.understood` | the two halves of the communication loop. |
+| `--n-farmers`, `--n-buyers` | community size per role (a scale key, like the presets). |
+| `population.founders_farmers/_buyers` | how many agents found the community. 0 = start at full size, which does not work above 2 + 2. |
+| `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
+| `reward.costs_from_rung` | the rung from which the speaker pays for length and rarity and is paid for agreeing (`mutual`). Earlier, the cheapest way to be short and to agree is to say the same short nothing. |
+| `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
+| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`order`). |
+| `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |
+| `world.holdout_combo_frac` | share of (fruit, colour, quality) combinations reserved and never trained on (0.25, a Latin square). |
+| `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones (0.60). The productivity gate. |
+| `curriculum.min_field_transfer`, `curriculum.min_field_coverage` | every field is checked for every role; coverage is what catches a code that names one field in every slot. |
+| `reward.belief_qty_tol` | how exactly a reported quantity has to match (1). |
+| `reward.atom_cost`, `reward.word_cost` | length is charged per atom after the first in a word (0.03), and much less per word (0.005): short words, not short sentences. |
+| `channel.atomic_vocab` | how many meaningless atoms words are built from (16). |
+| `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 — a buffer, not a pressure; the length cost sets length) and the number of turns (4). |
+| `channel.enforce_word_grammar` | atoms and marks alternate, so `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |
+| `bottleneck.coverage` | how much of the parent generation a newborn sees (1.0 — essentially all of it; lowering it puts *common* forms back at risk). |
 | `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
+| `world.zipf_alpha` | how skewed demand is. **Read §9 before raising it.** |
+| `reward.decode`, `reward.understood` | the two halves of the communication loop. |
+| `--episodes` | run length (a run setting). Generations fall out of it — see §7. |
 
 ---
 
-## 3b. The curriculum
+## 7. Generations are derived, not set
 
-Runs start on a lineup game and work up to the full market. Nothing is
-reinitialised between rungs; the same population carries its weights forward.
-
-Each rung has its own (min, max) budget in training updates -- 80 to 2,500 for
-the naming rungs and `order`, 80 to 3,500 for `mutual`, `haggle` and `bargain`,
-open for `market`. Promotion needs success clear of chance and the muted-channel
-control showing a real drop; in every lineup rung and `mutual` that is checked
-separately for each seat. A rung that mixes kinds of round is measured on the
-kind it introduced, and every kind it rehearses has its own `still names ...`
-check. `name-all` and `mutual` additionally need structure (topsim clear of its
-shuffled null, coverage of every field) and **success on the reserved
-combinations** -- at least 60% of the rate on trained ones. That last one is
-what a code of whole-thing names cannot pass.
-
-**Keep `--on-stall stop`** (the default). If a rung runs past its budget
-without converging, holding just burns money on a rung that is not working;
-stopping leaves a report saying exactly which criteria were unmet.
-
-Watch the rung in the log or the metrics:
-
-```bash
-grep -E "PHASE|phase " runs/<run>/run.log
-```
-
-Lineup rounds go to `lineups.jsonl` rather than the trade ledger -- there are no
-trades in them.
-
-## 4. Generations are derived, not set
-
-An agent ages by the training updates it takes part in -- nearly every update --
-and dies at its lifespan, so turnover falls out of run length and lifespan
-together:
+An agent ages by the training updates it takes part in — nearly every update —
+and dies at its lifespan (900–1,600 updates), so turnover falls out of run length
+and lifespan together:
 
 ```
 generations  ~  (episodes / batch_size) / mean_lifespan_in_updates
 ```
 
-The header and `--benchmark` print the resulting number. Lifespans want to stay
-long enough that an agent can learn the language before it dies -- the lineup
-code takes ~300-600 updates to form -- and short enough that the population
-turns over often.
+The header and `--benchmark` print the resulting number. Lifespans want to be
+long enough that an agent can learn the language before it dies — the first code
+takes ~300–600 updates to form — and short enough that the population turns over
+often.
+
+Everything that means an amount of learning is counted in **training updates**,
+never episodes: rung budgets, promotion checks (every 25), checkpoints (every
+100), the temperature and entropy anneals (1,000 and 800), growth (every 40),
+lifespans, and how long the population remembers what it has said (80). An early
+GPU run counted lifespans in episodes and every founder died after ~50 updates.
 
 ---
 
-## 5. Memory
-
-At this size a run needs well under 1 GB of GPU memory. Parameters are never the
-limit here: the straight-through Gumbel channel builds one autograd graph
-spanning every symbol step of an episode, so activation memory grows as
-
-```
-batch  x  sequence length  x  d_model  x  layers  x  (symbols per turn x turns)
-```
-
-If an experiment makes that too big, `--set train.grad_checkpoint=true`
-recomputes activations in the backward pass instead of keeping them. It changes
-memory only -- `tests/test_config.py` checks the update is the same -- so it is
-a run setting. It is what let a 4,096 batch fit on a 24 GB card.
-
----
-
-## 6. Never conclude anything from one run
+## 8. Never conclude anything from one run
 
 This simulation is bimodal. A population either finds a referential convention or
 it does not. Four neighbouring conditions at 40k episodes gave **76%, 0%, 92% and
-6%** of the channel headroom -- a spread far larger than any effect worth
+6%** of the channel headroom — a spread far larger than any effect worth
 measuring. One seed per arm is a coin flip with a table around it.
 
 ```bash
 python sweep.py --out runs/ablation --seeds 5 --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
 ```
 
-Reports mean, spread **and every individual seed**, so bimodality shows up instead
-of being averaged into a number that means nothing. Use `--parallel 1` on one GPU.
+Reports mean, spread **and every individual seed**, so bimodality shows up
+instead of being averaged into a number that means nothing. Use `--parallel 1` on
+a single GPU.
 
 Comparing two finished runs directly:
 
@@ -317,15 +284,19 @@ Comparing two finished runs directly:
 python compare_runs.py runs/a runs/b
 ```
 
+It reads each run's own `metrics.jsonl`, `token_semantics.json` and ledger, so it
+reports what the run recorded rather than what a report was written to say.
+`python -m orchard.run --compare runs/a runs/b` overlays them on one set of plots.
+
 ---
 
-## 7. Two traps
+## 9. Two traps
 
 **Skewing demand suppresses language.** `world.zipf_alpha` exists because the
 length/frequency prediction needs some meanings to be commoner than others. But
 skew also makes "guess the common case" pay, and that is a local optimum agents
-do not leave. Applying the skew to *which variety is wanted* took the channel from
-64% of headroom to **0%**. It is therefore split: `zipf_alpha` applies to
+do not leave. Applying the skew to *which fruit is wanted* took the channel from
+64% of headroom to **0%**. It is therefore split: `zipf_alpha` (0.3) applies to
 quantity, and `zipf_alpha_variety` defaults to 0. Raising the latter reproduces
 the failure.
 
@@ -337,34 +308,57 @@ rather than a single run.
 
 ---
 
-## 8. Output, and what to bring home
+## 10. Memory
 
-Per run, in `--out`:
+At the reference scale a run needs well under 1 GB of GPU memory. Parameters are
+never the limit: the straight-through Gumbel channel builds one autograd graph
+spanning every symbol step of an episode, so activation memory grows as
+
+```
+batch  x  sequence length  x  d_model  x  layers  x  (symbols per turn x turns)
+```
+
+If an experiment makes that too big:
+
+```bash
+bash cloud_run.sh --set train.grad_checkpoint=true
+```
+
+Recomputes activations in the backward pass instead of keeping them. Memory only
+— `tests/test_config.py` checks the update is identical — so it is a run setting.
+It is what lets a 4,096 batch fit on a 24 GB card, and the GPU presets set it
+already.
+
+---
+
+## 11. Output, and what to bring home
 
 | file | keep it? |
 |---|---|
-| `report.md` | **yes** -- rewritten every checkpoint, so it is readable mid-run |
-| `metrics.jsonl` | **yes** -- every checkpoint's full metric suite, small |
-| `births.jsonl` | **yes** -- what each newborn was taught and how it fared |
-| `config.json` | **yes** -- exactly reproduces the run |
+| `report.md` | **yes** — rewritten every checkpoint, so it is readable mid-run |
+| `metrics.jsonl` | **yes** — every checkpoint's full metric suite, small |
+| `promotions.jsonl` | **yes** — every promotion check, passed or not, with its evidence |
+| `births.jsonl` | **yes** — what each newborn was taught and how it fared |
+| `config.json` | **yes** — exactly reproduces the run |
 | `plots/*.svg`, `*.png` | yes, small |
-| `run.log` | probably |
-| `trades.jsonl`, `trades.csv` | the big ones -- see below |
+| `transcripts.txt` | yes — sampled rounds as expected / dialogue / outcome |
+| `run.log` | probably — the full checkpoint blocks |
+| `trades.jsonl`, `trades.csv`, `lineups.jsonl` | the big ones — see below |
 
 The trade ledger subsamples episodes (`log.ledger_stride`, 500) and still keeps
 thousands of fully reconstructable trades. Set `--ledger-stride 1` only if you
 genuinely want all of them, and check your disk first.
 
 ```bash
-tar czf results.tgz runs/<run> --exclude='trades.*'    # a few MB
+tar czf results.tgz runs/<run> --exclude='trades.*' --exclude='lineups.jsonl'
 ```
 
-Matplotlib is optional: plots are always written as SVG by a dependency-free
-writer, and the PNG versions appear as well if matplotlib imports.
+Reports and plots are written at every checkpoint, so a run killed early still
+leaves a readable `report.md`, full metrics and a ledger. Interrupting is safe.
 
 ---
 
-## 9. Long runs over SSH
+## 12. Long runs over SSH
 
 ```bash
 nohup bash cloud_run.sh > run.out 2>&1 &
@@ -374,18 +368,36 @@ nohup bash cloud_run.sh > run.out 2>&1 &
 tail -f run.out
 ```
 
-Interrupting is safe. Reports and plots are written at every checkpoint, so a run
-you kill early still leaves a readable `report.md`, full metrics and a ledger.
+Which rung is it on:
+
+```bash
+grep -E "rung|PHASE" runs/<run>/run.log | tail -20
+```
 
 ---
 
-## 10. Sanity checks before a long run
+## 13. Before a long run
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-154 tests, about a minute. Worth doing on the GPU box, not just locally --
+170 tests, about 80 seconds. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
 readable scalar one, and `tests/test_config.py` that there is one configuration
 and no device-specific arithmetic.
+
+---
+
+## 14. If something looks wrong
+
+| symptom | first thing to check |
+|---|---|
+| `$'\r': command not found` from `cloud_run.sh` | the file was checked out with CRLF. `.gitattributes` pins `*.sh` to LF; re-clone or `dos2unix cloud_run.sh`. |
+| "No CUDA device visible" | `cloud_run.sh` only runs on a GPU. Use `python -m orchard.run` for a CPU run. |
+| success at chance past ~1,000 updates in `name-fruit` | a real failure, not slowness. Check the header: speaker costs and hindsight should be off, the pool should be 2 + 2. |
+| `silent` climbing, ~1 word per utterance | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
+| a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
+| a rung stops the run | read the criteria it names in the log and in `promotions.jsonl`. Do not relax them to make it pass — they are the experiment. |
+| out of memory in the first batch | `--set train.grad_checkpoint=true`, then a smaller batch. See §10. |
+| every seed disagrees | expected. See §8. |
