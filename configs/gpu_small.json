@@ -1,0 +1,26 @@
+{
+  "name": "gpu_small",
+  "population": {
+    "n_farmers": 12,
+    "n_buyers": 12
+  },
+  "model": {
+    "d_model": 64,
+    "n_layers": 2,
+    "n_heads": 4,
+    "d_ff": 128
+  },
+  "train": {
+    "batch_size": 1024,
+    "episodes": 20000000,
+    "grad_checkpoint": true
+  },
+  "log": {
+    "checkpoint_every_updates": 100,
+    "intelligibility_episodes": 2048,
+    "zeroshot_episodes": 2048,
+    "ablation_episodes": 2048,
+    "ledger_stride": 500,
+    "transcript_stride": 2000
+  }
+}

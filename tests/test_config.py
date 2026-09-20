@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from orchard.config import (EXPERIMENT_KEYS, LEGACY_KEYS, RUN_KEYS, Config, flat_keys,
-                            method_changes, validate)
+from orchard.config import (EXPERIMENT_KEYS, LEGACY_KEYS, RUN_KEYS, SCALE_KEYS, Config,
+                            flat_keys, method_changes, scale_changes, validate)
 from orchard.conventions import PopulationUsage
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
@@ -34,27 +34,46 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestOneConfiguration(unittest.TestCase):
-    def test_config_files_are_named_experiments_only(self):
+    def test_a_preset_may_change_size_but_never_the_method(self):
+        """Presets exist so a GPU can run big. They must not run *different*."""
         for path in sorted(CONFIGS.glob("*.json")):
             d = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(d.get("name"), path.stem, path.name)
-            self.assertIn(path.stem, EXPERIMENT_KEYS,
-                          "%s is not a named experiment: the configuration lives in "
-                          "orchard/config.py, not in a second copy" % path.name)
-            extra = sorted(set(flat_keys(d)) - RUN_KEYS - EXPERIMENT_KEYS[path.stem])
-            self.assertEqual(extra, [], "%s changes more than its experiment: %s"
-                             % (path.name, extra))
-            validate(Config.from_json(str(path)))
+            allowed = RUN_KEYS | SCALE_KEYS | EXPERIMENT_KEYS.get(path.stem, frozenset())
+            extra = sorted(set(flat_keys(d)) - allowed)
+            self.assertEqual(extra, [], "%s changes the method: %s -- change the "
+                             "default instead, or declare an experiment" % (path.name, extra))
+            cfg = Config.from_json(str(path))
+            validate(cfg)
+            if path.stem not in EXPERIMENT_KEYS:
+                self.assertEqual(method_changes(cfg), {}, path.name)
 
-    def test_sizes_are_part_of_what_is_simulated(self):
-        # a run that tested one size on a CPU and ran another on a GPU was two
-        # versions; now a size change is reported like any other change
+    def test_size_is_reported_separately_from_the_method(self):
         cfg = Config()
         cfg.population.n_farmers = 48
         cfg.train.batch_size = 4096
         cfg.model.d_model = 96
-        self.assertEqual(set(method_changes(cfg)),
+        self.assertEqual(method_changes(cfg), {}, "a size change is not a method change")
+        self.assertEqual(set(scale_changes(cfg)),
                          {"population.n_farmers", "train.batch_size", "model.d_model"})
+        cfg.reward.symbol_cost = 0.5
+        self.assertIn("reward.symbol_cost", method_changes(cfg))
+
+    def test_every_gpu_preset_runs_the_same_ladder_and_world(self):
+        """The thing that must not drift: what is simulated, at any size."""
+        from orchard.curriculum import ladder
+        base = Config()
+        ref = ([p.name for p in ladder(base)], base.world.n_varieties, base.world.n_colors,
+               base.world.n_quality, base.world.holdout_combo_frac,
+               base.curriculum.rung_budget_updates, base.reward.atom_cost,
+               base.train.hindsight_from_rung, base.curriculum.min_holdout_ratio)
+        for path in sorted(CONFIGS.glob("gpu_*.json")):
+            cfg = Config.from_json(str(path))
+            got = ([p.name for p in ladder(cfg)], cfg.world.n_varieties, cfg.world.n_colors,
+                   cfg.world.n_quality, cfg.world.holdout_combo_frac,
+                   cfg.curriculum.rung_budget_updates, cfg.reward.atom_cost,
+                   cfg.train.hindsight_from_rung, cfg.curriculum.min_holdout_ratio)
+            self.assertEqual(got, ref, path.name)
 
     def test_run_settings_are_not_changes(self):
         cfg = Config()

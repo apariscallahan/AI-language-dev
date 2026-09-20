@@ -755,10 +755,19 @@ class Trainer:
           % (c.train.episodes, c.train.batch_size,
              c.train.episodes // max(1, c.train.batch_size)))
         if c.population.founders_farmers or c.population.founders_buyers:
-            L("population         : founded by %d farmers, %d buyers; grows to %d + %d "
-              "after the first rung (one of each every %d updates)"
-              % (len(self.pop.farmers), len(self.pop.buyers), c.population.n_farmers,
-                 c.population.n_buyers, c.population.grow_every_updates))
+            if self.pop.shared:
+                L("population         : one pool of %d agents, both seats of every "
+                  "lineup; grows to %d after the first rung (one every %d updates), "
+                  "then splits at `%s` into %d farmers + %d buyers"
+                  % (len(self.pop.farmers), max(c.population.n_farmers,
+                                                c.population.n_buyers),
+                     c.population.grow_every_updates, c.curriculum.split_roles_at,
+                     c.population.n_farmers, c.population.n_buyers))
+            else:
+                L("population         : %d farmers, %d buyers; grows to %d + %d "
+                  "(one of each every %d updates)"
+                  % (len(self.pop.farmers), len(self.pop.buyers), c.population.n_farmers,
+                     c.population.n_buyers, c.population.grow_every_updates))
         else:
             L("population         : %d farmers, %d buyers"
               % (c.population.n_farmers, c.population.n_buyers))
@@ -816,10 +825,17 @@ class Trainer:
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
-        from .config import method_changes
+        from .config import method_changes, scale_changes, scale_summary
         changes = method_changes(c)
+        L("scale              : %s" % scale_summary(c))
+        scaled = scale_changes(c)
+        if scaled:
+            L("                     (%s)" % ", ".join(
+                "%s %s -> %s" % (k.split(".")[-1], json.dumps(a), json.dumps(b))
+                for k, (a, b) in sorted(scaled.items())))
         L("method             : %s" % (
-            "the one configuration (nothing simulated was changed)" if not changes else
+            "the one configuration -- size aside, nothing simulated was changed"
+            if not changes else
             "CHANGED from the one configuration: " + ", ".join(
                 "%s %s -> %s" % (k, json.dumps(a), json.dumps(b))
                 for k, (a, b) in sorted(changes.items()))))

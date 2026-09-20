@@ -719,11 +719,10 @@ LEGACY_KEYS = {
 
 
 # --------------------------------------------------------------------------
-# What a run may change without changing what is simulated
+# What a run may change, in two tiers
 # --------------------------------------------------------------------------
 # How long, which seed, which device, how much output. Nothing here changes
-# what an agent sees, learns from or is judged on; every other setting does,
-# and a run that changes one is told so (``method_changes``).
+# what an agent sees, learns from or is judged on.
 RUN_KEYS = frozenset({
     "name", "train.episodes", "train.seed", "train.device", "train.torch_threads",
     "train.grad_checkpoint",                 # memory only; same update (tested)
@@ -731,6 +730,23 @@ RUN_KEYS = frozenset({
     "log.ledger_stride", "log.transcript_stride", "log.heartbeat_seconds",
     "log.plot", "log.flush_every", "log.snapshot_every_checkpoint",
     "log.n_example_transcripts",
+})
+
+# **Scale**: how big, not what. A GPU can afford a larger community, wider
+# brains and bigger batches than a laptop, and a preset in ``configs/`` may say
+# so -- but it changes nothing about the world, the ladder, the rewards or the
+# schedules, all of which are counted in training updates and therefore mean the
+# same thing at any batch size. The run header prints the scale it is running at
+# next to the method line, so the two can never be confused, and
+# ``tests/test_config.py`` checks that every preset leaves the method alone.
+SCALE_KEYS = frozenset({
+    "population.n_farmers", "population.n_buyers",
+    "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
+    "train.batch_size", "train.rung_batch_scale",
+    "bottleneck.batch_size",
+    "log.checkpoint_every_updates", "log.intelligibility_episodes",
+    "log.zeroshot_episodes", "log.ablation_episodes", "log.topsim_samples",
+    "log.stability_probes", "log.max_agents_probed", "log.word_analysis_samples",
 })
 
 # Named experiments in configs/, and the settings each is allowed to change.
@@ -756,16 +772,18 @@ def flat_keys(d: dict[str, Any], prefix: str = "") -> list[str]:
 
 
 def method_changes(cfg: "Config") -> dict[str, tuple[Any, Any]]:
-    """Every setting outside ``RUN_KEYS`` that differs from the configuration.
+    """Every setting outside ``RUN_KEYS`` and ``SCALE_KEYS`` that differs.
 
-    ``{"reward.symbol_cost": (default, this run's)}``. The run header and the
-    report print whatever is here, so a run that changed anything that is
-    simulated -- sizes included -- cannot be mistaken for one that did not.
+    ``{"reward.symbol_cost": (default, this run's)}``. This is what the run
+    header and the report call a *method* change: something that alters what is
+    simulated rather than how big it is. Size differences are reported
+    separately by :func:`scale_changes`, so a big run and a small one can be
+    compared, and neither can quietly become a different experiment.
     """
     base, mine = Config().to_dict(), cfg.to_dict()
     out = {}
     for key in flat_keys(mine):
-        if key in RUN_KEYS:
+        if key in RUN_KEYS or key in SCALE_KEYS:
             continue
         a, b = base, mine
         for part in key.split("."):
@@ -773,6 +791,33 @@ def method_changes(cfg: "Config") -> dict[str, tuple[Any, Any]]:
         if a != b:
             out[key] = (a, b)
     return out
+
+
+def scale_changes(cfg: "Config") -> dict[str, tuple[Any, Any]]:
+    """Every size this run differs from the reference scale in."""
+    base, mine = Config().to_dict(), cfg.to_dict()
+    out = {}
+    for key in sorted(SCALE_KEYS):
+        a, b = base, mine
+        try:
+            for part in key.split("."):
+                a, b = a[part], b[part]
+        except KeyError:
+            continue
+        if a != b:
+            out[key] = (a, b)
+    return out
+
+
+def scale_summary(cfg: "Config") -> str:
+    """One line: the community, the brain and the batch this run uses."""
+    p, m, t = cfg.population, cfg.model, cfg.train
+    pool = max(p.n_farmers, p.n_buyers)
+    start = max(p.founders_farmers, p.founders_buyers) or pool
+    return ("pool of %d growing to %d, then %d + %d once trading starts; "
+            "d=%d x %d layers, batch %s, %s episodes"
+            % (start, pool, p.n_farmers, p.n_buyers, m.d_model, m.n_layers,
+               "{:,}".format(t.batch_size), "{:,}".format(t.episodes)))
 
 
 # --------------------------------------------------------------------------

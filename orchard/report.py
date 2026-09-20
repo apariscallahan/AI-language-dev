@@ -298,9 +298,11 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
     rows: list[tuple[str, str]] = []
 
     rows.append(("started", str(final.get("started_utc", "n/a"))))
-    from .config import method_changes
+    from .config import method_changes, scale_summary
     changes = method_changes(cfg)
-    rows.append(("method", "the one configuration (nothing simulated was changed)" if not changes
+    rows.append(("scale", scale_summary(cfg)))
+    rows.append(("method", "the one configuration -- size aside, nothing simulated "
+                 "was changed" if not changes
                  else "**changed**: " + ", ".join(
                      "`%s` %s -> %s" % (k, json.dumps(a), json.dumps(b))
                      for k, (a, b) in sorted(changes.items()))))
