@@ -19,77 +19,77 @@ which replaces the fixed-token channel with an open vocabulary.
 
 ## Quick start
 
-This runs on a GPU. **[CLOUD.md](CLOUD.md) is the guide** -- presets, what the
-terminal shows, how to change a setting, memory sizing.
-
 ```bash
-CONFIG=configs/gpu_community.json bash cloud_run.sh
+bash cloud_run.sh
 ```
 
-`cloud_run.sh` checks a CUDA device is actually visible, writes to
-`runs/<UTC start time>_<preset>/`, and resumes from that folder's latest
-snapshot if it is run again. Everything after the script name is passed through
-to `python -m orchard.run`.
+on a GPU box, or, identically but slower, on any machine:
 
-### One method, several scales
+```bash
+python -m orchard.run
+```
 
-**The method is the code defaults in `orchard/config.py`.** The presets in
-`configs/` change only scale -- how many agents, how big a brain, how large a
-batch, how long a run, how much output -- and `tests/test_config.py` fails if one
-changes anything else. The run header and the report's summary statistics print
-"method: the code defaults" or name every setting that differs, so a run that
-changed the method cannot be mistaken for one that did not.
+**[CLOUD.md](CLOUD.md)** covers what the terminal shows, resuming, and changing
+a setting. `cloud_run.sh` only checks that a GPU is visible, writes to
+`runs/<UTC start time>_orchard/`, and resumes from that folder's latest snapshot
+if it is run again.
 
-| preset | community | brain | batch | episodes | what it is for |
-|---|---|---|---|---|---|
-| `gpu_smoke` | 8 + 8 | d64, 2 layers | 1,024 | 0.5M | plumbing check: short lives so deaths, births and the bottleneck all run |
-| `gpu_small` | 16 + 16 | d64, 2 layers | 2,048 | 8M | a cheaper full run |
-| `gpu_community` | 48 + 48 | d96, 3 layers | 4,096 | 60M | the main run; identical to the code defaults |
-| `gpu_full` | 128 + 128 | d96, 3 layers | 4,096 | 80M | a bigger community |
-| `gpu_duality` | 48 + 48 | d96, 3 layers | 2,048 | 40M | experiment: 12 varieties, 8 atoms, so an atom cannot name a whole meaning |
+### One configuration, on every device
 
-Every community is founded by 2 farmers and 2 buyers and grows after the first
-rung (see "The community" below).
+**There is one configuration: the defaults in `orchard/config.py`.** A GPU and a
+CPU run exactly the same thing -- the same agents, brains, batch and schedule,
+in the same arithmetic (fp32 everywhere; there is no GPU-only precision mode).
+The GPU is just faster: about 100 training updates a minute on an RTX 4090,
+against 10-15 on a laptop CPU. So a CPU check tests exactly what a GPU run does,
+and nothing can work on one and not the other.
+
+The sizes are the ones the CPU runs that worked were made at, because the
+configuration has to be one a CPU can test:
+
+| | |
+|---|---|
+| community | founded by 2 farmers + 2 buyers, grows to 6 + 6 after the first rung |
+| brain | 2-layer transformer, width 48, ~52k parameters, randomly initialised |
+| batch | 256 episodes per training update |
+| run ceiling | 6M episodes (~23k updates); each rung has its own budget |
+
+A run may change how long it runs, its seed, its device and its output
+(`RUN_KEYS`). **Anything else -- sizes included -- is printed as a method change**
+in the run header and in the report's summary statistics, so a run that changed
+what is simulated cannot be mistaken for one that did not. `configs/` holds only
+named experiments that change a few settings on purpose (`duality.json`: 12
+varieties and 8 atoms, so an atom cannot name a whole meaning).
+`tests/test_config.py` enforces all of this.
 
 **Everything that means an amount of learning is counted in training updates**
 (one update = one batch): rung budgets, how often promotion is checked,
 checkpoints, the temperature and entropy anneals, community growth, lifespans,
-and how long the population remembers what it has been saying. An episode count
-means a different amount of learning at every batch size -- counting lifespans in
-episodes once killed every founder after ~50 updates on a GPU. So the same
-settings mean the same thing at every scale, and a bigger batch just averages
-more episodes into each update.
+and how long the population remembers what it has been saying.
 
 ### What makes it fast on a GPU
 
+These change speed and memory only; the same code runs on a CPU.
+
 - **Tensor world and reward.** Scenarios are sampled and trades scored as whole
   batches of tensors (`orchard/batched.py`); per-episode Python used to cap a
-  4,096 batch at ~6,700 episodes/sec. `tests/test_batched.py` asserts the tensor
+  large batch at ~6,700 episodes/sec. `tests/test_batched.py` asserts the tensor
   versions agree exactly with the scalar ones in `world.py` and `env.py`, which
   remain the readable definition of the rules.
 - **Fixed-stride pairings**, so each agent's slice of the batch is a constant and
   the rollout never stalls the device to ask who plays what.
-- **Full precision, on purpose.** bf16 autocast and TF32 exist (`train.amp`,
-  `train.tf32`) but are off, and a preset cannot turn them on without it being
-  reported as a method change: the GPU then does the CPU's arithmetic, so a CPU
-  check says something about a GPU run. The code forms from very small signals
-  and the models are small enough that the GPU is launch-bound, not
-  arithmetic-bound -- fp32 ran as fast as bf16 on an RTX 4090.
-- **Gradient checkpointing** of each agent's embedding and encoder: memory at a
-  4,096 batch went from 56-365 GB to 0.7-9.8 GB depending on the rung.
-  `tests/test_config.py` asserts it gives the same update as without it.
 - **Prefix-only embedding**, slicing soft tokens before gathering, grouping
   agents once per batch, and one host copy per batch for the bottleneck store.
-- Bigger batches on the cheap lineup rungs (`train.rung_batch_scale`).
+- **Gradient checkpointing** (`train.grad_checkpoint`, off at this size): memory
+  only, and `tests/test_config.py` checks it gives the same update. It is what
+  let a 4,096 batch fit on a 24 GB card.
 
-`python -m orchard.run --config configs/gpu_community.json --benchmark` times
-the light, middle and heaviest rungs at full community size and prints peak GPU
-memory and the hours the configured run will take.
+`python -m orchard.run --benchmark` times the light, middle and heaviest rungs at
+full community size on whatever device it finds, and estimates the run's hours.
 
 ### Comparing anything: use several seeds
 
 ```bash
-python sweep.py --config configs/gpu_small.json --out runs/ablation --seeds 5     --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
+python sweep.py --out runs/ablation --seeds 5 --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
 ```
 
 **Do not draw conclusions from single runs of this simulation.** It is bimodal: a
@@ -98,7 +98,8 @@ neighbouring conditions at 40k episodes produced 76%, 0%, 92% and 6% of the
 channel headroom -- a spread that swamps any effect worth measuring. `sweep.py`
 runs each arm across seeds and reports mean, spread and the per-seed values, so
 the bimodality is visible rather than averaged into a misleading single number.
-Use `--parallel 1` on a single GPU.
+Use `--parallel 1` on a single GPU. (Turning the bottleneck off is a method
+change, and each arm's report says so.)
 
 ### Other commands
 
@@ -127,17 +128,45 @@ python -m unittest discover -s tests
 Language is only needed when one party holds something the other cannot see and
 cannot guess. That is built in explicitly and enforced in code:
 
+A thing in this world is a **(fruit, colour, quality)** combination: 4 fruits,
+4 colours, 4 qualities, 64 in all. The three fields are separate on purpose --
+that is what makes an adjective worth inventing, because a code can only
+describe a combination it has never met if it names the parts.
+
 | Farmer privately knows | Buyer privately knows |
 |---|---|
-| how much of **each variety** is in the barn | which single variety they want |
-| the quality of each variety | the minimum quality they will accept |
-| the lowest price they will take | the most they can pay |
+| how much of **each (fruit, colour) lot** is in the barn | which fruit, in which colour, they want |
+| the quality of each lot | the minimum quality they will accept |
+| the lowest price they will take | how many they need, and the most they can pay |
 
-A deal is possible only if the barn has the wanted variety, in enough quantity, at
-acceptable quality, within budget. **Neither agent can determine that alone.**
+A deal is possible only if the barn has that fruit in that colour, in enough
+quantity, at acceptable quality, within budget. **Neither agent can determine
+that alone.**
 Both then independently declare what they think was agreed, and the trade succeeds
 only if those declarations match *each other* and describe a deal that is actually
 executable. One agent being right is never enough.
+
+### A quarter of the combinations are never trained on
+
+Sixteen of the 64 combinations are reserved, and nothing in the project ever
+trains on them: no lineup describes one, no barn stocks one, no shopper asks for
+one. They are chosen as a **Latin square** -- one quality withheld from every
+(fruit, colour) lot, one colour from every (fruit, quality), one fruit from every
+(colour, quality) -- which makes the set balanced in every direction. Two things
+follow, and both matter:
+
+* every fruit, colour and quality still appears constantly in training, so there
+  is always something to generalise *from*; what is withheld is a pairing, never
+  a value;
+* a lineup that varies one field always has exactly three candidates that could
+  be the answer. An unbalanced set leaves lineups containing a combination that
+  is never anybody's target, and a guesser can then rule it out **without
+  listening** -- which is how an earlier version scored 0.42 with the channel
+  muted.
+
+Success on the reserved combinations is the productivity test, and it gates
+promotion (below). A code that gives each thing its own name scores at chance
+there however well it has drilled the rest; a code with reusable parts does not.
 
 ### The property everything rests on
 
@@ -211,14 +240,23 @@ anyone should feel: the report flags any utterance that reaches it.
 
 ### What keeps utterances short is a cost, not a rule
 
-Every emitted symbol — atoms, hyphens and spaces alike — is charged for. Ending a
-message is free, because brevity should not be taxed.
+Length is charged **per atom after the first in a word** (`reward.atom_cost`,
+0.03), plus a much smaller charge **per word** (`reward.word_cost`, 0.005).
+Ending a message is free, because brevity should not be taxed.
 
-That single cost is also the whole Zipf mechanism. Requests follow a Zipf-like
-frequency distribution, so a meaning that comes up constantly pays its length cost
-constantly, while a rare one barely pays it at all. Nothing rewards "short words
-for common things" directly; it is a prediction, and `report.md` reports the
-correlation rather than eyeballing it.
+The split is deliberate. A fused name for a whole (fruit, colour, quality) is one
+long word; naming the parts is two or three short ones. Charging every symbol
+equally would tax the compositional utterance for being longer overall -- so
+words are pressed to be short, while saying several of them costs almost
+nothing. Three atoms as one word cost 0.065; the same three atoms as two words
+cost 0.040.
+
+In the trading rungs this is also the Zipf mechanism: requests follow a Zipf-like
+frequency distribution, so a meaning that comes up constantly pays its length
+cost constantly, while a rare one barely pays it at all. Nothing rewards "short
+words for common things" directly; it is a prediction, and `report.md` reports
+the correlation rather than eyeballing it. (In the naming rungs things are drawn
+uniformly, so there is nothing for length to track, and the report says so.)
 
 ---
 
@@ -359,17 +397,37 @@ comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
 
 So the task is built up, and a rung is only left behind once it has worked:
 
+Five of the ten rungs are about naming, and nothing is traded until they are
+done. Each is a lineup: the describer sees one thing, the guesser sees the
+candidates and picks. The describer alternates batch by batch, and below the
+trading rungs **both seats are filled from one pool of agents**, so there is one
+language rather than two that have to be reconciled afterwards.
+
 | rung | what is added | chance rate |
 |---|---|---|
-| `refer` | a lineup game: the farmer describes one meaning, the buyer picks it out of K candidates. No price, no budget, no negotiation, no market. | 1/K |
-| `refer-swap` | the same game with the roles alternating batch by batch, so every agent must both describe and decode | 1/K |
-| `refer-mutual` | both hold a private (variety, quantity, quality) tuple and each must report the other's; still no price, no accept/reject | measured (muted channel) |
-| `order` | the buyer asks; the farmer must fill the order exactly with its *deal* decision — the first rung that uses the deal heads | measured (muted channel) |
+| `name-fruit` | a lineup whose candidates share colour and quality and differ only in fruit: only the fruit needs saying | 1/3 |
+| `name-color` | the same over colour alone -- same fruit, same quality, different colours. A word for a colour and nothing else. | 1/3 |
+| `name-quality` | the same over quality alone | 1/3 |
+| `name-all` | candidates differing in any field, mostly one-field near misses, so the whole (fruit, colour, quality) has to be named at once | 1/3 |
+| `describe-one` | the field being asked about changes round by round, so one word has to mean a colour *wherever* it appears | 1/3 |
+| `mutual` | both hold a private thing and each must report the other's; still no price, no accept/reject | measured (muted channel) |
+| `order` | trading begins and the pool splits into farmers and buyers, each carrying the language it learned: the buyer asks for a fruit, a colour and a quantity, and the farmer must fill the order exactly | measured (muted channel) |
 | `haggle` | price and budget, so accept/reject has a payoff — still one message each | ~0 |
 | `bargain` | several turns, so counter-offers become possible | ~0 |
 | `market` | the full economy: persistent stock, restocking, viability | ~0 |
 
-Each rung adds one thing. `refer-swap` exists because a single fixed describer
+**The single-field rungs come first because they are learnable from nothing.**
+A code has to exist before it can be made compositional: `name-fruit` needs one
+word per fruit and nothing else, and the rungs that follow reuse those words
+rather than starting again.
+
+**`name-all` and `mutual` are gated on the held-out combinations** -- success
+there must reach 60% of success on trained ones (`curriculum.min_holdout_ratio`)
+and be clear of chance. The single-field rungs are not asked for it: they have
+not been taught the other fields. That gate is the pressure toward reusable
+parts; everything else in the ladder is opportunity.
+
+Each rung adds one thing. Alternating describers exist because a single fixed one
 produces a one-way code: in the run that motivated it, the farmer's utterances
 had positional structure 0.03 while the buyer's had 0.39, and every farmer
 newborn's token accuracy was 0.000.
@@ -391,11 +449,11 @@ same check before the next rung starts:
 - topological similarity clear of its own shuffled null,
 - the channel control showing a real drop when messages are muted.
 
-In `refer-swap` and `refer-mutual` every one of these is checked **per role**,
+In the lineup rungs and `mutual` every one of these is checked **per role**,
 never pooled: each role's own utterances must show topsim over null *and*
 positional structure (`curriculum.min_positional_structure`), and each role must
-decode in the view where it is the one decoding (`refer-swap`) or report the
-other's tuple (`refer-mutual`, `curriculum.mutual_min_report`). A pooled
+decode in the view where it is the one decoding, or report the other's thing
+(`mutual`, `curriculum.mutual_min_report`). A pooled
 average would let a fluent partner carry a role that never learned to speak.
 
 Success alone is not enough, because a pair can score on base rates without
@@ -432,15 +490,15 @@ variety and 0.01-0.05 bits of quantity or quality in live messages, e.g.
 never learns what it should have read, and a speaker whose every slot is read
 as variety gets no gradient towards anything else.
 
-**It starts at `refer-mutual`** (`train.hindsight_from_rung`), not before. While
+**It starts at `mutual`** (`train.hindsight_from_rung`), not before. While
 no code exists yet, a listener told the answer learns -- correctly -- that the
 messages carry nothing: it spreads its guesses evenly (the spread of its choice
 logits fell from 0.5 to 0.17 in 100 updates) and the speaker's gradient, which
 runs through the listener, dies with it. With hindsight on from the first rung
 the lineup code never formed, on the CPU and on the GPU (still at chance after
 2,500 updates); without it, it formed at ~550 updates. So the two rungs where a
-code has to form from nothing -- `refer`, and `refer-swap`, where the buyer
-describes for the first time -- run without it, and it joins where it was meant
+code has to form from nothing -- every naming rung -- run without it, and it
+joins where it was meant
 to help: drawing quantity and quality out of a code that already carries
 variety.
 
@@ -559,8 +617,8 @@ orchard/
   transcripts.py transcripts.txt: expected / dialogue / outcome for every round
   analyse.py     re-measure a snapshot after the fact
   run.py         CLI (also --benchmark and --resume)
-configs/         the GPU presets -- scale only; the method is config.py's defaults
-tests/           including test_config.py, which keeps presets from changing the method
+configs/         named experiments only; the configuration is config.py's defaults
+tests/           including test_config.py: one configuration on every device
 ```
 
 ### Why Gumbel-softmax
@@ -590,9 +648,9 @@ The scientific point is the comparison, so the mechanisms toggle from the comman
 line and the same code runs either way:
 
 ```bash
-python -m orchard.run --config configs/gpu_small.json --out runs/main
-python -m orchard.run --config configs/gpu_small.json --out runs/nobottleneck --bottleneck off
-python -m orchard.run --config configs/gpu_small.json --out runs/noturnover  --turnover off
+python -m orchard.run --out runs/main
+python -m orchard.run --out runs/nobottleneck --bottleneck off
+python -m orchard.run --out runs/noturnover  --turnover off
 python -m orchard.run --compare runs/main runs/nobottleneck runs/noturnover
 ```
 

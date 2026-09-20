@@ -38,14 +38,15 @@ import torch.nn.functional as F
 from .agents import Agent, dialogue_offset, own_dialogue_positions
 from .config import Config
 from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
-                  farmer_obs, grammar_allowed, resolve, speaker_of_turn)
+                  farmer_obs, grammar_allowed, length_cost, resolve,
+                  speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
 from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch, Phase,
                          ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
                          phase_schema, resolve_mutual, resolve_order,
                          resolve_referential)
-from .rollout import (BatchRollout, UpdateStats, anneal, group_by_agent,
-                      n_outputs, split_decision)
+from .rollout import (BatchRollout, UpdateStats, anneal, belief_columns,
+                      group_by_agent, n_outputs, split_decision)
 from .world import Scenario
 
 
@@ -238,29 +239,33 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     content = (tokens < c.end_id)
     f_emitted = _count(content, phase.own_positions(cfg, FARMER))
     b_emitted = _count(content, phase.own_positions(cfg, BUYER))
+    # What each speaker pays for the length of what it said: short words are
+    # pressed for, saying several of them is nearly free.
+    f_len = length_cost(cfg, tokens, phase.own_positions(cfg, FARMER))
+    b_len = length_cost(cfg, tokens, phase.own_positions(cfg, BUYER))
     outcomes: list[Outcome] = []
     res = None
     if referential:
         res = resolve_referential(cfg, scenarios,
                                   dec_sampled[phase.guesser][:, H_CHOICE],
-                                  f_emitted, b_emitted)
+                                  f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif mutual:
         rep = list(H_BELIEF[:3])
         res = resolve_mutual(cfg, scenarios, dec_sampled[FARMER][:, rep],
-                             dec_sampled[BUYER][:, rep], f_emitted, b_emitted)
+                             dec_sampled[BUYER][:, rep], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and batched:
-        res = resolve_order(cfg, scenarios, dec_sampled[FARMER], f_emitted, b_emitted)
+        res = resolve_order(cfg, scenarios, dec_sampled[FARMER], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif batched:
         # One pass over the batch instead of B trips through the interpreter.
         use_bel = cfg.reward.belief_heads
         res = resolve_batch(
             cfg, scenarios, dec_sampled[FARMER][:, :4], dec_sampled[BUYER][:, :4],
-            f_emitted, b_emitted,
-            f_bel=dec_sampled[FARMER][:, 4:8] if use_bel else None,
-            b_bel=dec_sampled[BUYER][:, 4:8] if use_bel else None)
+            f_len, b_len,
+            f_bel=belief_columns(dec_sampled[FARMER]) if use_bel else None,
+            b_bel=belief_columns(dec_sampled[BUYER]) if use_bel else None)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     else:
         f_rew = torch.zeros(B, device=device)
@@ -268,7 +273,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         for i, sc in enumerate(scenarios):
             fd, fb = split_decision(dec_sampled[FARMER][i])
             bd, bb = split_decision(dec_sampled[BUYER][i])
-            o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
+            o = resolve(cfg, sc, fd, bd, float(f_len[i]), float(b_len[i]),
                         f_beliefs=fb, b_beliefs=bb)
             outcomes.append(o)
             f_rew[i] = o.farmer_reward
@@ -276,13 +281,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
 
     # ---- the speaker's own terms: brevity, coining, convention ------------
     g = float(min(1.0, max(0.0, cost_scale)))
-    sc = cfg.reward.symbol_cost
-    shape = {FARMER: -g * sc * f_emitted.float(), BUYER: -g * sc * b_emitted.float()}
+    shape = {FARMER: -g * f_len, BUYER: -g * b_len}
     agree = {FARMER: torch.zeros(B, device=device), BUYER: torch.zeros(B, device=device)}
     if g < 1.0:
-        # the resolvers charged the full symbol cost; hand back the gated share
-        f_rew = f_rew + (1.0 - g) * sc * f_emitted.float()
-        b_rew = b_rew + (1.0 - g) * sc * b_emitted.float()
+        # the resolvers charged the full length cost; hand back the gated share
+        f_rew = f_rew + (1.0 - g) * f_len
+        b_rew = b_rew + (1.0 - g) * b_len
         if res is not None:
             res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
     terms = {}
@@ -316,7 +320,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         f_obs=f_obs, b_obs=b_obs, f_idx=f_idx, b_idx=b_idx,
         f_dec=dec_sampled[FARMER].detach(), b_dec=dec_sampled[BUYER].detach(),
         f_reward=f_rew.detach(), b_reward=b_rew.detach(), outcomes=outcomes,
-        f_emitted=f_emitted, b_emitted=b_emitted,
+        f_emitted=f_emitted, b_emitted=b_emitted, f_cost=f_len, b_cost=b_len,
         res=res, sb=scenarios if batched else None, n=B, cfg_ref=cfg, phase=phase)
 
     stats = UpdateStats()

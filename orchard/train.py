@@ -193,6 +193,9 @@ class Trainer:
         self.eval_rng = random.Random(cfg.train.seed + 6)
 
         self.episode = 0
+        if cfg.curriculum.enabled and self.curriculum.index > 0:
+            # started part way up the ladder, at or past the split
+            self.maybe_split_roles(self.curriculum.phase, log=lambda *_: None)
         self.history = History()
         self.train_success = RollingStat(window=4000)
         self.train_reward = RollingStat(window=4000)
@@ -359,8 +362,9 @@ class Trainer:
         """How one view of a phase draws rounds -- lineups, mutual pairs, or trades."""
         rw = self.referential_world
         if phase.referential and rw is not None:
-            return lambda n, held_out=False: rw.sample(n, informer=phase.informer,
-                                                       held_out=bool(held_out))
+            return lambda n, held_out=False: rw.sample(
+                n, informer=phase.informer, held_out=bool(held_out),
+                query=phase.query, mixed_query=phase.mixed_query)
         if phase.mutual and rw is not None:
             return lambda n, held_out=False: rw.sample_mutual(n, held_out=bool(held_out))
         if self.tensor_world is not None:
@@ -392,15 +396,23 @@ class Trainer:
         """
         rw = self.referential_world
         if phase.referential and rw is not None:
-            return lambda n, held_out=False: rw.sample(n, informer=phase.informer,
-                                                       held_out=bool(held_out),
-                                                       hard_frac=0.0)
+            return lambda n, held_out=False: rw.sample(
+                n, informer=phase.informer, held_out=bool(held_out), hard_frac=0.0,
+                query=phase.query, mixed_query=phase.mixed_query)
         return self.phase_sampler(phase)
+
+    def holdout_sampler(self, phase):
+        """The same rung, drawn only from combinations never trained on."""
+        s = self.zero_shot_sampler(phase)
+        # _play calls sampler(n, held_out); this one is held-out whatever it asks
+        return (lambda n, _ho=False, _s=s: _s(n, held_out=True)) if s is not None else None
 
     def chance_for(self, phase) -> float:
         """The floor this phase has to clear (NaN: measured, not analytic)."""
         if phase.referential:
-            return 1.0 / max(2, self.cfg.curriculum.n_candidates)
+            rw = self.referential_world
+            return (rw.chance(phase) if rw is not None
+                    else 1.0 / max(2, self.cfg.curriculum.n_candidates))
         if phase.mutual or phase.order:
             return float("nan")           # measured against a muted channel instead
         return self.chance
@@ -410,6 +422,7 @@ class Trainer:
         n_eval = lg.ablation_episodes // (2 if light else 1)
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
+            holdout_sampler_for=self.holdout_sampler,
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
             device=self.device, rng=self.eval_rng)
@@ -470,6 +483,7 @@ class Trainer:
             for name, c in checks.items():
                 A("      met: %-40s %s" % (name, c["detail"]))
             A("    the population carries its weights forward; nothing is reinitialised.")
+            self.maybe_split_roles(nxt, A)
             A("")
             return
 
@@ -620,6 +634,7 @@ class Trainer:
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        self.maybe_split_roles(cur.phase, log=lambda *_: None)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s"
                             % (path, self.updates, self.episode, cur.phase.name))
 
@@ -634,9 +649,13 @@ class Trainer:
         if self.updates < self._next_grow:
             return
         p = self.cfg.population
-        for role, target in ((FARMER, p.n_farmers), (BUYER, p.n_buyers)):
-            if len(self.pop.pool(role)) < target:
-                self.pop.add_newcomer(role, self.episode, on_birth=self.on_birth)
+        if self.pop.shared:          # one pool: one newcomer, who takes both seats
+            if len(self.pop.farmers) < max(p.n_farmers, p.n_buyers):
+                self.pop.add_newcomer(FARMER, self.episode, on_birth=self.on_birth)
+        else:
+            for role, target in ((FARMER, p.n_farmers), (BUYER, p.n_buyers)):
+                if len(self.pop.pool(role)) < target:
+                    self.pop.add_newcomer(role, self.episode, on_birth=self.on_birth)
         self._next_grow = self.updates + p.grow_every_updates
         self.community_log.append({"episode": self.episode, "update": self.updates,
                                    "phase": self.curriculum.phase.name,
@@ -646,6 +665,23 @@ class Trainer:
             self.log.always("  [community] full size: %d farmers, %d buyers at update %s"
                             % (len(self.pop.farmers), len(self.pop.buyers),
                                "{:,}".format(self.updates)))
+
+    def maybe_split_roles(self, phase, log=None) -> None:
+        """Trading begins: the one pool becomes farmers and buyers, both fluent."""
+        at = self.cfg.curriculum.split_roles_at
+        if not at or not self.pop.shared:
+            return
+        names = [p.name for p in self.curriculum.phases]
+        if phase.index < names.index(at):
+            return
+        n = self.pop.split_roles(self.episode)
+        say = log or self.log.always
+        say("    *** roles split at `%s`: each of the %d agents is now a farmer "
+            "and a buyer, both carrying the language the pool learned ***" % (phase.name, n))
+        self.community_log.append({"episode": self.episode, "update": self.updates,
+                                   "phase": phase.name, "event": "split_roles",
+                                   "farmers": len(self.pop.farmers),
+                                   "buyers": len(self.pop.buyers)})
 
     def update_cost_gate(self, succ: torch.Tensor) -> None:
         """Speaker costs: off through the first rung, on once it has been passed."""
@@ -741,15 +777,19 @@ class Trainer:
             if bn.enabled else ""))
         L("channel            : %d content tokens + <eos>, <= %d tokens/turn, %d turns"
           % (c.channel.vocab_size, c.channel.max_msg_len, c.channel.n_turns))
-        L("world              : %d varieties, qty 1-%d, %d quality levels, %d price bins"
-          % (c.world.n_varieties, c.world.max_qty, c.world.n_quality, c.world.n_price_bins))
+        w = c.world
+        L("world              : %d fruits x %d colours x %d qualities = %d things to "
+          "name; qty 1-%d, %d price bins"
+          % (w.n_varieties, w.n_colors, w.n_quality,
+             w.n_varieties * w.n_colors * w.n_quality, w.max_qty, w.n_price_bins))
         L("meaning space      : %d distinct private states per role"
-          % (c.world.n_varieties * c.world.max_qty * c.world.n_quality * c.world.n_price_bins))
+          % (w.n_varieties * w.n_colors * w.max_qty * w.n_quality * w.n_price_bins))
         L("economy            : %s, %d encounters/day, season = %d days"
           % ("persistent lots" if c.economy.persistent_inventory else "per-episode sampling",
              c.economy.episodes_per_day, c.economy.season_days))
-        L("held-out combos    : %d (variety, quantity) pairs reserved for zero-shot"
-          % len(self.world.holdout))
+        L("held out           : %d of %d (fruit, colour, quality) combinations, never "
+          "trained on anywhere -- the productivity test"
+          % (len(self.world.holdout), len(self.world.holdout.combos)))
         L("algorithm          : straight-through Gumbel-softmax on message tokens + "
           "REINFORCE on the decisions; temperature %.1f->%.1f over %d updates"
           % (c.train.gumbel_tau, c.train.gumbel_tau_final, c.train.tau_anneal_updates))
@@ -769,18 +809,18 @@ class Trainer:
             L("                     (budgets in training updates; promotion checked every "
               "%d updates; on a rung's max without meeting its criteria: %s)"
               % (c.curriculum.check_every_updates, c.curriculum.on_stall))
-        L("speaker pressures  : %.3f per symbol, up to %.3f per novel word, %.3f for "
-          "matching the population's convention" % (c.reward.symbol_cost,
-                                                     c.reward.rarity_cost,
-                                                     c.reward.convention))
+        L("speaker pressures  : %.3f per atom after the first in a word, %.3f per word, "
+          "up to %.3f per novel word, %.3f for matching the population's convention"
+          % (c.reward.atom_cost, c.reward.word_cost, c.reward.rarity_cost,
+             c.reward.convention))
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
         from .config import method_changes
         changes = method_changes(c)
         L("method             : %s" % (
-            "the code defaults (this preset changes scale only)" if not changes else
-            "CHANGED from the code defaults: " + ", ".join(
+            "the one configuration (nothing simulated was changed)" if not changes else
+            "CHANGED from the one configuration: " + ", ".join(
                 "%s %s -> %s" % (k, json.dumps(a), json.dumps(b))
                 for k, (a, b) in sorted(changes.items()))))
         if self.resume_note:
@@ -867,7 +907,7 @@ class Trainer:
                        chance=(self.chance_for(views[0])
                                if self.chance_for(views[0]) == self.chance_for(views[0])
                                else 0.0),
-                       n_holdout=(int(self.referential_world.holdout.shape[0])
+                       n_holdout=(len(self.referential_world.holdout)
                                   if phase.tuples and self.referential_world is not None
                                   else None))
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
@@ -1360,8 +1400,10 @@ class Trainer:
                      if rung.swaps else rung)
             f_idx, b_idx = self.pop.pair(n, device=self.device)
             if phase.referential:
-                # The lineup game: no market, no stock, no price -- just meanings.
-                scen = self.referential_world.sample(n, informer=phase.informer)
+                # A lineup: no market, no stock, no price -- just things to name.
+                scen = self.referential_world.sample(
+                    n, informer=phase.informer, query=phase.query,
+                    mixed_query=phase.mixed_query)
             elif phase.mutual:
                 scen = self.referential_world.sample_mutual(n)
             elif not phase.use_market:

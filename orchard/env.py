@@ -39,12 +39,12 @@ def _pad(cfg: Config, values: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def farmer_obs(scenario: Scenario, cfg: Config) -> tuple[int, ...]:
-    """Stock per variety, quality per variety, reservation price -- the whole barn."""
+    """Stock, colour and quality per fruit, plus the reservation price."""
     return _pad(cfg, scenario.farmer.as_tuple())
 
 
 def buyer_obs(scenario: Scenario, cfg: Config) -> tuple[int, ...]:
-    """Wanted variety, needed quantity, minimum quality, budget ceiling."""
+    """Wanted fruit and colour, quantity, minimum quality, budget ceiling."""
     return _pad(cfg, scenario.buyer.as_tuple())
 
 
@@ -85,6 +85,7 @@ class Beliefs:
     qty: int
     quality: int
     price: int
+    color: int = 0
 
     def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.variety, self.qty, self.quality, self.price)
@@ -107,6 +108,7 @@ def decode_hits(beliefs: Beliefs, sc: Scenario, role: int,
             abs(beliefs.qty - b.need_qty) <= R.belief_qty_tol,
             beliefs.quality == b.min_quality,
             abs(beliefs.price - b.max_price) <= R.belief_price_tol,
+            beliefs.color == b.want_color,
         ]
     # The buyer reports on the line it asked about, so stock 0 means "he does not
     # carry it" -- getting that right is itself a thing the farmer had to convey.
@@ -114,6 +116,7 @@ def decode_hits(beliefs: Beliefs, sc: Scenario, role: int,
         abs(beliefs.qty - sc.offered_stock) <= R.belief_qty_tol,
         beliefs.quality == sc.offered_quality,
         abs(beliefs.price - sc.farmer.reservation) <= R.belief_price_tol,
+        beliefs.color == sc.offered_color,
     ]
 
 
@@ -234,13 +237,14 @@ def _classify(sc: Scenario, fd: Decision, bd: Decision, agree: dict[str, bool],
 
 
 def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
-            farmer_tokens: int = 0, buyer_tokens: int = 0,
+            farmer_cost: float = 0.0, buyer_cost: float = 0.0,
             f_beliefs: Beliefs | None = None,
             b_beliefs: Beliefs | None = None) -> Outcome:
     """Score one finished negotiation.
 
-    ``farmer_tokens`` / ``buyer_tokens`` are the symbols that agent emitted and
-    is charged for: atoms, hyphens and spaces, but not the end-of-message mark.
+    ``farmer_cost`` / ``buyer_cost`` are what each agent pays for the length of
+    what it said (:func:`length_cost`): per atom after the first in a word, plus
+    a much smaller charge per word.
     """
     R: RewardConfig = cfg.reward
     prices = cfg.world.price_values
@@ -263,6 +267,7 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
 
     executable = (
         sc.variety_ok
+        and sc.color_ok
         and agreed_variety == sc.deal_variety
         and 1 <= agreed_qty <= sc.offered_stock
         and abs(agreed_qty - sc.buyer.need_qty) <= R.qty_tol
@@ -355,13 +360,13 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
             br += R.correct_no_deal
             terms["correct_no_deal"] = R.correct_no_deal
 
-    # Addendum 2.1: every symbol the speaker emitted is charged for -- atoms,
-    # hyphens and spaces alike.  Paid per episode, so meanings that come up often
-    # pay it often, which is the whole of the Zipf mechanism in 2.2.
-    fr -= R.symbol_cost * farmer_tokens
-    br -= R.symbol_cost * buyer_tokens
-    terms["farmer_symbol_cost"] = -R.symbol_cost * farmer_tokens
-    terms["buyer_symbol_cost"] = -R.symbol_cost * buyer_tokens
+    # Addendum 2.1: length is charged per episode, so meanings that come up often
+    # pay for their length often -- the whole of the Zipf mechanism in 2.2. The
+    # charge falls on long *words*, not on saying several of them.
+    fr -= farmer_cost
+    br -= buyer_cost
+    terms["farmer_length_cost"] = -farmer_cost
+    terms["buyer_length_cost"] = -buyer_cost
 
     correct_no_deal = (not both_accept) and (fd.accept == bd.accept) and (not sc.viable)
     if success:
@@ -458,6 +463,45 @@ def grammar_mask_for_positions(cfg: Config, tokens: torch.Tensor,
 
 
 MASKED = -1e9     # a logit no sample can land on; finite, so entropies stay finite
+
+
+def length_cost(cfg: Config, tokens: "torch.Tensor", positions: "list[int]"
+                ) -> "torch.Tensor":
+    """(B,) what each speaker pays for the length of what it said.
+
+    Charged per *atom after the first in a word*, plus a much smaller charge per
+    word: short words are pressed for, several of them are not. A fused name for
+    a whole (fruit, colour, quality) is one long word and pays for every atom
+    after the first; naming the parts costs three cheap words instead.
+    """
+    R = cfg.reward
+    c = cfg.channel
+    if not positions:
+        return torch.zeros(tokens.shape[0], dtype=torch.float, device=tokens.device)
+    cols = tokens[:, positions]
+    atoms = cols < c.atomic_vocab
+    # a word starts at an atom that does not follow a hyphen
+    prev = torch.cat([torch.full((cols.shape[0], 1), c.pad_id, dtype=cols.dtype,
+                                 device=cols.device), cols[:, :-1]], dim=1)
+    starts = atoms & (prev != c.hyphen_id)
+    n_atoms = atoms.sum(dim=1).float()
+    n_words = starts.sum(dim=1).float()
+    return (R.word_cost * n_words + R.atom_cost * (n_atoms - n_words)
+            + R.symbol_cost * (cols < c.end_id).sum(dim=1).float())
+
+
+def word_atom_counts(cfg: Config, symbols: "list[int]") -> tuple[int, int]:
+    """(words, atoms) in one finished utterance -- the scalar path's version."""
+    words = parse_words(cfg, symbols)
+    return len(words), sum(len(w) for w in words)
+
+
+def scalar_length_cost(cfg: Config, symbols: "list[int]") -> float:
+    R = cfg.reward
+    n_words, n_atoms = word_atom_counts(cfg, symbols)
+    n_sym = sum(1 for s in symbols if s < cfg.channel.end_id)
+    return (R.word_cost * n_words + R.atom_cost * max(0, n_atoms - n_words)
+            + R.symbol_cost * n_sym)
 
 
 def parse_words(cfg: Config, symbols: "list[int]") -> list[tuple[int, ...]]:
@@ -569,7 +613,8 @@ class RandomScriptedAgent:
 
     def believe(self, obs, history) -> Beliefs:
         w = self.cfg.world
-        return Beliefs(variety=self.rng.randrange(w.n_varieties),
+        return Beliefs(color=self.rng.randrange(w.n_colors),
+                       variety=self.rng.randrange(w.n_varieties),
                        qty=self.rng.randint(0, w.max_qty),
                        quality=self.rng.randrange(w.n_quality),
                        price=self.rng.randrange(w.n_price_bins))
@@ -602,9 +647,11 @@ class HonestScriptedAgent:
         sc: Scenario = self.scenario_ref()
         if self.role == FARMER:
             b = sc.buyer
-            return Beliefs(b.want_variety, b.need_qty, b.min_quality, b.max_price)
+            return Beliefs(b.want_variety, b.need_qty, b.min_quality, b.max_price,
+                           color=b.want_color)
         return Beliefs(sc.buyer.want_variety, sc.offered_stock,
-                       sc.offered_quality, sc.farmer.reservation)
+                       sc.offered_quality, sc.farmer.reservation,
+                       color=sc.offered_color)
 
 
 def run_scripted_episode(cfg: Config, scenario: Scenario, farmer_agent, buyer_agent) -> Transcript:
@@ -629,17 +676,17 @@ def run_scripted_episode(cfg: Config, scenario: Scenario, farmer_agent, buyer_ag
     fb = farmer_agent.believe(farmer_obs(scenario, cfg), history)
     bb = buyer_agent.believe(buyer_obs(scenario, cfg), history)
 
-    def n_costed(role: int) -> int:
-        n = 0
+    def said_by(role: int) -> list[int]:
+        out: list[int] = []
         for turn in range(c.n_turns):
             if speaker_of_turn(turn) != role:
                 continue
-            for sym in tokens[turn * c.max_symbols:(turn + 1) * c.max_symbols]:
-                if c.costed(sym):
-                    n += 1
-        return n
+            out.extend(int(s) for s in tokens[turn * c.max_symbols:(turn + 1) * c.max_symbols])
+        return out
 
-    outcome = resolve(cfg, scenario, fd, bd, n_costed(FARMER), n_costed(BUYER),
+    outcome = resolve(cfg, scenario, fd, bd,
+                      scalar_length_cost(cfg, said_by(FARMER)),
+                      scalar_length_cost(cfg, said_by(BUYER)),
                       f_beliefs=fb, b_beliefs=bb)
     return Transcript(tokens=tokens, scenario=scenario, farmer_decision=fd,
                       buyer_decision=bd, outcome=outcome,

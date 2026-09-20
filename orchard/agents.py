@@ -44,8 +44,8 @@ import torch.nn.functional as F
 
 from .config import Config
 from .env import BUYER, FARMER, speaker_of_turn
-from .world import (K_EMPTY, K_PRICE, K_QTY, K_QUALITY, K_VARIETY, n_obs_slots,
-                    obs_schema)
+from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
+                    n_obs_slots, obs_schema)
 
 # Sequence layout.  The number of observation slots is whatever the world's
 # schema needs (a farm with several varieties has more to look at than a buyer
@@ -53,7 +53,7 @@ from .world import (K_EMPTY, K_PRICE, K_QTY, K_QUALITY, K_VARIETY, n_obs_slots,
 # one layout and one set of position indices.
 SLOT_BOS, SLOT_SEP, SLOT_DIALOGUE, SLOT_DECIDE = 0, 1, 2, 3
 N_FIXED_SLOT_TYPES = 4
-N_SLOT_TYPES = N_FIXED_SLOT_TYPES + 5        # + one per field kind
+N_SLOT_TYPES = N_FIXED_SLOT_TYPES + 7        # + one per field kind
 
 
 def dialogue_offset(cfg: Config) -> int:
@@ -109,7 +109,12 @@ class CommNet(nn.Module):
         self.variety_emb = nn.Embedding(w.n_varieties, d)
         self.qty_emb = nn.Embedding(w.max_qty + 1, d)
         self.quality_emb = nn.Embedding(w.n_quality, d)
+        self.color_emb = nn.Embedding(w.n_colors, d)
         self.price_emb = nn.Embedding(w.n_price_bins, d)
+        # "which field are you being asked about" -- the naming rungs put this in
+        # the describer's observation, and it is what a word for a colour alone
+        # has to be conditioned on.
+        self.field_emb = nn.Embedding(4, d)     # fruit, colour, quality, or all three
         self.empty_emb = nn.Embedding(1, d)
         self.slot_emb = nn.Embedding(N_SLOT_TYPES, d)
         # One embedding per observation *position*, so "stock of GREEN" is a
@@ -141,6 +146,8 @@ class CommNet(nn.Module):
         self.belief_qty_head = nn.Linear(d, w.max_qty + 1)
         self.belief_quality_head = nn.Linear(d, w.n_quality)
         self.belief_price_head = nn.Linear(d, w.n_price_bins)
+        # Appended after the choice head so every earlier head keeps its index.
+        self.belief_color_head = nn.Linear(d, w.n_colors)
         # Which candidate in the lineup (referential phase only).  This is a
         # pointer rather than a flat classifier: it scores the hidden state *at
         # each candidate's own slots*, so "compare the message against this
@@ -210,7 +217,8 @@ class CommNet(nn.Module):
         parts.append(bos.expand(B, 1, d))
 
         tables = {K_VARIETY: self.variety_emb, K_QTY: self.qty_emb,
-                  K_QUALITY: self.quality_emb, K_PRICE: self.price_emb}
+                  K_QUALITY: self.quality_emb, K_PRICE: self.price_emb,
+                  K_COLOR: self.color_emb, K_FIELD: self.field_emb}
         cols = []
         for i, kind in enumerate(schema if schema is not None else self.schema):
             if kind == K_EMPTY:
@@ -247,20 +255,10 @@ class CommNet(nn.Module):
         """Hidden states for the prefix of length ``upto`` (default: whole sequence)."""
         n = self.seq_len if upto is None else upto
         mask = self._causal[:n, :n]
-        # bf16 autocast on the transformer layers only, and only on CUDA: that
-        # is where the arithmetic is, and keeping embeddings, heads and losses in
-        # fp32 means nothing downstream has to know. (The flag used to be set by
-        # the GPU presets and read by nothing.)
-        amp = self.cfg.train.amp and obs.is_cuda
 
         def run(tok):
             x = self.embed(obs, tok, schema, self_mask, upto=n)
-            if amp:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    h = self.encoder(x, mask=mask).float()
-            else:
-                h = self.encoder(x, mask=mask)
-            return self.norm(h)
+            return self.norm(self.encoder(x, mask=mask))
         # Gradient checkpointing covers embedding, layers and the final norm, so
         # all the backward pass keeps per call is the (soft) tokens that went in.
         # Generation re-encodes the conversation at every symbol step and the
@@ -297,6 +295,9 @@ class CommNet(nn.Module):
         return (self.belief_variety_head(h), self.belief_qty_head(h),
                 self.belief_quality_head(h), self.belief_price_head(h))
 
+    def report_color(self, h: torch.Tensor) -> torch.Tensor:
+        return self.belief_color_head(h)
+
     def candidate_embeddings(self, obs: torch.Tensor) -> torch.Tensor:
         """(B, K, d) -- each lineup candidate embedded from its own three fields.
 
@@ -319,9 +320,10 @@ class CommNet(nn.Module):
             # ranges do not match these tables, and the head's output is unused.
             # Clamping keeps the lookup legal rather than making every call site
             # have to know which phase it is in.
+            # a candidate is (fruit, colour, quality)
             vecs.append(
                 self.variety_emb(obs[:, i].clamp(0, self.variety_emb.num_embeddings - 1))
-                + self.qty_emb(obs[:, i + 1].clamp(0, self.qty_emb.num_embeddings - 1))
+                + self.color_emb(obs[:, i + 1].clamp(0, self.color_emb.num_embeddings - 1))
                 + self.quality_emb(
                     obs[:, i + 2].clamp(0, self.quality_emb.num_embeddings - 1)))
         return torch.stack(vecs, dim=1)
@@ -343,7 +345,8 @@ class CommNet(nn.Module):
         """Every discrete output, in the fixed order curriculum.py indexes."""
         choice = (self.choice_logits(h, obs) if obs is not None
                   else h.new_zeros((h.shape[0], self.n_candidates)))
-        return self.decision_heads(h) + self.belief_heads(h) + (choice,)
+        return (self.decision_heads(h) + self.belief_heads(h) + (choice,)
+                + (self.report_color(h),))
 
     def full_pass(self, obs: torch.Tensor, tokens: torch.Tensor,
                   read_positions: torch.Tensor, schema=None, self_mask=None):

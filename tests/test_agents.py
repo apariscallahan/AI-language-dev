@@ -19,14 +19,13 @@ import torch
 from orchard.agents import (CommNet, count_parameters, dialogue_offset, make_agent,
                             own_dialogue_positions, sequence_len)
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER
 from orchard.rollout import read_positions_for, run_episodes
 from orchard.world import World
 
 
 def tiny_cfg() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.max_qty = 6
     cfg.world.n_varieties = 3
     cfg.world.n_price_bins = 6

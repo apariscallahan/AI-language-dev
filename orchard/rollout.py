@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from .agents import Agent, dialogue_offset, own_dialogue_positions
 from .config import Config
 from .env import (BUYER, FARMER, Beliefs, Decision, Outcome, Transcript,
-                  buyer_obs, farmer_obs, resolve, speaker_of_turn)
+                  buyer_obs, farmer_obs, length_cost, resolve, speaker_of_turn)
 from .world import Scenario
 
 
@@ -56,6 +56,8 @@ class BatchRollout:
     outcomes: list[Outcome] = field(default_factory=list)
     f_emitted: torch.Tensor | None = None
     b_emitted: torch.Tensor | None = None
+    f_cost: torch.Tensor | None = None       # what each paid for its length
+    b_cost: torch.Tensor | None = None
     # vectorised path only
     res: dict[str, torch.Tensor] | None = None
     sb: Any = None
@@ -123,7 +125,7 @@ class BatchRollout:
         fd, fb = split_decision(self.f_dec[i])
         bd, bb = split_decision(self.b_dec[i])
         return resolve(self.cfg_ref, self.sb.scenario(i), fd, bd,
-                       int(self.f_emitted[i]), int(self.b_emitted[i]),
+                       float(self.f_cost[i]), float(self.b_cost[i]),
                        f_beliefs=fb, b_beliefs=bb)
 
     cfg_ref: Any = None
@@ -170,8 +172,19 @@ def n_outputs(cfg) -> int:
 
 def split_decision(row) -> tuple[Decision, Optional[Beliefs]]:
     """Unpack one agent's discrete outputs into a deal and (maybe) a belief."""
+    from .curriculum import H_BELIEF_COLOR
     v = [int(x) for x in row]
-    return Decision(*v[:4]), (Beliefs(*v[4:8]) if len(v) >= 8 else None)
+    if len(v) < 8:
+        return Decision(*v[:4]), None
+    colour = v[H_BELIEF_COLOR] if len(v) > H_BELIEF_COLOR else 0
+    return Decision(*v[:4]), Beliefs(*v[4:8], color=colour)
+
+
+def belief_columns(dec: "torch.Tensor") -> "torch.Tensor":
+    """(B, 5) the belief heads in the order decode_hits reads them, colour last."""
+    from .curriculum import H_BELIEF, H_BELIEF_COLOR
+    cols = list(H_BELIEF) + [H_BELIEF_COLOR]
+    return dec[:, cols]
 
 
 _GROUP_CACHE: dict[tuple, list[tuple[int, torch.Tensor]]] = {}
@@ -354,27 +367,29 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     b_pos = phase.own_positions(cfg, BUYER)
     f_emitted = content[:, f_pos].sum(dim=1) if f_pos else zeros
     b_emitted = content[:, b_pos].sum(dim=1) if b_pos else zeros
+    f_len = length_cost(cfg, tokens, f_pos)
+    b_len = length_cost(cfg, tokens, b_pos)
 
     outcomes: list[Outcome] = []
     res = None
     if referential:
         res = resolve_referential(cfg, scenarios, decs[phase.guesser][:, H_CHOICE],
-                                  f_emitted, b_emitted)
+                                  f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif mutual:
         rep = list(H_BELIEF[:3])
         res = resolve_mutual(cfg, scenarios, decs[FARMER][:, rep], decs[BUYER][:, rep],
-                             f_emitted, b_emitted)
+                             f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and tensor_in:
-        res = resolve_order(cfg, scenarios, decs[FARMER], f_emitted, b_emitted)
+        res = resolve_order(cfg, scenarios, decs[FARMER], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif tensor_in:
         use_bel = cfg.reward.belief_heads
         res = resolve_batch(cfg, scenarios, decs[FARMER][:, :4], decs[BUYER][:, :4],
-                            f_emitted, b_emitted,
-                            f_bel=decs[FARMER][:, 4:8] if use_bel else None,
-                            b_bel=decs[BUYER][:, 4:8] if use_bel else None)
+                            f_len, b_len,
+                            f_bel=belief_columns(decs[FARMER]) if use_bel else None,
+                            b_bel=belief_columns(decs[BUYER]) if use_bel else None)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     else:
         f_rew = torch.zeros(B)
@@ -382,7 +397,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         for i, sc in enumerate(scenarios):
             fd, fb = split_decision(decs[FARMER][i])
             bd, bb = split_decision(decs[BUYER][i])
-            o = resolve(cfg, sc, fd, bd, int(f_emitted[i]), int(b_emitted[i]),
+            o = resolve(cfg, sc, fd, bd, float(f_len[i]), float(b_len[i]),
                         f_beliefs=fb, b_beliefs=bb)
             outcomes.append(o)
             f_rew[i] = o.farmer_reward
@@ -395,6 +410,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         f_dec=decs[FARMER], b_dec=decs[BUYER],
         f_reward=f_rew, b_reward=b_rew,
         outcomes=outcomes, f_emitted=f_emitted, b_emitted=b_emitted,
+        f_cost=f_len, b_cost=b_len,
         res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg, phase=phase)
 
 

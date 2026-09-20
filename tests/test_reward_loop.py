@@ -17,14 +17,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.env import (BUYER, FARMER, Beliefs, Decision, decode_hits,
                          decode_score, resolve)
 from orchard.world import World
 
 
 def cfg_small() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -37,17 +36,18 @@ def cfg_small() -> Config:
 def truth(sc, role) -> Beliefs:
     if role == FARMER:
         b = sc.buyer
-        return Beliefs(b.want_variety, b.need_qty, b.min_quality, b.max_price)
+        return Beliefs(b.want_variety, b.need_qty, b.min_quality, b.max_price,
+                       color=b.want_color)
     return Beliefs(sc.buyer.want_variety, sc.offered_stock, sc.offered_quality,
-                   sc.farmer.reservation)
+                   sc.farmer.reservation, color=sc.offered_color)
 
 
 def blind(sc, cfg, role) -> Beliefs:
     """The best an agent can do from its own half plus the world's marginals."""
     if role == FARMER:
-        return Beliefs(0, 1, 0, cfg.world.n_price_bins - 2)
+        return Beliefs(0, 1, 0, cfg.world.n_price_bins - 2, color=0)
     return Beliefs(sc.buyer.want_variety, cfg.world.max_qty // 2,
-                   cfg.world.n_quality - 1, 1)
+                   cfg.world.n_quality - 1, 1, color=sc.buyer.want_color)
 
 
 def good_deal(sc) -> Decision:
@@ -149,9 +149,10 @@ class TestDecodingNeedsTheChannel(unittest.TestCase):
             f = truth(sc, FARMER).as_tuple()
             self.assertEqual(f, (sc.buyer.want_variety, sc.buyer.need_qty,
                                  sc.buyer.min_quality, sc.buyer.max_price))
-            # the buyer is asked only about farmer-side facts
+            # the buyer is asked only about farmer-side facts: how much of the
+            # lot there is, its quality and colour, and the farmer's floor price
             hits = decode_hits(truth(sc, BUYER), sc, BUYER, cfg)
-            self.assertEqual(len(hits), 3)
+            self.assertEqual(len(hits), 4)
             self.assertTrue(all(hits))
 
     def test_tolerances_are_respected(self):
@@ -204,7 +205,9 @@ class TestWorldOverlap(unittest.TestCase):
         nv = cfg.world.n_varieties
         base = max(sum(s.buyer.want_variety == v for s in scen) for v in range(nv)) / n
         from_barn = sum(
-            s.buyer.want_variety == max(range(nv), key=lambda v: s.farmer.stocks[v])
+            s.buyer.want_variety == max(
+                range(nv), key=lambda v: sum(s.farmer.stock_of(v, c)
+                                             for c in range(cfg.world.n_colors)))
             for s in scen) / n
         self.assertLess(from_barn, base + 0.03,
                         "the farmer's own stock now predicts what the buyer wants")

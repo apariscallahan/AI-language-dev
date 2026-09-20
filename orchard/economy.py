@@ -75,7 +75,7 @@ class Economy:
         inv = self.inventories[farm]
         st = inv.state
         return FarmerState(stocks=tuple(inv.remaining), qualities=st.qualities,
-                           reservation=st.reservation)
+                           n_colors=st.n_colors, reservation=st.reservation)
 
     # ------------------------------------------------------------------
     def begin_day(self) -> None:
@@ -161,7 +161,7 @@ class Economy:
     # tensor path
     # ------------------------------------------------------------------
     def inventory_tensors(self, device) -> tuple:
-        """Current per-farm stock, quality and cost, as (n_farms, V) / (n_farms,)."""
+        """Current per-farm stock, colour, quality and cost."""
         stocks = torch.tensor([inv.remaining for inv in self.inventories],
                               dtype=torch.long, device=device)
         quals = torch.tensor([list(inv.state.qualities) for inv in self.inventories],
@@ -190,9 +190,11 @@ class Economy:
         stocks, quals, res = self.inventory_tensors(sb.want_variety.device)
         return ScenarioBatch(
             stocks=stocks[f_idx].clamp(min=0), qualities=quals[f_idx],
-            reservation=res[f_idx], want_variety=sb.want_variety,
+            reservation=res[f_idx],
+            want_variety=sb.want_variety, want_color=sb.want_color,
             need_qty=sb.need_qty, min_quality=sb.min_quality,
-            max_price=sb.max_price, held_out=sb.held_out, day=self.day)
+            max_price=sb.max_price, held_out=sb.held_out,
+            n_colors=self.cfg.world.n_colors, day=self.day)
 
     def settle_tensor(self, f_idx, res: dict) -> dict[str, float]:
         """Deplete farms by the batch's completed sales, without a Python loop."""

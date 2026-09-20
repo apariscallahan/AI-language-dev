@@ -6,12 +6,18 @@ scientific point of the project (spec section 7) is running the *same* code with
 different settings and comparing, so all of it is config-driven and serialisable
 to JSON.
 
-**These defaults are the method.** They are what every run uses unless a preset
-says otherwise, and the presets in ``configs/`` may only change *scale* -- how
-many agents, how big a brain, how large a batch, how long a run, how much
-output (see ``PRESET_KEYS`` and ``tests/test_config.py``). That is what keeps the
-runs from drifting apart: there is one place where the method is written down,
-and it is here. The defaults themselves are the ``gpu_community`` scale.
+**These defaults are the configuration -- the only one.** Every run uses them,
+on a GPU or on a CPU, sizes included: the same agents, the same brains, the same
+batch, the same arithmetic (fp32 everywhere; there is no GPU-only precision
+mode). A GPU runs it faster; that is the only difference. A CPU check therefore
+tests exactly what a GPU run does, which is why the sizes are ones a CPU can
+test: 2 + 2 founders growing to 6 + 6, 48-wide brains, batch 256 -- the scale at
+which the CPU runs that worked were made.
+
+A run may change only how long it runs, its seed, its device and its output
+(``RUN_KEYS``). Anything else is printed as a method change in the run header and
+the report. ``configs/`` holds only named experiments (``EXPERIMENT_KEYS``), each
+changing the few settings that define it; ``tests/test_config.py`` enforces both.
 
 Anything whose meaning is "an amount of learning" -- rung budgets, how often
 promotion is checked, checkpoints, annealing, community growth, lifespans -- is
@@ -34,8 +40,20 @@ from typing import Any
 # --------------------------------------------------------------------------
 @dataclass
 class WorldConfig:
-    n_varieties: int = 3              # RED / GREEN / GOLD
-    n_quality: int = 3                # LOW / MED / HIGH
+    # A thing to talk about is a (fruit, colour, quality) triple: 4 x 3 x 3 = 36
+    # combinations, of which a quarter are never trained on (holdout_combo_frac).
+    # Fruit and colour are separate fields on purpose: a code can only describe a
+    # combination it has never seen if it names them separately, which is what
+    # makes an adjective worth inventing.
+    # The three fields are the same size on purpose. It lets the held-out set be
+    # a Latin square -- one quality withheld from every (fruit, colour) lot, one
+    # colour from every (fruit, quality), one fruit from every (colour, quality)
+    # -- so a lineup that varies one field always has exactly three trainable
+    # candidates. With unequal fields some lineups contain a combination that is
+    # never anyone's target, and a guesser can rule it out without listening.
+    n_varieties: int = 4              # fruit types: APPLE / BANANA / PEAR / PLUM
+    n_colors: int = 4                 # RED / YELLOW / GREEN / PURPLE
+    n_quality: int = 4                # LOW / MED / HIGH / PRIME
     max_qty: int = 8                  # quantities 1..max_qty
     n_price_bins: int = 6             # price discretised onto a grid
     price_min: float = 1.0
@@ -51,7 +69,13 @@ class WorldConfig:
     # skewed-but-independent marginals in World, this is what keeps roughly half
     # of encounters worth doing WITHOUT making either side's private state
     # predictable from the other's -- see the note at the top of world.py.
-    p_stocked: float = 0.90
+    # Per (fruit, colour) lot. The barn has n_varieties x n_colors of them, so a
+    # shopper's exact request is usually -- not always -- servable: 0.85 puts the
+    # share of rounds where a deal is possible at ~0.68, inside the 55-71% band
+    # the earlier sweeps found workable (higher makes "just accept" pay), and
+    # leaves the reasons a deal falls through spread: no such lot 0.49,
+    # quality 0.22, too few 0.21, price 0.09.
+    p_stocked: float = 0.85
     # Both sides are drawn fresh and independently every round -- that is what
     # keeps the private information genuinely private.  These shift the *marginals*
     # so the two distributions overlap often enough that closing a deal is the
@@ -68,7 +92,12 @@ class WorldConfig:
 
     # Held-out (variety, quantity) combinations, never sampled during training,
     # used for the zero-shot generalisation metric (spec 5.6).
-    holdout_frac: float = 0.10
+    # Share of (fruit, colour, quality) combinations never trained on anywhere,
+    # so describing one is a test of productivity, not recall. Rounded to whole
+    # qualities per (fruit, colour) lot, which is what makes the set balanced:
+    # every fruit, colour and quality appears equally often in training and in
+    # the held-out set (see world.ComboHoldout).
+    holdout_combo_frac: float = 0.25
     holdout_seed: int = 1234
 
     # Zipf-like skew on which meanings actually come up (addendum 2.2).  The
@@ -93,10 +122,15 @@ class WorldConfig:
 
     @property
     def variety_names(self) -> list[str]:
-        base = ["RED", "GREEN", "GOLD", "RUSSET", "BRAMLEY", "PIPPIN", "FUJI", "GALA",
-                "COX", "BRAEBURN", "JAZZ", "ENVY", "EMPIRE", "COMICE", "DISCOVERY", "SPARTAN"]
+        base = ["APPLE", "BANANA", "PEAR", "PLUM", "CHERRY", "MELON", "FIG", "MANGO",
+                "PEACH", "QUINCE", "LEMON", "GRAPE"]
         # Labels are for humans reading reports; the agents only ever see indices.
-        return (base + ["V%d" % i for i in range(len(base), self.n_varieties)])[: self.n_varieties]
+        return (base + ["F%d" % i for i in range(len(base), self.n_varieties)])[: self.n_varieties]
+
+    @property
+    def color_names(self) -> list[str]:
+        base = ["RED", "YELLOW", "GREEN", "PURPLE", "ORANGE", "BROWN"]
+        return (base + ["C%d" % i for i in range(len(base), self.n_colors)])[: self.n_colors]
 
     @property
     def quality_names(self) -> list[str]:
@@ -221,10 +255,10 @@ class ChannelConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    d_model: int = 96
-    n_layers: int = 3
+    d_model: int = 48
+    n_layers: int = 2
     n_heads: int = 4
-    d_ff: int = 256
+    d_ff: int = 96
     dropout: float = 0.0
 
 
@@ -286,7 +320,13 @@ class RewardConfig:
     one_sided_accept: float = -0.10 # one accepts, one rejects
     missed_deal: float = -0.10      # viable but both rejected
     bad_deal: float = -0.15         # not viable but both accepted
-    symbol_cost: float = 0.03       # per emitted symbol -- atoms, hyphens and spaces
+    # Length costs, split so that *words* are pressed to be short while an
+    # utterance may hold several of them. A fused name for a whole (fruit,
+    # colour, quality) needs one long word; a compositional one needs two or
+    # three short words, and must not be taxed for it.
+    atom_cost: float = 0.03         # per atom after the first in each word
+    word_cost: float = 0.005        # per word -- deliberately much smaller
+    symbol_cost: float = 0.0        # per emitted symbol -- atoms, hyphens and spaces
                                     # all count (addendum 2.1).  A soft pressure toward
                                     # brevity on top of the hard per-turn cap, because
                                     # people do not routinely max out the longest
@@ -354,7 +394,7 @@ class CurriculumConfig:
     phase has demonstrably worked.
     """
     enabled: bool = True
-    n_candidates: int = 4            # lineup size in the referential phase
+    n_candidates: int = 3            # lineup size: every field has at least 3 values
 
     # ---- promotion, on evidence rather than on a schedule -----------------
     # (minimum, maximum) training updates per rung. A rung that meets its
@@ -363,9 +403,12 @@ class CurriculumConfig:
     # The CPU runs took the lineup off at ~550 updates. Rungs not named use
     # ``default_rung_updates``.
     rung_budget_updates: dict = field(default_factory=lambda: {
-        "refer": [80, 2500],
-        "refer-swap": [80, 2500],
-        "refer-mutual": [80, 3500],
+        "name-fruit": [80, 1500],
+        "name-color": [80, 1500],
+        "name-quality": [80, 1500],
+        "name-all": [80, 2500],
+        "describe-one": [80, 2500],
+        "mutual": [80, 3500],
         "order": [80, 2500],
         "haggle": [80, 3500],
         "bargain": [80, 3500],
@@ -379,6 +422,12 @@ class CurriculumConfig:
     # Empty = the bottom rung, which is what every real run should use.
     start_phase: str = ""
     refer_min_success: float = 0.45    # vs 1/n_candidates by chance
+    # Held-out combinations are never trained on, so success on them is the test
+    # of whether the code has reusable parts rather than one name per thing. A
+    # naming rung is not passed until held-out success reaches this share of
+    # success on trained combinations (and is itself clear of chance): a fused
+    # code scores at chance here however well drilled it is.
+    min_holdout_ratio: float = 0.60
     trade_min_success: float = 0.15
     min_success_over_chance: float = 2.0
     min_topsim_over_null: float = 0.10
@@ -387,7 +436,11 @@ class CurriculumConfig:
     min_positional_structure: float = 0.15   # mean slot->field strength, each role
     mutual_min_report: float = 0.30          # each role reports the other's tuple
     mutual_min_success: float = 0.10         # both do, in the same round
-    mutual_qty_tol: int = 0                  # quantity must be reported exactly
+    # The first rung at which the population is split into farmers and buyers.
+    # Below it everyone is one pool speaking one language, taking both sides of
+    # the lineup; at the split each agent is copied into a farmer and a buyer,
+    # so both roles start out fluent in the same language.
+    split_roles_at: str = "order"
     # each role, each field (variety, quantity, quality): share of headroom over
     # a muted channel, so no field can ride on the others
     min_field_transfer: float = 0.25
@@ -400,9 +453,6 @@ class CurriculumConfig:
     # is needed to pick the target in ~46% of rounds (31% with independent
     # candidates), variety in ~36%, quality in ~33%.
     hard_distractor_frac: float = 0.75
-    # Share of (variety, quantity, quality) combinations never used in the lineup
-    # rungs, so describing one is a test of productivity, not recall.
-    holdout_tuple_frac: float = 0.1
     # If a rung never hits threshold inside its budget, advancing anyway would
     # just rebuild the same failure one rung up.  "stop" ends the run and writes
     # the report; "hold" keeps training and flags it loudly.
@@ -414,8 +464,8 @@ class CurriculumConfig:
 # --------------------------------------------------------------------------
 @dataclass
 class PopulationConfig:
-    n_farmers: int = 48
-    n_buyers: int = 48
+    n_farmers: int = 6
+    n_buyers: int = 6
     # A community can be founded small and grow to n_farmers / n_buyers. With
     # founders > 0 the run starts with that many of each, and once the first
     # curriculum rung has been passed a newcomer of each role joins every
@@ -427,7 +477,7 @@ class PopulationConfig:
     # and two invent one in ~80k. 0 = start at full size.
     founders_farmers: int = 2
     founders_buyers: int = 2
-    grow_every_updates: int = 20
+    grow_every_updates: int = 40
     turnover: bool = True                 # master switch for birth/death (spec 9)
     # In training updates the agent took part in: how much it has learned, the
     # same at any batch size or population size.
@@ -456,7 +506,7 @@ class BottleneckConfig:
     max_samples: int = 40_000             # a ceiling for tractability, not a squeeze
     n_samples: int = 0                    # 0 = derive from coverage; >0 forces a cap
     epochs: int = 3
-    batch_size: int = 1024
+    batch_size: int = 256
     lr: float = 1e-3
     store_capacity: int = 40_000          # ring buffer of recent successful episodes
     only_successful: bool = True          # learn from trades that worked
@@ -496,11 +546,9 @@ class TrainConfig:
     # units as the task advantage. Through the Gumbel path they have no route at
     # all -- the straight-through gradient only carries what the listener did.
     shaping_reinforce: float = 0.2
-    # Batch multiplier per rung, e.g. {"refer": 2}. Rungs with one short turn use
-    # little memory, so a larger batch there buys lower-noise updates for almost
-    # no extra time per update. Absent rungs use 1.
-    rung_batch_scale: dict = field(default_factory=lambda: {
-        "refer": 2, "refer-swap": 2, "order": 2})
+    # Batch multiplier per rung, e.g. {"refer": 2}. Absent rungs use 1. Empty:
+    # every rung runs at the batch the lineup was shown to form a code at.
+    rung_batch_scale: dict = field(default_factory=dict)
     # The convention bonus gets its own coefficient on the same route: it has to
     # be strong enough to seed a shared code before the task pays anything,
     # whereas the costs have to be weak enough not to silence a young channel.
@@ -519,9 +567,9 @@ class TrainConfig:
     # where the buyer describes for the first time -- run without it, and it
     # joins at `refer-mutual`, the rung it was added for (drawing quantity and
     # quality out of a code that already carries variety).
-    hindsight_from_rung: str = "refer-mutual"
-    episodes: int = 60_000_000            # the run's ceiling; rung budgets stop it earlier
-    batch_size: int = 4096                # episodes per update (x rung_batch_scale)
+    hindsight_from_rung: str = "mutual"
+    episodes: int = 6_000_000             # the run's ceiling (~23k updates); rung budgets stop it earlier
+    batch_size: int = 256                 # episodes per update (x rung_batch_scale)
     lr: float = 3e-4
     grad_clip: float = 1.0
     value_coef: float = 0.5
@@ -541,21 +589,15 @@ class TrainConfig:
     # want for a script that has to run on a laptop and on a cloud box unchanged.
     device: str = "auto"
     torch_threads: int = 4
-    # bfloat16 autocast on the transformer layers, CUDA only (ignored on CPU).
-    # Off: the GPU then does the CPU's arithmetic exactly, so a CPU check says
-    # something about a GPU run. A code forms here from very small signals (the
-    # listener's sensitivity to a message is ~0.02 in logits before lift-off),
-    # and bf16 keeps 8 bits of mantissa. The models are small enough that the
-    # GPU is limited by the number of kernel launches, not arithmetic: fp32 ran
-    # as fast as bf16 in the RTX 4090 diagnostics.
-    amp: bool = False
+    # Everything runs in fp32 on every device: there is no bf16 or TF32 mode (both
+    # were removed so a GPU can never compute something a CPU check does not; a
+    # code forms here from ~0.02-logit signals).
+    #
     # Recompute encoder activations in the backward pass instead of keeping them.
-    # The Gumbel path builds one graph spanning every symbol step of an episode,
-    # so activation memory grows as batch x sequence x width x symbol-steps and is
-    # what limits big configurations long before parameter count does.  Costs
-    # roughly 30% more compute and buys back most of that memory.
-    grad_checkpoint: bool = True
-    tf32: bool = False              # TF32 matmuls on Ampere+: off for the same reason as amp
+    # Memory only -- tests/test_config.py checks the update is the same -- so a
+    # run may switch it (it is a RUN_KEY). Not needed at this size (under 1 GB);
+    # it is what made batch 4,096 fit on a 24 GB card.
+    grad_checkpoint: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -571,9 +613,9 @@ class LogConfig:
     # random sample of agents per role instead of every one.
     max_agents_probed: int = 8
     stability_probes: int = 32       # fixed probe meanings re-queried each checkpoint
-    intelligibility_episodes: int = 4096
-    zeroshot_episodes: int = 4096
-    ablation_episodes: int = 4096
+    intelligibility_episodes: int = 1024
+    zeroshot_episodes: int = 1024
+    ablation_episodes: int = 1024
     word_analysis_samples: int = 400   # messages sampled for word-unit statistics
     rare_frequent_split: float = 0.5   # quantile splitting rare from frequent meanings
     track_form_survival: bool = True   # follow specific meanings across generations
@@ -592,7 +634,7 @@ class LogConfig:
 
 @dataclass
 class Config:
-    name: str = "gpu_community"
+    name: str = "orchard"
     world: WorldConfig = field(default_factory=WorldConfig)
     economy: EconomyConfig = field(default_factory=EconomyConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
@@ -666,38 +708,37 @@ LEGACY_KEYS = {
     "train.algo": "Gumbel-softmax is the only training path",
     "train.vectorised": "the tensor world is the only training path",
     "train.compile": "torch.compile was never wired in",
+    "curriculum.holdout_tuple_frac": "renamed: world.holdout_combo_frac (a third of the "
+                                     "(fruit, colour, quality) combinations)",
+    "world.holdout_frac": "renamed: world.holdout_combo_frac",
+    "curriculum.mutual_qty_tol": "the mutual rung reports (fruit, colour, quality), "
+                                 "each exactly; there is no quantity in a thing",
+    "train.amp": "removed: every device computes in fp32, so a CPU check is a GPU run",
+    "train.tf32": "removed: every device computes in fp32, so a CPU check is a GPU run",
 }
 
 
 # --------------------------------------------------------------------------
-# What a preset may change
+# What a run may change without changing what is simulated
 # --------------------------------------------------------------------------
-# Scale, hardware and output. Everything else is the method and lives in the
-# defaults above; tests/test_config.py fails if a preset in configs/ sets
-# anything outside this list (plus its entry in PRESET_EXTRA_KEYS). Lower-
-# precision arithmetic (train.amp, train.tf32) is deliberately *not* here: it
-# would make a GPU run compute something a CPU check does not.
-PRESET_KEYS = frozenset({
-    "name",
-    "population.n_farmers", "population.n_buyers",
-    "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
-    "train.episodes", "train.batch_size", "train.rung_batch_scale", "train.seed",
-    "train.device", "train.torch_threads", "train.grad_checkpoint",
-    "bottleneck.batch_size",
+# How long, which seed, which device, how much output. Nothing here changes
+# what an agent sees, learns from or is judged on; every other setting does,
+# and a run that changes one is told so (``method_changes``).
+RUN_KEYS = frozenset({
+    "name", "train.episodes", "train.seed", "train.device", "train.torch_threads",
+    "train.grad_checkpoint",                 # memory only; same update (tested)
     "curriculum.on_stall", "curriculum.start_phase",
-}) | frozenset("log." + f.name for f in dataclasses.fields(LogConfig))
+    "log.ledger_stride", "log.transcript_stride", "log.heartbeat_seconds",
+    "log.plot", "log.flush_every", "log.snapshot_every_checkpoint",
+    "log.n_example_transcripts",
+})
 
-# The few presets that are deliberately a different experiment, and what they
-# may change beyond scale. Anything here is printed as a method change in the
-# run header and the report.
-PRESET_EXTRA_KEYS = {
-    # a plumbing check: short lifespans and fast growth so a ~500-update run
-    # exercises deaths, births and the bottleneck
-    "gpu_smoke": frozenset({"population.lifespan_min", "population.lifespan_max",
-                            "population.grow_every_updates"}),
+# Named experiments in configs/, and the settings each is allowed to change.
+# They are method changes by design, and are reported as such.
+EXPERIMENT_KEYS = {
     # more meanings than atoms, so an atom cannot stand for a whole meaning
-    "gpu_duality": frozenset({"world.n_varieties", "channel.atomic_vocab",
-                              "channel.max_symbols"}),
+    "duality": frozenset({"world.n_varieties", "channel.atomic_vocab",
+                          "channel.max_symbols"}),
 }
 
 
@@ -715,16 +756,16 @@ def flat_keys(d: dict[str, Any], prefix: str = "") -> list[str]:
 
 
 def method_changes(cfg: "Config") -> dict[str, tuple[Any, Any]]:
-    """Every setting outside ``PRESET_KEYS`` that differs from the method.
+    """Every setting outside ``RUN_KEYS`` that differs from the configuration.
 
-    ``{"reward.symbol_cost": (default, this run's)}``. Empty for every scale-only
-    preset; the run header and the report print whatever is here, so a run that
-    changed the method cannot be mistaken for one that did not.
+    ``{"reward.symbol_cost": (default, this run's)}``. The run header and the
+    report print whatever is here, so a run that changed anything that is
+    simulated -- sizes included -- cannot be mistaken for one that did not.
     """
     base, mine = Config().to_dict(), cfg.to_dict()
     out = {}
     for key in flat_keys(mine):
-        if key in PRESET_KEYS:
+        if key in RUN_KEYS:
             continue
         a, b = base, mine
         for part in key.split("."):
@@ -781,8 +822,6 @@ def add_config_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--threads", type=int, default=None)
     p.add_argument("--device", type=str, default=None,
                    help="auto (default), cpu, cuda, or cuda:N")
-    p.add_argument("--amp", type=_tobool, default=None,
-                   help="on/off: bfloat16 autocast")
     p.add_argument("--persistent-inventory", type=_tobool, default=None,
                    help="on/off: farms hold a depleting lot across market days")
     p.add_argument("--no-plot", action="store_true")
@@ -833,7 +872,6 @@ def config_from_args(args: argparse.Namespace) -> Config:
         ("ledger_stride", cfg.log, "ledger_stride"),
         ("threads", cfg.train, "torch_threads"),
         ("device", cfg.train, "device"),
-        ("amp", cfg.train, "amp"),
         ("persistent_inventory", cfg.economy, "persistent_inventory"),
     ]
     for arg_name, section, key in simple:

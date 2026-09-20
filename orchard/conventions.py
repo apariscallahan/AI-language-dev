@@ -56,7 +56,7 @@ import torch
 
 from .config import Config
 from .env import BUYER, FARMER, parse_words
-from .world import K_EMPTY
+from .world import K_EMPTY, K_FIELD
 
 
 def _edit(a: Sequence[int], b: Sequence[int]) -> int:
@@ -80,7 +80,7 @@ def similarity(a: Sequence[int], b: Sequence[int]) -> float:
 def n_real_fields(cfg: Config, role: int, phase) -> int:
     """How many leading observation slots hold the speaker's actual meaning."""
     from .curriculum import phase_schema
-    return sum(1 for k in phase_schema(cfg, role, phase) if k != K_EMPTY)
+    return sum(1 for k in phase_schema(cfg, role, phase) if k not in (K_EMPTY, K_FIELD))
 
 
 class PopulationUsage:

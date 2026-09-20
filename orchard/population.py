@@ -59,15 +59,55 @@ class Population:
         p = cfg.population
         nf = p.founders_farmers if p.founders_farmers > 0 else p.n_farmers
         nb = p.founders_buyers if p.founders_buyers > 0 else p.n_buyers
-        self.farmers: list[Agent] = [self._spawn(FARMER, s, 0, 0, initial=True)
-                                     for s in range(nf)]
-        self.buyers: list[Agent] = [self._spawn(BUYER, s, 0, 0, initial=True)
-                                    for s in range(nb)]
+        # Until trading begins there are no roles: one pool of agents takes both
+        # seats of a lineup, so there is one language rather than two that have
+        # to be reconciled. ``farmers`` and ``buyers`` are the same list, and
+        # pairing never puts an agent opposite itself.
+        self.shared = bool(cfg.curriculum.enabled and cfg.curriculum.split_roles_at)
+        if self.shared:
+            n = max(nf, nb)
+            self.farmers: list[Agent] = [self._spawn(FARMER, s, 0, 0, initial=True)
+                                         for s in range(n)]
+            self.buyers: list[Agent] = self.farmers
+        else:
+            self.farmers = [self._spawn(FARMER, s, 0, 0, initial=True)
+                            for s in range(nf)]
+            self.buyers = [self._spawn(BUYER, s, 0, 0, initial=True)
+                           for s in range(nb)]
 
     @property
     def full_size(self) -> bool:
         p = self.cfg.population
+        if self.shared:
+            return len(self.farmers) >= max(p.n_farmers, p.n_buyers)
         return len(self.farmers) >= p.n_farmers and len(self.buyers) >= p.n_buyers
+
+    # ------------------------------------------------------------------
+    def split_roles(self, episode: int) -> int:
+        """Trading begins: copy every agent into a farmer and a buyer.
+
+        Both roles therefore start out fluent in the one language the pool
+        learned, which is the point of keeping them together until now. The copy
+        carries the weights *and* the optimiser state; only the role embedding
+        each one uses differs from here on.
+        """
+        import copy as _copy
+        if not self.shared:
+            return 0
+        pool = self.farmers
+        farmers, buyers = [], []
+        for slot, a in enumerate(pool):
+            twin = _copy.deepcopy(a)
+            twin.agent_id = self._next_id
+            self._next_id += 1
+            twin.role = BUYER
+            twin.net.role = BUYER
+            a.slot = twin.slot = slot
+            farmers.append(a)
+            buyers.append(twin)
+        self.farmers, self.buyers = farmers, buyers
+        self.shared = False
+        return len(pool)
 
     def add_newcomer(self, role: int, episode: int,
                      on_birth: Optional[Callable[[Agent, "BirthEvent"], None]] = None
@@ -110,7 +150,7 @@ class Population:
         return self.farmers if role == FARMER else self.buyers
 
     def all_agents(self) -> list[Agent]:
-        return self.farmers + self.buyers
+        return list(self.farmers) if self.shared else self.farmers + self.buyers
 
     def pair(self, n: int, device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
         """Farmer/Buyer pairings for ``n`` episodes (spec 1.1: a marketplace).
@@ -125,6 +165,14 @@ class Population:
         """
         nf, nb = len(self.farmers), len(self.buyers)
         i = torch.arange(n, device=device)
+        if self.shared:
+            # One pool: seat A is agent i % n, seat B is a *different* agent, and
+            # over a batch every ordered pair comes up equally often.
+            if nf < 2:
+                return i % nf, i % nf
+            a = i % nf
+            step = 1 + torch.div(i, nf, rounding_mode="floor") % (nf - 1)
+            return a, (a + step) % nf
         return i % nf, torch.div(i, nf, rounding_mode="floor") % nb
 
     # ------------------------------------------------------------------
@@ -133,7 +181,10 @@ class Population:
         """Age every agent by the episodes it actually played, and tally its results."""
         if getattr(batch, "res", None) is not None:
             return self._record_from_tensors(f_idx, b_idx, batch)
-        for idx, pool in ((f_idx, self.farmers), (b_idx, self.buyers)):
+        seats = ((f_idx, self.farmers), (b_idx, self.buyers))
+        if self.shared:      # one pool in both seats: it took part in one update
+            seats = ((torch.cat([f_idx, b_idx]), self.farmers),)
+        for idx, pool in seats:
             for a_i in set(int(x) for x in idx.tolist()):
                 pool[a_i].updates += 1            # took part in this update
         for i in range(len(batch)):
@@ -158,9 +209,16 @@ class Population:
         """The same tallies, as a handful of scatter_adds instead of B iterations."""
         res = batch.res
         succ = res["success"]
-        for pool, idx, rew, money in (
-                (self.farmers, f_idx, batch.f_reward, res["farmer_profit"]),
-                (self.buyers, b_idx, batch.b_reward, res["buyer_savings"])):
+        seats = ((self.farmers, f_idx, batch.f_reward, res["farmer_profit"]),
+                 (self.buyers, b_idx, batch.b_reward, res["buyer_savings"]))
+        if self.shared:
+            # The same agents fill both seats, so their episodes and rewards are
+            # the two seats added together -- and it is still *one* update each.
+            seats = ((self.farmers, torch.cat([f_idx, b_idx]),
+                      torch.cat([batch.f_reward, batch.b_reward]),
+                      torch.cat([res["farmer_profit"], res["buyer_savings"]])),)
+            succ = torch.cat([succ, succ])
+        for pool, idx, rew, money in seats:
             n = len(pool)
             idx = idx.long()
             counts = torch.zeros(n, device=idx.device).scatter_add_(
@@ -168,10 +226,13 @@ class Population:
             rewards = torch.zeros(n, device=idx.device).scatter_add_(0, idx, rew.float())
             successes = torch.zeros(n, device=idx.device).scatter_add_(
                 0, idx, succ.float())
+            qty, val = res["traded_qty"], res["trade_value"]
+            if self.shared:
+                qty, val = torch.cat([qty, qty]), torch.cat([val, val])
             apples = torch.zeros(n, device=idx.device).scatter_add_(
-                0, idx, (res["traded_qty"] * succ.long()).float())
+                0, idx, (qty * succ.long()).float())
             value = torch.zeros(n, device=idx.device).scatter_add_(
-                0, idx, res["trade_value"] * succ.float())
+                0, idx, val * succ.float())
             profit = torch.zeros(n, device=idx.device).scatter_add_(
                 0, idx, money * succ.float())
             for a, c, r, sx, ap, va, pf in zip(

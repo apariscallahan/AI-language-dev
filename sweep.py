@@ -1,7 +1,7 @@
 """Run one configuration across several seeds and report the spread.
 
-    python sweep.py --config configs/gpu_small.json --out runs/sweep --seeds 5
-    python sweep.py --config configs/gpu_small.json --out runs/ablate --seeds 5 \\
+    python sweep.py --out runs/sweep --seeds 5
+    python sweep.py --out runs/ablate --seeds 5 \\
         --arm "bottleneck_on:" --arm "bottleneck_off:--bottleneck off"
 
 Why this exists
@@ -62,10 +62,12 @@ def final_metrics(run_dir: str) -> Optional[dict]:
     return rows[-1] if rows else None
 
 
-def launch(cfg_path: str, out: str, seed: int, extra: list[str],
+def launch(cfg_path: Optional[str], out: str, seed: int, extra: list[str],
            quiet: bool = True) -> subprocess.Popen:
-    cmd = [sys.executable, "-m", "orchard.run", "--config", cfg_path,
-           "--out", out, "--name", os.path.basename(out), "--seed", str(seed)]
+    cmd = [sys.executable, "-m", "orchard.run"]
+    if cfg_path:                    # a named experiment; default: the configuration
+        cmd += ["--config", cfg_path]
+    cmd += ["--out", out, "--name", os.path.basename(out), "--seed", str(seed)]
     if quiet:
         cmd.append("--quiet")
     cmd += extra
@@ -76,7 +78,8 @@ def launch(cfg_path: str, out: str, seed: int, extra: list[str],
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", default=None,
+                    help="a named experiment in configs/; default: the configuration")
     ap.add_argument("--out", required=True, help="directory to put the arms in")
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--seed0", type=int, default=0)

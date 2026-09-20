@@ -41,7 +41,8 @@ from .config import Config
 from .env import BUYER, FARMER, buyer_obs, farmer_obs, obs_for, speaker_of_turn
 from .population import Population
 from .rollout import run_episodes
-from .world import (K_EMPTY, K_PRICE, K_QTY, K_QUALITY, K_VARIETY, KIND_NAMES,
+from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
+                    KIND_NAMES,
                     Scenario, World, field_labels, field_spans, obs_schema)
 
 
@@ -142,19 +143,20 @@ def meaning_distance(a: Sequence[int], b: Sequence[int], cfg: Config, role: int,
     kinds = list(kinds) if kinds is not None else obs_schema(cfg.world, role)
     if metric == "hamming":
         return float(sum(1 for x, y, k in zip(a, b, kinds)
-                         if k != K_EMPTY and x != y))
+                         if k not in (K_EMPTY, K_FIELD) and x != y))
     if metric == "l1":
         # keeps the ordinal structure of quantity and price that Hamming discards
         spans = _spans_for(cfg, kinds)
         return float(sum(abs(x - y) / sp
-                         for x, y, k, sp in zip(a, b, kinds, spans) if k != K_EMPTY))
+                         for x, y, k, sp in zip(a, b, kinds, spans)
+                         if k not in (K_EMPTY, K_FIELD)))
     raise ValueError("unknown meaning metric %r" % (metric,))
 
 
 def _spans_for(cfg: Config, kinds: Sequence[int]) -> list[int]:
     w = cfg.world
-    spans = {K_EMPTY: 1, K_VARIETY: max(w.n_varieties - 1, 1), K_QTY: max(w.max_qty, 1),
-             K_QUALITY: max(w.n_quality - 1, 1), K_PRICE: max(w.n_price_bins - 1, 1)}
+    from .world import field_spans_by_kind
+    spans = field_spans_by_kind(w)
     return [spans[k] for k in kinds]
 
 
@@ -233,13 +235,18 @@ def _strip(cfg: Config, row: Sequence[int]) -> list[int]:
 @torch.no_grad()
 def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequence[int]],
                             *, context: Optional[torch.Tensor] = None,
-                            device: str = "cpu", phase=None) -> Optional[list[list[int]]]:
+                            device: str = "cpu", phase=None,
+                            role: Optional[int] = None) -> Optional[list[list[int]]]:
     """This agent's own first utterance for each meaning, greedily decoded.
 
     The first speaker's utterance is a pure function of its private observation.
     A later speaker's also depends on what was said to it, so ``context``
     supplies one fixed opening for every probe -- holding the conversation
     constant so the variation measured is the probed agent's own.
+
+    ``role`` is the seat being probed, which is not always the agent's own role:
+    below the trading rungs one pool of agents fills both seats, so the seat the
+    view describes from is what decides the schema and whose words are whose.
 
     ``phase`` decides who speaks when, what the observation slots mean, and which
     slots are "mine". Without it this is the trading task (buyer opens). Returns
@@ -250,7 +257,8 @@ def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequen
     from .curriculum import ladder, phase_schema
     c = cfg.channel
     ph = phase if phase is not None else ladder(cfg)[-1]
-    turns = ph.turns_of(cfg, agent.role)
+    seat = agent.role if role is None else role
+    turns = ph.turns_of(cfg, seat)
     if not turns:
         return None
     turn = turns[0]
@@ -263,8 +271,8 @@ def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequen
             context = torch.full((turn * L,), c.pad_id, dtype=torch.long, device=device)
             context[0] = c.eos_id
         tokens[:, :turn * L] = context[:turn * L].unsqueeze(0)
-    greedy_turn(cfg, agent, obs, tokens, turn, schema=phase_schema(cfg, agent.role, ph),
-                self_mask=ph.self_mask(cfg, agent.role, device))
+    greedy_turn(cfg, agent, obs, tokens, turn, schema=phase_schema(cfg, seat, ph),
+                self_mask=ph.self_mask(cfg, seat, device))
     return [_strip(cfg, tokens[i, turn * L:(turn + 1) * L]) for i in range(n)]
 
 
@@ -282,16 +290,32 @@ def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
     return field_labels(cfg.world, role)
 
 
-def tuple_meanings(cfg: Config, n: int, seed: int = 0) -> list[tuple[int, ...]]:
-    """(variety, quantity, quality) meanings from the lineup marginals, padded."""
-    from .curriculum import ReferentialWorld
+def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
+                   held_out: bool = False) -> list[tuple[int, ...]]:
+    """(fruit, colour, quality) things to describe, plus the field being asked about.
+
+    The describer's observation in a naming rung is the thing *and* the query, so
+    a probe that left the query out would be asking about the wrong rung: in
+    ``name-color`` every probe has to say "colour" for the answer to mean
+    anything.
+    """
+    from .curriculum import ASK_ALL, ReferentialWorld
     from .world import n_obs_slots
     g = torch.Generator()
     g.manual_seed(seed)
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
-    rows = rw._draw(n).tolist()
+    rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
-    return [tuple(r) + (0,) * (width - len(r)) for r in rows]
+    q = ASK_ALL
+    if phase is not None and getattr(phase, "query", None) is not None:
+        q = int(phase.query)
+    out = []
+    for i, r in enumerate(rows):
+        if phase is not None and getattr(phase, "mixed_query", False):
+            q = i % 3                      # every field equally often
+        row = tuple(r) + (q,)
+        out.append(row + (0,) * (width - len(row)))
+    return out
 
 
 def sample_meanings(cfg: Config, world: World, role: int, n: int,
@@ -299,7 +323,8 @@ def sample_meanings(cfg: Config, world: World, role: int, n: int,
                     seed: Optional[int] = None) -> list[tuple[int, ...]]:
     if phase is not None and phase.tuples:
         return tuple_meanings(cfg, n, seed if seed is not None
-                              else random.Random().randrange(1 << 30))
+                              else random.Random().randrange(1 << 30),
+                              phase=phase, held_out=bool(held_out))
     from .world import n_obs_slots
     width = n_obs_slots(cfg.world, cfg)
     out = []
@@ -391,14 +416,14 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
                                    seed=rng.randrange(1 << 30))
         per_agent = []
         from .properties import disentanglement
-        real = [i for i, k in enumerate(kinds) if k != K_EMPTY]
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
         pool = list(pop.pool(role))
         cap = max(1, cfg.log.max_agents_probed)
         if len(pool) > cap:
             pool = random.Random(cfg.train.seed + len(pool)).sample(pool, cap)
         for agent in pool:
             msgs = utterances_for_meanings(cfg, agent, meanings, context=ctx,
-                                           device=device, phase=view)
+                                           device=device, phase=view, role=role)
             r = topographic_similarity(meanings, msgs, cfg, role, metric="hamming",
                                        rng=rng, kinds=kinds, n_null=n_null)
             r_l1 = topographic_similarity(meanings, msgs, cfg, role, metric="l1",
@@ -540,6 +565,7 @@ class StabilityTracker:
             all_msgs: list[list[list[int]]] = []
             for agent in pop.pool(role):
                 msgs = utterances_for_meanings(self.cfg, agent, probes, context=ctx,
+                                               role=role,
                                                device=device, phase=view)
                 if msgs is None:
                     continue
@@ -893,8 +919,10 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
         req.append(tuple(r))
     same, diff = [], []
     for agent in pop.buyers:
-        a = utterances_for_meanings(cfg, agent, tup, device=device, phase=lineup)
-        b = utterances_for_meanings(cfg, agent, req, device=device, phase=trade)
+        a = utterances_for_meanings(cfg, agent, tup, device=device, phase=lineup,
+                                    role=lineup.informer)
+        b = utterances_for_meanings(cfg, agent, req, device=device, phase=trade,
+                                    role=BUYER)
         if a is None or b is None:
             continue
         strip = lambda u: [t for t in u if t < cfg.channel.end_id]
@@ -914,7 +942,8 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
 def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    sampler_for, n_eval: int, n_topsim: int, n_semantics: int,
                    chance: float, device: str = "cpu",
-                   rng: Optional[random.Random] = None) -> dict[str, Any]:
+                   rng: Optional[random.Random] = None,
+                   holdout_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
     * per view (both describers, in a swap rung): intact / muted success and the
@@ -923,8 +952,11 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     * per speaking role: topographic similarity against its own shuffled null,
       and positional structure (mean slot->field strength), so each role's
       *describing* is measured on its own utterances;
-    * in the mutual rung: each role's accuracy at reporting the other's tuple,
-      intact and muted.
+    * in the mutual rung: each role's accuracy at reporting the other's thing,
+      intact and muted;
+    * success on **held-out combinations** -- ones no agent was ever trained on.
+      A code with reusable parts describes them; a fused one, however well
+      drilled, cannot, so this is the test that separates the two.
     """
     rng = rng or random.Random(0)
     f_all = list(range(len(pop.farmers)))
@@ -961,6 +993,35 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["success"] = sum(good) / len(good) if good else float("nan")
     good = [x for x in trans if x == x]
     out["transfer"] = sum(good) / len(good) if good else float("nan")
+
+    # Held-out combinations, played exactly like the rung itself.
+    out["holdout_success"] = float("nan")
+    out["holdout_ratio"] = float("nan")
+    if holdout_sampler_for is not None:
+        hs, seen = [], []
+        for v in phase.views():
+            sam = holdout_sampler_for(v)
+            plain = sampler_for(v)
+            if sam is None:
+                continue
+            try:
+                h = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
+                                     device=device, rng=rng, phase=v, sampler=sam)
+                # the comparison run: seen combinations, same lineup shape
+                s = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
+                                     device=device, rng=rng, phase=v,
+                                     sampler=lambda n, _ho=False, _p=plain: _p(n, held_out=False))
+            except Exception:
+                continue
+            if h.get("n"):
+                hs.append(h["success_rate"])
+                seen.append(s["success_rate"])
+        if hs:
+            out["holdout_success"] = sum(hs) / len(hs)
+            base = sum(seen) / len(seen) if seen else float("nan")
+            out["seen_success"] = base
+            out["holdout_ratio"] = (out["holdout_success"] / base
+                                    if base == base and base > 1e-9 else float("nan"))
     if (phase.mutual or phase.order) and out["views"]:
         # no analytic chance for "report / fill a whole tuple": silence is the floor
         out["chance"] = out["views"][0]["muted_success"]
@@ -1170,7 +1231,7 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
         view = speaker_view(phase, cfg, role) if phase is not None else None
         kinds = phase_kinds(cfg, role, view)
         labels = phase_labels(cfg, role, view)
-        real = [i for i, k in enumerate(kinds) if k != K_EMPTY]
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
         ctx = opening_context(cfg, pop, world, view, device)
         meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
                                    seed=rng.randrange(1 << 30))
@@ -1182,6 +1243,7 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
             if not idx:
                 continue
             got = utterances_for_meanings(cfg, agent, [meanings[j] for j in idx],
+                                          role=role,
                                           context=ctx, device=device, phase=view)
             for j, m in zip(idx, got):
                 msgs[j] = m

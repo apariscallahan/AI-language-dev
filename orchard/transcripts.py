@@ -61,16 +61,16 @@ def _viability(cfg: Config, sc) -> str:
     """Why a trade is or is not possible, from the two private situations."""
     w = cfg.world
     f, b = sc.farmer, sc.buyer
-    v = b.want_variety
-    vn = w.variety_names[v]
-    stock = f.stocks[v]
+    v, col = b.want_variety, b.want_color
+    vn = "%s %s" % (w.color_names[col], w.variety_names[v])
+    stock = f.stock_of(v, col)
     if stock <= 0:
         return "no deal is possible: the farmer has no %s" % vn
     if stock < b.need_qty:
         return "no deal is possible: the farmer has only %d %s" % (stock, vn)
-    if f.qualities[v] < b.min_quality:
+    if f.quality_of(v, col) < b.min_quality:
         return ("no deal is possible: the farmer's %s is %s, below the buyer's minimum"
-                % (vn, w.quality_names[f.qualities[v]]))
+                % (vn, w.quality_names[f.quality_of(v, col)]))
     if f.reservation > b.max_price:
         return ("no deal is possible: the farmer's floor %s is above the buyer's ceiling %s"
                 % (_price(cfg, f.reservation), _price(cfg, b.max_price)))
@@ -156,9 +156,8 @@ def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
         ]
 
     f = sc.farmer
-    barn = ", ".join("%s %d @ %s" % (w.variety_names[v], f.stocks[v],
-                                     w.quality_names[f.qualities[v]])
-                     for v in range(w.n_varieties) if f.stocks[v] > 0) or "nothing"
+    from .render import barn_text
+    barn = barn_text(w, f)
     expected = ("the buyer wants %s, quality >= %s, pays at most %s; the farmer has %s and "
                 "sells at no less than %s -> %s"
                 % (want, w.quality_names[b.min_quality], _price(cfg, b.max_price), barn,

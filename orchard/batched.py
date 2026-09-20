@@ -32,26 +32,32 @@ from .world import BuyerState, FarmerState, Scenario
 @dataclass
 class ScenarioBatch:
     """A whole market day's hidden state, as tensors on one device."""
-    stocks: torch.Tensor          # (B, V)
-    qualities: torch.Tensor       # (B, V)
+    stocks: torch.Tensor          # (B, V*C), fruit-major cells
+    qualities: torch.Tensor       # (B, V*C)
     reservation: torch.Tensor     # (B,)
     want_variety: torch.Tensor    # (B,)
+    want_color: torch.Tensor      # (B,)
     need_qty: torch.Tensor        # (B,)
     min_quality: torch.Tensor     # (B,)
     max_price: torch.Tensor       # (B,)
     held_out: torch.Tensor        # (B,) bool
+    n_colors: int = 1
     day: int = 0
 
     # ---- derived, computed once ---------------------------------------
     def __post_init__(self) -> None:
-        idx = self.want_variety.unsqueeze(1)
+        n_colors = self.n_colors
+        idx = (self.want_variety * n_colors + self.want_color).unsqueeze(1)
         self.offered_stock = self.stocks.gather(1, idx).squeeze(1)
         self.offered_quality = self.qualities.gather(1, idx).squeeze(1)
+        self.offered_color = self.want_color
         self.variety_ok = self.offered_stock > 0
+        self.color_ok = self.variety_ok
         self.stock_ok = self.offered_stock >= self.need_qty
         self.quality_ok = self.variety_ok & (self.offered_quality >= self.min_quality)
         self.price_ok = self.reservation <= self.max_price
-        self.viable = self.variety_ok & self.stock_ok & self.quality_ok & self.price_ok
+        self.viable = (self.variety_ok & self.color_ok & self.stock_ok
+                       & self.quality_ok & self.price_ok)
 
     def __len__(self) -> int:
         return int(self.want_variety.shape[0])
@@ -70,9 +76,11 @@ class ScenarioBatch:
             farmer=FarmerState(
                 stocks=tuple(int(x) for x in self.stocks[i]),
                 qualities=tuple(int(x) for x in self.qualities[i]),
+                n_colors=self.n_colors,
                 reservation=int(self.reservation[i])),
             buyer=BuyerState(
                 want_variety=int(self.want_variety[i]),
+                want_color=int(self.want_color[i]),
                 need_qty=int(self.need_qty[i]),
                 min_quality=int(self.min_quality[i]),
                 max_price=int(self.max_price[i])),
@@ -87,8 +95,9 @@ class ScenarioBatch:
         if role == FARMER:
             parts = [self.stocks, self.qualities, self.reservation.unsqueeze(1)]
         else:
-            parts = [self.want_variety.unsqueeze(1), self.need_qty.unsqueeze(1),
-                     self.min_quality.unsqueeze(1), self.max_price.unsqueeze(1)]
+            parts = [self.want_variety.unsqueeze(1), self.want_color.unsqueeze(1),
+                     self.need_qty.unsqueeze(1), self.min_quality.unsqueeze(1),
+                     self.max_price.unsqueeze(1)]
         x = torch.cat(parts, dim=1)
         if x.shape[1] < n:
             x = torch.cat([x, torch.zeros((B, n - x.shape[1]), dtype=torch.long,
@@ -107,40 +116,29 @@ class TensorWorld:
     """
 
     def __init__(self, cfg: Config, device: str = "cpu",
-                 generator: Optional[torch.Generator] = None):
+                 generator: Optional[torch.Generator] = None, holdout=None):
         self.cfg = cfg
         w = cfg.world
         self.device = torch.device(device)
         self.gen = generator
         self.day = 0
 
-        from .world import World
-        ref = World(w)                       # reuse the holdout + Zipf definitions
+        from .world import ComboHoldout, World
+        holdout = holdout or ComboHoldout(w, w.holdout_combo_frac, w.holdout_seed)
+        ref = World(w, holdout=holdout)      # reuse the Zipf definitions
         self.ref = ref
+        self.holdout = holdout
         self.need_ceiling = ref.need_ceiling()
 
         self._variety_cdf = self._cdf(ref.variety_probs())
         self._qty_cdf = self._cdf(ref._zipf_weights(self.need_ceiling, w.zipf_alpha))
 
-        hold = torch.zeros((w.n_varieties, w.max_qty + 1), dtype=torch.bool)
-        for (v, q) in ref.holdout:
-            hold[v, q] = True
-        self.holdout = hold.to(self.device)
-
-        # Reserved requests are ~10% of the space, so rejection sampling would
-        # need many rounds to fill a zero-shot batch.  Draw from them directly
-        # instead, keeping their relative frequencies.
-        pairs = sorted(ref.holdout)
-        if pairs:
-            vp, qp = ref.variety_probs(), ref.qty_probs()
-            wts = [vp[v] * (qp[q - 1] if q - 1 < len(qp) else 0.0) for v, q in pairs]
-            if sum(wts) <= 0:
-                wts = [1.0] * len(pairs)
-            self._held_pairs = torch.tensor(pairs, dtype=torch.long, device=self.device)
-            self._held_cdf = self._cdf(wts)
-        else:
-            self._held_pairs = None
-            self._held_cdf = None
+        # (fruit, colour, quality) -> is this combination never trained on?
+        held = torch.zeros((w.n_varieties, w.n_colors, w.n_quality), dtype=torch.bool)
+        for (f, c_, q) in holdout.held:
+            held[f, c_, q] = True
+        self.combo_held = held.to(self.device)
+        self._held_combos = holdout.tensor(self.device)
 
     # ------------------------------------------------------------------
     def _cdf(self, probs) -> torch.Tensor:
@@ -169,51 +167,80 @@ class TensorWorld:
         w = self.cfg.world
         V = w.n_varieties
 
-        stocked = torch.rand((n, V), device=self.device, generator=self.gen) < w.p_stocked
+        C = w.n_colors
+        cells = V * C
+        stocked = torch.rand((n, cells), device=self.device,
+                             generator=self.gen) < w.p_stocked
         floor = max(1, int(round(w.stock_floor_frac * w.max_qty)))
         stocks = torch.maximum(
-            torch.randint(floor, w.max_qty + 1, (n, V), device=self.device,
+            torch.randint(floor, w.max_qty + 1, (n, cells), device=self.device,
                           generator=self.gen),
-            torch.randint(floor, w.max_qty + 1, (n, V), device=self.device,
+            torch.randint(floor, w.max_qty + 1, (n, cells), device=self.device,
                           generator=self.gen))
-        quals = torch.maximum(
-            torch.randint(0, w.n_quality, (n, V), device=self.device, generator=self.gen),
-            torch.randint(0, w.n_quality, (n, V), device=self.device, generator=self.gen))
-        for _ in range(w.quality_bias):
-            quals = torch.maximum(quals, torch.maximum(
-                torch.randint(0, w.n_quality, (n, V), device=self.device, generator=self.gen),
-                torch.randint(0, w.n_quality, (n, V), device=self.device, generator=self.gen)))
+        def draw_quality() -> torch.Tensor:
+            """The barn's quality draw, skewed high exactly as the scalar world's."""
+            q = torch.maximum(
+                torch.randint(0, w.n_quality, (n, cells), device=self.device,
+                              generator=self.gen),
+                torch.randint(0, w.n_quality, (n, cells), device=self.device,
+                              generator=self.gen))
+            for _ in range(w.quality_bias):
+                q = torch.maximum(q, torch.maximum(
+                    torch.randint(0, w.n_quality, (n, cells), device=self.device,
+                                  generator=self.gen),
+                    torch.randint(0, w.n_quality, (n, cells), device=self.device,
+                                  generator=self.gen)))
+            return q
+
+        quals = draw_quality()
+        # A lot is a (fruit, colour, quality) combination too, so held-out ones
+        # must not sit in the barn: redraw the quality, and empty the lot if every
+        # quality of it is reserved.
+        f_ix = (torch.arange(cells, device=self.device) // C).unsqueeze(0).expand(n, cells)
+        c_ix = (torch.arange(cells, device=self.device) % C).unsqueeze(0).expand(n, cells)
+        for _ in range(32):
+            bad = self.combo_held[f_ix, c_ix, quals] & stocked
+            if not bool(bad.any()):
+                break
+            quals = torch.where(bad, draw_quality(), quals)
+        stocked = stocked & ~self.combo_held[f_ix, c_ix, quals]
         stocks = torch.where(stocked, stocks, torch.zeros_like(stocks))
         quals = torch.where(stocked, quals, torch.zeros_like(quals))
         reservation = self._skew_low(0, w.reservation_max_bin, n)
 
         want = self._categorical(self._variety_cdf, n)
         need = self._categorical(self._qty_cdf, n) + 1
+        want_c = torch.randint(0, w.n_colors, (n,), device=self.device, generator=self.gen)
         min_q = self._skew_low(0, w.n_quality - 1, n)
         for _ in range(w.quality_bias):
             min_q = torch.minimum(min_q, self._skew_low(0, w.n_quality - 1, n))
         max_p = self._skew_high(w.budget_min_bin, w.n_price_bins - 1, n)
 
         if held_out:
-            if self._held_pairs is None:
-                raise ValueError("no reserved requests exist; holdout_frac is 0")
-            pick = self._held_pairs[self._categorical(self._held_cdf, n)]
-            want, need = pick[:, 0], pick[:, 1]
+            if self._held_combos is None or not len(self._held_combos):
+                raise ValueError("no reserved combinations exist; holdout_combo_frac is 0")
+            pick = self._held_combos[torch.randint(0, self._held_combos.shape[0], (n,),
+                                                   device=self.device, generator=self.gen)]
+            want, want_c, min_q = pick[:, 0], pick[:, 1], pick[:, 2]
         else:
             # Reserved requests are re-drawn rather than filtered out, so the batch
-            # stays exactly the size asked for.  Only ~10% are reserved, so this
-            # converges in a couple of rounds.
+            # stays exactly the size asked for.
             for _ in range(32):
-                bad = self.holdout[want, need]
+                bad = self.combo_held[want, want_c, min_q]
                 if not bool(bad.any()):
                     break
                 want = torch.where(bad, self._categorical(self._variety_cdf, n), want)
-                need = torch.where(bad, self._categorical(self._qty_cdf, n) + 1, need)
+                want_c = torch.where(bad, torch.randint(0, w.n_colors, (n,), device=self.device,
+                                                        generator=self.gen), want_c)
+                min_q = torch.where(bad, self._skew_low(0, w.n_quality - 1, n), min_q)
 
-        return ScenarioBatch(stocks=stocks, qualities=quals, reservation=reservation,
-                             want_variety=want, need_qty=need, min_quality=min_q,
-                             max_price=max_p, held_out=self.holdout[want, need],
-                             day=self.day)
+        return ScenarioBatch(stocks=stocks, qualities=quals,
+                             reservation=reservation,
+                             want_variety=want, want_color=want_c, need_qty=need,
+                             min_quality=min_q,
+                             max_price=max_p,
+                             held_out=self.combo_held[want, want_c, min_q],
+                             n_colors=C, day=self.day)
 
 
 # ==========================================================================
@@ -224,18 +251,25 @@ def _decode_hits(cfg: Config, sb: ScenarioBatch, bel: torch.Tensor,
     """(B, n_fields) bool -- the tensor form of :func:`orchard.env.decode_hits`."""
     R = cfg.reward
     v, q, k, p = bel[:, 0], bel[:, 1], bel[:, 2], bel[:, 3]
+    col = bel[:, 4] if bel.shape[1] > 4 else None
     if role == FARMER:
-        return torch.stack([
+        hits = [
             v == sb.want_variety,
             (q - sb.need_qty).abs() <= R.belief_qty_tol,
             k == sb.min_quality,
             (p - sb.max_price).abs() <= R.belief_price_tol,
-        ], dim=1)
-    return torch.stack([
+        ]
+        if col is not None:
+            hits.append(col == sb.want_color)
+        return torch.stack(hits, dim=1)
+    hits = [
         (q - sb.offered_stock).abs() <= R.belief_qty_tol,
         k == sb.offered_quality,
         (p - sb.reservation).abs() <= R.belief_price_tol,
-    ], dim=1)
+    ]
+    if col is not None:
+        hits.append(col == sb.offered_color)
+    return torch.stack(hits, dim=1)
 
 
 def _correctness(cfg: Config, sb: ScenarioBatch, dec: torch.Tensor) -> torch.Tensor:
@@ -249,8 +283,8 @@ def _correctness(cfg: Config, sb: ScenarioBatch, dec: torch.Tensor) -> torch.Ten
 
 
 def resolve_batch(cfg: Config, sb: ScenarioBatch, f_dec: torch.Tensor,
-                  b_dec: torch.Tensor, f_symbols: torch.Tensor,
-                  b_symbols: torch.Tensor, *, f_bel: Optional[torch.Tensor] = None,
+                  b_dec: torch.Tensor, f_cost: torch.Tensor,
+                  b_cost: torch.Tensor, *, f_bel: Optional[torch.Tensor] = None,
                   b_bel: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
     """Score a whole batch of negotiations.  Mirrors :func:`orchard.env.resolve`."""
     R = cfg.reward
@@ -278,6 +312,7 @@ def resolve_batch(cfg: Config, sb: ScenarioBatch, f_dec: torch.Tensor,
 
     executable = (
         sb.variety_ok
+        & sb.color_ok
         & (agreed_v == sb.want_variety)
         & (agreed_q >= 1) & (agreed_q <= sb.offered_stock)
         & ((agreed_q - sb.need_qty).abs() <= R.qty_tol)
@@ -326,8 +361,8 @@ def resolve_batch(cfg: Config, sb: ScenarioBatch, f_dec: torch.Tensor,
     fr += R.missed_deal * missed.float() + R.correct_no_deal * correct_no.float()
     br += R.missed_deal * missed.float() + R.correct_no_deal * correct_no.float()
 
-    fr -= R.symbol_cost * f_symbols.float()
-    br -= R.symbol_cost * b_symbols.float()
+    fr -= f_cost.float()
+    br -= b_cost.float()
 
     traded_qty = torch.where(success, agreed_q, torch.zeros_like(agreed_q))
     trade_value = torch.where(success, pv * traded_qty.float(),

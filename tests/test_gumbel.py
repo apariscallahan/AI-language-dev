@@ -20,14 +20,13 @@ import torch.nn.functional as F
 
 from orchard.agents import CommNet, make_agent
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import gumbel_tau, run_and_update_gumbel
 from orchard.world import World
 
 
 def tiny_cfg() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 6
     cfg.world.n_price_bins = 6

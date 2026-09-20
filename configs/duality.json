@@ -1,0 +1,10 @@
+{
+  "name": "duality",
+  "world": {
+    "n_varieties": 12
+  },
+  "channel": {
+    "atomic_vocab": 8,
+    "max_symbols": 32
+  }
+}

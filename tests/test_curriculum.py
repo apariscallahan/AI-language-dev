@@ -21,7 +21,6 @@ from orchard.agents import make_agent, sequence_len
 from orchard.bottleneck import StoredEpisode, TranscriptStore
 from orchard.batched import TensorWorld
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.curriculum import (H_CHOICE, N_HEADS, CurriculumState, Phase,
                                 ReferentialWorld, ladder, phase_named, phase_schema,
                                 promotion_for, resolve_referential)
@@ -31,7 +30,7 @@ from orchard.world import K_EMPTY, n_obs_slots
 
 
 def cfg_small() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -184,9 +183,14 @@ class TestLineupGame(unittest.TestCase):
         n = n_obs_slots(cfg.world, cfg)
         self.assertEqual(tuple(f.shape), (256, n))
         self.assertEqual(tuple(g.shape), (256, n))
-        # the informer sees exactly the true tuple, and nothing about the lineup
+        # the informer sees exactly the thing it must describe and which field
+        # is being asked about -- and nothing at all about the lineup
         self.assertTrue(bool((f[:, :3] == rb.true_meaning).all()))
-        self.assertTrue(bool((f[:, 3:] == 0).all()), "informer saw the lineup")
+        self.assertTrue(bool((f[:, 3] == rb.query).all()))
+        self.assertTrue(bool((f[:, 4:] == 0).all()), "informer saw the lineup")
+        # the guesser sees the candidates and the query, not the answer
+        self.assertTrue(bool((g[:, :3 * rb.meanings.shape[1]]
+                              == rb.meanings.reshape(256, -1)).all()))
 
     def test_scoring_is_the_guess(self):
         cfg = cfg_small()
@@ -210,11 +214,15 @@ class TestLineupGame(unittest.TestCase):
         rb = rw.sample(100)
         zero = torch.zeros(100, dtype=torch.long)
         five = torch.full((100,), 5, dtype=torch.long)
-        quiet = resolve_referential(cfg, rb, rb.target, zero, zero)
-        chatty = resolve_referential(cfg, rb, rb.target, five, zero)
+        # the resolvers are handed the length cost itself, already computed
+        quiet = resolve_referential(cfg, rb, rb.target, zero.float(), zero.float())
+        chatty = resolve_referential(cfg, rb, rb.target, five.float(), zero.float())
         self.assertAlmostEqual(
             float(quiet["farmer_reward"].mean() - chatty["farmer_reward"].mean()),
-            5 * cfg.reward.symbol_cost, places=5)
+            5.0, places=5)
+        self.assertAlmostEqual(
+            float(quiet["buyer_reward"].mean() - chatty["buyer_reward"].mean()),
+            0.0, places=5)
 
 
 class TestTheGuesserActuallyListens(unittest.TestCase):
@@ -328,15 +336,15 @@ class TestPromotion(unittest.TestCase):
     def test_state_advances_and_records_why(self):
         cfg = cfg_small()
         st = CurriculumState(ladder(cfg))
-        self.assertEqual(st.phase.name, "refer")
+        self.assertEqual(st.phase.name, "name-fruit")
         st.episodes_in_phase = 999
         st.updates_in_phase = 99
         st.advance(1234, {"success above floor": {"met": True, "detail": "0.9"}})
-        self.assertEqual(st.phase.name, "refer-swap")
+        self.assertEqual(st.phase.name, "name-color")
         self.assertEqual(st.episodes_in_phase, 0)
         self.assertEqual(st.updates_in_phase, 0)
         self.assertEqual(len(st.transitions), 1)
-        self.assertEqual(st.transitions[0]["from"], "refer")
+        self.assertEqual(st.transitions[0]["from"], "name-fruit")
         self.assertEqual(st.transitions[0]["episode"], 1234)
         self.assertIn("criteria", st.transitions[0])
 

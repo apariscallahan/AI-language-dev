@@ -82,7 +82,7 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
 
     Worth doing before starting anything long on a rented box: it reports real
     episodes per second for these exact settings, an estimate for the configured
-    episode count, and peak GPU memory, so a preset that will not fit or will not
+    episode count, and peak GPU memory, so a run that will not fit or will not
     finish is obvious in under a minute.
     """
     import time
@@ -151,13 +151,11 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
 
     # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
     # dialogue in the market. Time a light, a middle and the heaviest rung, at
-    # full community size (an upper bound: founders are cheaper). On a GPU, also
-    # at twice the batch: memory is rarely the limit here -- the number of
-    # per-agent calls is -- so a bigger batch often buys episodes almost free.
-    # Use the numbers to set train.batch_size / train.rung_batch_scale.
+    # full community size (an upper bound: founders are cheaper), at the
+    # configured batch -- the same measurement on every device.
     rates = {}
-    scales = (1, 2) if dev.type == "cuda" else (1,)
-    for name in ("refer", "refer-mutual", "market"):
+    scales = (1,)
+    for name in ("name-fruit", "mutual", "market"):
         phase = phase_named(cfg, name)
         base = int(B * float((cfg.train.rung_batch_scale or {}).get(name, 1)))
         cells = []
@@ -189,8 +187,8 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
         r = rates.get(name)
         return cfg.train.episodes / r / 3600 if r else float("nan")
     print("\n  configured run    : %s episodes -> ~%.1f hours at the middle rung's rate "
-          "(%.1f at the lineup's, %.1f at the market's)"
-          % ("{:,}".format(cfg.train.episodes), hours("refer-mutual"), hours("refer"),
+          "(%.1f at a naming rung's, %.1f at the market's)"
+          % ("{:,}".format(cfg.train.episodes), hours("mutual"), hours("name-fruit"),
              hours("market")))
     n_ck = max(1, cfg.train.episodes // max(1, cfg.train.batch_size)
                // max(1, cfg.log.checkpoint_every_updates))
@@ -313,8 +311,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.benchmark:
         return benchmark(cfg, args.benchmark)
 
-    # Default folder: when it started (UTC), then the preset, e.g.
-    # runs/2026-09-18_14-03-12UTC_gpu_community -- sorts by time, says what it is.
+    # Default folder: when it started (UTC), then the run's name, e.g.
+    # runs/2026-09-18_14-03-12UTC_orchard -- sorts by time, says what it is.
     now = time.gmtime()
     out = args.out or os.path.join(
         "runs", "%s_%s" % (time.strftime("%Y-%m-%d_%H-%M-%SUTC", now), cfg.name))

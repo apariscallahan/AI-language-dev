@@ -51,24 +51,43 @@ from .world import World
 # ==========================================================================
 # probing
 # ==========================================================================
-def reference_buyer_obs(cfg: Config, key: tuple[int, int]) -> tuple[int, ...]:
+def reference_buyer_obs(cfg: Config, key: tuple[int, ...]) -> tuple[int, ...]:
     """A buyer observation expressing meaning ``key``, with the other fields pinned."""
     from .world import n_obs_slots
-    variety, qty = key
+    if len(key) >= 3:
+        fruit, colour, qty = key[0], key[1], key[2]
+    else:                       # a trading meaning: (fruit, quantity)
+        fruit, qty, colour = key[0], key[1], 0
     ref_quality = 0
     ref_price = cfg.world.n_price_bins - 2
-    vals = (variety, qty, ref_quality, ref_price)
+    vals = (fruit, colour, qty, ref_quality, ref_price)
     return tuple(vals) + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
 
 
-def reference_obs(cfg: Config, key: tuple[int, int], phase=None) -> tuple[int, ...]:
-    """The probe observation for ``key`` under ``phase``: a request, or a tuple."""
+def reference_obs(cfg: Config, key: tuple[int, ...], phase=None) -> tuple[int, ...]:
+    """The probe observation for ``key``: a shopping list, or a thing to describe.
+
+    In a naming rung the key is the (fruit, colour, quality) combination itself,
+    and the observation carries the field the rung asks about as well -- that is
+    part of what the describer sees, so a probe without it would be asking a
+    different question.
+    """
+    from .world import n_obs_slots
     if phase is None or not phase.tuples:
         return reference_buyer_obs(cfg, key)
-    from .world import n_obs_slots
-    variety, qty = key
-    vals = (variety, qty, 0)
-    return tuple(vals) + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
+    from .curriculum import ASK_ALL
+    q = ASK_ALL
+    if getattr(phase, "query", None) is not None:
+        q = int(phase.query)
+    vals = tuple(key[:3]) + (q,)
+    return vals + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
+
+
+def meaning_keys(cfg: Config, world: World, phase=None) -> list[tuple]:
+    """The meanings a probe should sweep, for this rung."""
+    if phase is not None and phase.tuples:
+        return [tuple(c) for c in world.holdout.training]
+    return [k for k, _ in world.meaning_table()]
 
 
 def probe_plan(cfg: Config, phase=None) -> list[tuple[int, Any]]:
@@ -94,13 +113,14 @@ def probe_messages(cfg: Config, pop: Population, keys: Sequence[tuple[int, int]]
     out: dict[tuple[int, int], list[list[int]]] = {k: [] for k in keys}
     for role, view in probe_plan(cfg, phase):
         pool = (agents if agents is not None else pop.pool(role))
-        pool = [a for a in pool if a.role == role]
+        if not pop.shared:        # one pool fills both seats below the trading rungs
+            pool = [a for a in pool if a.role == role]
         ctx = opening_context(cfg, pop, None, view, device) if (
             view.turns_of(cfg, role) and view.turns_of(cfg, role)[0] > 0
             and view.tuples) else None
         for agent in pool:
             msgs = utterances_for_meanings(cfg, agent, obs, context=ctx, device=device,
-                                           phase=view)
+                                           phase=view, role=role)
             if msgs is None:
                 continue
             for k, m in zip(keys, msgs):
@@ -335,6 +355,13 @@ def length_frequency(cfg: Config, pop: Population, world: World, *,
     meaning occurs and the length of the message used for it, in symbols and
     again in words.  A negative correlation is the human pattern.
     """
+    if phase is not None and phase.tuples:
+        # Things are drawn uniformly in the naming rungs, so there is no "commoner
+        # meaning" for length to track. Saying so beats reporting a correlation
+        # computed over a flat distribution.
+        return {"n": 0, "rho_symbols": float("nan"), "rho_words": float("nan"),
+                "note": "meanings are uniform in the naming rungs: nothing for "
+                        "length to track"}
     table = world.meaning_table()
     if len(table) < 6:
         return {"n": len(table)}
@@ -372,9 +399,16 @@ def _mean(xs: Sequence[float]) -> float:
 # ==========================================================================
 # 3.3  rare vs frequent buckets
 # ==========================================================================
-def split_meanings(world: World, quantile: float = 0.5
-                   ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Frequent and rare halves of the meaning space, by cumulative probability."""
+def split_meanings(world: World, quantile: float = 0.5, phase=None
+                   ) -> tuple[list[tuple], list[tuple]]:
+    """Frequent and rare halves of the meaning space, by cumulative probability.
+
+    Things are drawn uniformly in the naming rungs, so there is no rare half to
+    contrast: both lists come back empty and the analyses that use them say so
+    rather than splitting a flat distribution down the middle.
+    """
+    if phase is not None and phase.tuples:
+        return [], []
     table = world.meaning_table()
     if not table:
         return [], []
@@ -403,7 +437,7 @@ def bucketed_analysis(cfg: Config, pop: Population, world: World, *,
     long, volatile and compositional -- so the split is the point.
     """
     rng = rng or random.Random(0)
-    frequent, rare = split_meanings(world, cfg.log.rare_frequent_split)
+    frequent, rare = split_meanings(world, cfg.log.rare_frequent_split, phase)
     out: dict[str, Any] = {"n_frequent": len(frequent), "n_rare": len(rare)}
     for label, keys in (("frequent", frequent), ("rare", rare)):
         if len(keys) < 4:
@@ -504,16 +538,24 @@ class FormTracker:
                 phase=None) -> dict[str, Any]:
         regime = tuple((r, "tuple" if v.tuples else "trade")
                        for r, v in probe_plan(self.cfg, phase))
+        # In a naming rung the meanings are the (fruit, colour, quality)
+        # combinations themselves, and they are all equally common.
+        if phase is not None and phase.tuples:
+            keys = meaning_keys(self.cfg, self.world, phase)
+            bucket = {k: "frequent" for k in keys}
+            prob = {k: 1.0 / max(1, len(keys)) for k in keys}
+        else:
+            keys, bucket, prob = self.keys, self.bucket, self.prob
         if self._regime is not None and regime != self._regime:
             self._last = {}
             self.regime_changes.append({"episode": episode,
                                         "phase": phase.name if phase else "market"})
         self._regime = regime
-        msgs = probe_messages(self.cfg, pop, self.keys, device=device, phase=phase)
-        consensus = {k: consensus_message(msgs[k]) for k in self.keys}
+        msgs = probe_messages(self.cfg, pop, keys, device=device, phase=phase)
+        consensus = {k: consensus_message(msgs[k]) for k in keys}
 
         inventory: Counter = Counter()
-        for k in self.keys:
+        for k in keys:
             for w in parse_words(self.cfg, consensus[k]):
                 inventory[w] += 1
 
@@ -522,26 +564,26 @@ class FormTracker:
         changed = {"frequent": 0, "rare": 0}
         counted = {"frequent": 0, "rare": 0}
 
-        for k in self.keys:
+        for k in keys:
             cur = consensus[k]
-            bucket = self.bucket[k]
+            b_of_k = bucket[k]
             text = " ".join(word_text(self.cfg, w) for w in parse_words(self.cfg, cur))
             self.history[k].append((episode, text))
             prev = self._last.get(k)
             if prev is not None:
                 d = normalised_levenshtein(prev, cur)
-                drift[bucket].append(d)
-                counted[bucket] += 1
+                drift[b_of_k].append(d)
+                counted[b_of_k] += 1
                 if prev != cur:
-                    changed[bucket] += 1
+                    changed[b_of_k] += 1
                     old_words = parse_words(self.cfg, prev)
                     new_words = parse_words(self.cfg, cur)
                     oc = self._compositionality(old_words, inventory)
                     nc = self._compositionality(new_words, inventory)
                     if d > 0.34:          # a real replacement, not a one-symbol wobble
                         self.events.append(FormEvent(
-                            episode=episode, meaning=list(k), bucket=bucket,
-                            prob=self.prob[k],
+                            episode=episode, meaning=list(k), bucket=b_of_k,
+                            prob=prob[k],
                             old_form=" ".join(word_text(self.cfg, w) for w in old_words) or "<silence>",
                             new_form=text or "<silence>",
                             old_words=len(old_words), new_words=len(new_words),

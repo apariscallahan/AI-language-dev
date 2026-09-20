@@ -18,6 +18,18 @@ from .config import Config
 from .env import FARMER, BUYER, Transcript, parse_words, speaker_of_turn
 
 
+def barn_text(w, f) -> str:
+    """The barn as a human reads it: one entry per coloured lot that has stock."""
+    parts = []
+    for v in range(w.n_varieties):
+        for c in range(w.n_colors):
+            if f.stock_of(v, c) > 0:
+                parts.append("%s %s x%d (%s)"
+                             % (w.color_names[c], w.variety_names[v], f.stock_of(v, c),
+                                w.quality_names[f.quality_of(v, c)]))
+    return ", ".join(parts) or "nothing"
+
+
 def token_label(cfg: Config, tok: int) -> str:
     """Placeholder names only.  ``a7`` is atom seven and nothing more."""
     c = cfg.channel
@@ -89,9 +101,7 @@ def render_transcript(cfg: Config, tr: Transcript, *, semantics=None,
     if header:
         lines.append(header)
     lines.append("%sday %d  |  viable=%s  held_out=%s" % (indent, sc.day, sc.viable, sc.held_out))
-    barn = ", ".join("%s x%d (%s)" % (w.variety_names[v], f.stocks[v],
-                                      w.quality_names[f.qualities[v]])
-                     for v in range(w.n_varieties) if f.stocks[v] > 0) or "nothing"
+    barn = barn_text(w, f)
     lines.append("%sFARMER sees: barn holds %s; will not sell below %.2f"
                  % (indent, barn, w.price_values[f.reservation]))
     lines.append("%sBUYER  sees: wants %s x%d, quality >= %s, cannot pay above %.2f" % (

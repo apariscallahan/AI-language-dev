@@ -18,13 +18,12 @@ import torch
 
 from orchard.batched import ScenarioBatch, TensorWorld, resolve_batch
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.env import BUYER, FARMER, Beliefs, Decision, buyer_obs, farmer_obs, resolve
 from orchard.world import World
 
 
 def cfg_small() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 8
@@ -126,7 +125,8 @@ class TestResolveAgreement(unittest.TestCase):
             torch.randint(0, w.n_varieties, (n,), generator=g),
             torch.randint(0, w.max_qty + 1, (n,), generator=g),
             torch.randint(0, w.n_quality, (n,), generator=g),
-            torch.randint(0, w.n_price_bins, (n,), generator=g)], dim=1)
+            torch.randint(0, w.n_price_bins, (n,), generator=g),
+            torch.randint(0, w.n_colors, (n,), generator=g)], dim=1)
         f_bel, b_bel = (bel(), bel()) if with_beliefs else (None, None)
         f_sym = torch.randint(0, 9, (n,), generator=g)
         b_sym = torch.randint(0, 9, (n,), generator=g)
@@ -139,6 +139,7 @@ class TestResolveAgreement(unittest.TestCase):
             bd = Decision(*[int(x) for x in b_dec[i]])
             fb = Beliefs(*[int(x) for x in f_bel[i]]) if with_beliefs else None
             bb = Beliefs(*[int(x) for x in b_bel[i]]) if with_beliefs else None
+            # Beliefs takes colour last, exactly as the belief columns arrive
             o = resolve(cfg, sc, fd, bd, int(f_sym[i]), int(b_sym[i]),
                         f_beliefs=fb, b_beliefs=bb)
             self.assertAlmostEqual(float(res["farmer_reward"][i]), o.farmer_reward,
@@ -175,7 +176,7 @@ class TestResolveAgreement(unittest.TestCase):
         self._compare(cfg, n=800, seed=2)
 
     def test_matches_scalar_on_a_bigger_world(self):
-        cfg = method_at_test_scale()      # the original spec's bigger world
+        cfg = Config()                    # the original spec's bigger world
         cfg.world.n_varieties, cfg.world.max_qty = 4, 20
         cfg.world.n_price_bins, cfg.world.reservation_max_bin = 12, 9
         cfg.world.zipf_alpha = 0.9

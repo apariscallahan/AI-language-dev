@@ -1,10 +1,13 @@
-"""One method, many scales: guards against the runs drifting apart again.
+"""One configuration, on every device: guards against versions drifting apart.
 
-The CPU and GPU versions drifted because the method was written down in several
-places -- code defaults, a dozen JSON presets, a GUI's own presets -- and because
-schedules were counted in episodes, which mean a different amount of learning at
-every batch size. These tests pin both down: presets may only change scale, and
-every schedule is in training updates.
+The CPU and GPU versions drifted because the settings were written down in
+several places -- code defaults, a dozen JSON presets, a GUI's own presets --
+because schedules were counted in episodes, which mean a different amount of
+learning at every batch size, and because the CPU was tested at one size while
+the GPU ran at another. These tests pin all three down: there is one
+configuration, a run may change only its length, seed, device and output,
+every schedule is in training updates, and there is no device-specific
+arithmetic.
 """
 from __future__ import annotations
 
@@ -22,42 +25,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from orchard.config import (LEGACY_KEYS, PRESET_EXTRA_KEYS, PRESET_KEYS, Config,
-                            flat_keys, method_changes, validate)
+from orchard.config import (EXPERIMENT_KEYS, LEGACY_KEYS, RUN_KEYS, Config, flat_keys,
+                            method_changes, validate)
 from orchard.conventions import PopulationUsage
-from testscale import method_at_test_scale
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
+ROOT = Path(__file__).resolve().parents[1]
 
 
-class TestPresetsChangeScaleOnly(unittest.TestCase):
-    def test_every_preset_sets_only_what_a_preset_may(self):
-        paths = sorted(CONFIGS.glob("*.json"))
-        self.assertTrue(paths, "no presets found")
-        for path in paths:
+class TestOneConfiguration(unittest.TestCase):
+    def test_config_files_are_named_experiments_only(self):
+        for path in sorted(CONFIGS.glob("*.json")):
             d = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(d.get("name"), path.stem, path.name)
-            allowed = PRESET_KEYS | PRESET_EXTRA_KEYS.get(path.stem, frozenset())
-            extra = sorted(set(flat_keys(d)) - allowed)
-            self.assertEqual(extra, [], "%s changes the method: %s -- change the code "
-                             "default instead, or list it in PRESET_EXTRA_KEYS with a "
-                             "reason" % (path.name, extra))
+            self.assertIn(path.stem, EXPERIMENT_KEYS,
+                          "%s is not a named experiment: the configuration lives in "
+                          "orchard/config.py, not in a second copy" % path.name)
+            extra = sorted(set(flat_keys(d)) - RUN_KEYS - EXPERIMENT_KEYS[path.stem])
+            self.assertEqual(extra, [], "%s changes more than its experiment: %s"
+                             % (path.name, extra))
             validate(Config.from_json(str(path)))
 
-    def test_scale_presets_report_no_method_change(self):
-        for name in ("gpu_small", "gpu_community", "gpu_full"):
-            cfg = Config.from_json(str(CONFIGS / ("%s.json" % name)))
-            self.assertEqual(method_changes(cfg), {}, name)
-
-    def test_the_community_preset_is_the_defaults(self):
-        cfg = Config.from_json(str(CONFIGS / "gpu_community.json"))
-        self.assertEqual(cfg.to_dict(), Config().to_dict())
-
-    def test_a_method_change_is_named(self):
+    def test_sizes_are_part_of_what_is_simulated(self):
+        # a run that tested one size on a CPU and ran another on a GPU was two
+        # versions; now a size change is reported like any other change
         cfg = Config()
-        cfg.reward.symbol_cost = 0.5
-        cfg.population.n_farmers = 3            # scale: not a method change
-        self.assertEqual(method_changes(cfg), {"reward.symbol_cost": (0.03, 0.5)})
+        cfg.population.n_farmers = 48
+        cfg.train.batch_size = 4096
+        cfg.model.d_model = 96
+        self.assertEqual(set(method_changes(cfg)),
+                         {"population.n_farmers", "train.batch_size", "model.d_model"})
+
+    def test_run_settings_are_not_changes(self):
+        cfg = Config()
+        cfg.name, cfg.train.episodes, cfg.train.seed = "x", 1000, 7
+        cfg.train.device, cfg.train.grad_checkpoint = "cpu", True
+        cfg.log.heartbeat_seconds = 5
+        self.assertEqual(method_changes(cfg), {})
+
+    def test_no_device_specific_arithmetic(self):
+        cfg = Config()
+        self.assertFalse(hasattr(cfg.train, "amp"))
+        self.assertFalse(hasattr(cfg.train, "tf32"))
+        for f in ("orchard/agents.py", "orchard/gumbel.py", "orchard/rollout.py",
+                  "orchard/bottleneck.py", "orchard/curriculum.py", "orchard/batched.py"):
+            src = (ROOT / f).read_text(encoding="utf-8")
+            for word in ("autocast", "bfloat16", "is_cuda", "allow_tf32"):
+                self.assertNotIn(word, src, "%s: %s" % (f, word))
+        from orchard.hardware import setup
+        setup(cfg)
+        self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+        self.assertEqual(torch.get_float32_matmul_precision(), "highest")
+
+    def test_the_launcher_uses_the_configuration(self):
+        sh = (ROOT / "cloud_run.sh").read_text(encoding="utf-8")
+        self.assertNotIn("configs/gpu_", sh)
+        self.assertNotIn(b"\r\n", (ROOT / "cloud_run.sh").read_bytes(),
+                         "cloud_run.sh must keep Unix line endings")
 
 
 class TestSchedulesCountUpdates(unittest.TestCase):
@@ -86,7 +110,7 @@ class TestSchedulesCountUpdates(unittest.TestCase):
 
     def test_usage_memory_decays_per_update_not_per_episode(self):
         for batch in (64, 4096):
-            cfg = method_at_test_scale()
+            cfg = Config()
             u = PopulationUsage(cfg)
             for _ in range(cfg.reward.usage_half_life_updates):
                 u.observe({}, batch)
@@ -96,7 +120,7 @@ class TestSchedulesCountUpdates(unittest.TestCase):
 class TestGrowthDoesNotSpendTheBudget(unittest.TestCase):
     def test_a_rung_budget_counts_from_full_size(self):
         from orchard.train import Trainer
-        cfg = method_at_test_scale()
+        cfg = Config()
         cfg.world.max_qty = 4
         cfg.channel.max_symbols = 6
         cfg.model.d_model, cfg.model.d_ff = 32, 64
@@ -105,7 +129,7 @@ class TestGrowthDoesNotSpendTheBudget(unittest.TestCase):
         cfg.population.grow_every_updates = 2
         cfg.population.turnover = False
         cfg.bottleneck.enabled = False
-        cfg.curriculum.start_phase = "refer-swap"
+        cfg.curriculum.start_phase = "name-all"
         cfg.curriculum.on_stall = "hold"
         cfg.train.batch_size = 16
         cfg.train.episodes = 16 * 6
@@ -140,12 +164,12 @@ class TestGradientCheckpointingChangesNothing(unittest.TestCase):
         from orchard.env import BUYER, FARMER
         from orchard.gumbel import run_and_update_gumbel
 
-        base = method_at_test_scale()
+        base = Config()
         base.model.d_model, base.model.d_ff = 32, 64
         base.channel.max_symbols = 6
         rw = ReferentialWorld(base, generator=torch.Generator().manual_seed(0))
         tw = TensorWorld(base, generator=torch.Generator().manual_seed(0))
-        for name in ("refer-mutual", "haggle"):
+        for name in ("mutual", "haggle"):
             phase = phase_named(base, name)
             scen = rw.sample_mutual(24) if phase.mutual else tw.sample(24)
             results = []
@@ -190,11 +214,11 @@ class TestTheCodeCanForm(unittest.TestCase):
         from orchard.agents import make_agent
         from orchard.curriculum import ReferentialWorld, ladder, phase_named
         from orchard.env import BUYER, FARMER
-        cfg = method_at_test_scale()
+        cfg = Config()
         cfg.model.d_model, cfg.model.d_ff = 32, 64
         cfg.channel.max_symbols = 4
         names = [p.name for p in ladder(cfg)]
-        self.assertLess(names.index("refer-swap"), names.index(cfg.train.hindsight_from_rung))
+        self.assertLess(names.index("name-all"), names.index(cfg.train.hindsight_from_rung))
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
         f = [make_agent(cfg, agent_id=0, role=FARMER, slot=0, generation=0,
                         birth_episode=0, lifespan=10 ** 9)]
@@ -205,7 +229,7 @@ class TestTheCodeCanForm(unittest.TestCase):
         real = gumbel.hindsight_targets
         gumbel.hindsight_targets = lambda *a, **k: calls.append(a[1].name) or real(*a, **k)
         try:
-            for name in ("refer", "refer-swap", "refer-mutual"):
+            for name in ("name-fruit", "name-all", "mutual"):
                 ph = phase_named(cfg, name)
                 for view in ph.views():
                     scen = (rw.sample_mutual(16) if ph.mutual
@@ -213,19 +237,12 @@ class TestTheCodeCanForm(unittest.TestCase):
                     gumbel.run_and_update_gumbel(cfg, scen, f, b, z, z, phase=view)
         finally:
             gumbel.hindsight_targets = real
-        self.assertEqual(calls, ["refer-mutual"])
-
-    def test_the_gpu_does_the_cpus_arithmetic(self):
-        cfg = Config()
-        self.assertFalse(cfg.train.amp)
-        self.assertFalse(cfg.train.tf32)
-        self.assertNotIn("train.amp", PRESET_KEYS)
-        self.assertNotIn("train.tf32", PRESET_KEYS)
+        self.assertEqual(calls, ["mutual"])
 
     def test_degenerate_flags_after_the_run_has_settled(self):
         # this branch only runs at a settled checkpoint and once crashed a run
         from orchard.metrics import detect_degenerate
-        cfg = method_at_test_scale()
+        cfg = Config()
         vocab = {"token_entropy_norm": 0.5, "tokens_used": 10, "silent_frac": 0.0,
                  "mean_msg_len": 2.0}
         flags = detect_degenerate(cfg, 0.25, 0.25, vocab, {"mean": 0.0},

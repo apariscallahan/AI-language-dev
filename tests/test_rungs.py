@@ -30,7 +30,8 @@ from orchard import metrics as M
 from orchard.bottleneck import TranscriptStore, train_newborn
 from orchard.config import Config
 from orchard.conventions import PopulationUsage
-from orchard.curriculum import (H_BELIEF, H_CHOICE, H_QTY, H_VARIETY, MutualBatch,
+from orchard.curriculum import (H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_QTY, H_REPORT,
+                                H_VARIETY, MutualBatch, N_HEADS,
                                 ReferentialWorld, evaluate_rung, ladder, phase_named,
                                 resolve_mutual, resolve_order, rung_budget)
 from orchard.env import BUYER, FARMER
@@ -49,15 +50,15 @@ class TestSpeakingOrder(unittest.TestCase):
     def test_each_rung_says_who_speaks_when(self):
         cfg = cfg_small()
         L = cfg.channel.max_msg_len
-        refer = phase_named(cfg, "refer")
+        refer = phase_named(cfg, "name-fruit")
         self.assertEqual(refer.own_positions(cfg, FARMER), list(range(L)))
         self.assertEqual(refer.own_positions(cfg, BUYER), [],
                          "the lineup guesser never speaks")
-        swap = phase_named(cfg, "refer-swap")
+        swap = phase_named(cfg, "name-all")
         self.assertEqual([v.informer for v in swap.views()], [FARMER, BUYER])
         self.assertEqual(swap.with_informer(BUYER).own_positions(cfg, BUYER), list(range(L)))
         self.assertEqual(swap.with_informer(BUYER).own_positions(cfg, FARMER), [])
-        mutual = phase_named(cfg, "refer-mutual")
+        mutual = phase_named(cfg, "mutual")
         self.assertEqual(mutual.own_positions(cfg, FARMER), list(range(L)))
         self.assertEqual(mutual.own_positions(cfg, BUYER), list(range(L, 2 * L)))
         haggle = phase_named(cfg, "haggle")
@@ -66,7 +67,7 @@ class TestSpeakingOrder(unittest.TestCase):
     def test_the_me_embedding_follows_the_phase(self):
         cfg = cfg_small()
         L = cfg.channel.max_msg_len
-        m = phase_named(cfg, "refer").self_mask(cfg, FARMER)
+        m = phase_named(cfg, "name-fruit").self_mask(cfg, FARMER)
         self.assertTrue(bool(m[:L].all()), "the describer's own words were not 'mine'")
         self.assertFalse(bool(m[L:].any()))
 
@@ -78,7 +79,7 @@ class TestSpeakingOrder(unittest.TestCase):
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
         fi, bi = pairing(128)
         for informer in (FARMER, BUYER):
-            ph = phase_named(cfg, "refer-swap").with_informer(informer)
+            ph = phase_named(cfg, "name-all").with_informer(informer)
             batch, _ = run_and_update_gumbel(cfg, rw.sample(128, informer=informer),
                                              f, b, fi, bi, phase=ph, train=False)
             spoke = batch.f_emitted if informer == FARMER else batch.b_emitted
@@ -93,7 +94,7 @@ class TestSpeakingOrder(unittest.TestCase):
         f, b = agents(cfg)
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(1))
         fi, bi = pairing(64)
-        ph = phase_named(cfg, "refer-swap").with_informer(BUYER)
+        ph = phase_named(cfg, "name-all").with_informer(BUYER)
         rb = rw.sample(64, informer=BUYER)
         batch, _ = run_and_update_gumbel(cfg, rb, f, b, fi, bi, phase=ph, train=False)
         want = batch.f_dec[:, H_CHOICE] == rb.target
@@ -118,8 +119,8 @@ class TestBottleneckIsRoleCorrect(unittest.TestCase):
         cfg = cfg_small()
         cfg.bottleneck.epochs = 1
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(2))
-        store, f, b = self._store(cfg, phase_named(cfg, "refer"), lambda: rw.sample(128))
-        self.assertEqual(store._buf[0].phase.name, "refer")
+        store, f, b = self._store(cfg, phase_named(cfg, "name-fruit"), lambda: rw.sample(128))
+        self.assertEqual(store._buf[0].phase.name, "name-fruit")
         newborn = agents(cfg, 1)[0][0]
         info = train_newborn(cfg, newborn, store, random.Random(0))
         self.assertIsNotNone(info["token_accuracy"],
@@ -132,7 +133,7 @@ class TestBottleneckIsRoleCorrect(unittest.TestCase):
         cfg = cfg_small()
         cfg.bottleneck.epochs = 1
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(3))
-        store, f, b = self._store(cfg, phase_named(cfg, "refer"), lambda: rw.sample(128))
+        store, f, b = self._store(cfg, phase_named(cfg, "name-fruit"), lambda: rw.sample(128))
         newborn = agents(cfg, 1)[1][0]
         info = train_newborn(cfg, newborn, store, random.Random(0))
         self.assertIsNone(info["token_accuracy"],
@@ -143,7 +144,7 @@ class TestBottleneckIsRoleCorrect(unittest.TestCase):
         cfg = cfg_small()
         cfg.bottleneck.epochs = 1
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(4))
-        swap = phase_named(cfg, "refer-swap")
+        swap = phase_named(cfg, "name-all")
         k = [0]
 
         def draw():
@@ -174,19 +175,18 @@ class TestMutualRung(unittest.TestCase):
         mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
         sym = torch.zeros(2, dtype=torch.long)
         res = resolve_mutual(cfg, mb, f_report=b_m.clone(), b_report=f_m.clone(),
-                             f_symbols=sym, b_symbols=sym)
+                             f_cost=sym.float(), b_cost=sym.float())
         self.assertTrue(bool(res["success"].all()))
         wrong = f_m.clone()
         wrong[0, 0] = (wrong[0, 0] + 1) % cfg.world.n_varieties
         res = resolve_mutual(cfg, mb, f_report=b_m.clone(), b_report=wrong,
-                             f_symbols=sym, b_symbols=sym)
+                             f_cost=sym.float(), b_cost=sym.float())
         self.assertEqual(res["success"].tolist(), [False, True])
         self.assertEqual(res["farmer_report_ok"].tolist(), [True, True])
         self.assertEqual(res["buyer_report_ok"].tolist(), [False, True])
 
     def test_quantity_is_exact_by_default(self):
         cfg = cfg_small()
-        self.assertEqual(cfg.curriculum.mutual_qty_tol, 0)
         mb = MutualBatch(f_meaning=torch.tensor([[0, 4, 0]]),
                          b_meaning=torch.tensor([[1, 4, 1]]))
         sym = torch.zeros(1, dtype=torch.long)
@@ -194,31 +194,36 @@ class TestMutualRung(unittest.TestCase):
                                     torch.tensor([[0, 4, 0]]), sym, sym)
         self.assertFalse(bool(off_by_one["farmer_report_ok"][0]))
 
-    def test_quantity_tolerance_is_configurable(self):
+    def test_every_field_of_the_report_must_be_right(self):
+        """A thing is (fruit, colour, quality) and all three are reported exactly."""
         cfg = cfg_small()
-        cfg.curriculum.mutual_qty_tol = 1
-        mb = MutualBatch(f_meaning=torch.tensor([[0, 4, 0]]),
-                         b_meaning=torch.tensor([[1, 4, 1]]))
-        sym = torch.zeros(1, dtype=torch.long)
-        near = resolve_mutual(cfg, mb, torch.tensor([[1, 5, 1]]), torch.tensor([[0, 3, 0]]),
-                              sym, sym)
-        far = resolve_mutual(cfg, mb, torch.tensor([[1, 7, 1]]), torch.tensor([[0, 4, 0]]),
-                             sym, sym)
-        self.assertTrue(bool(near["success"][0]))
-        self.assertFalse(bool(far["success"][0]))
+        mb = MutualBatch(f_meaning=torch.tensor([[0, 1, 0]]),
+                         b_meaning=torch.tensor([[1, 2, 1]]))
+        zero = torch.zeros(1)
+        right = resolve_mutual(cfg, mb, torch.tensor([[1, 2, 1]]),
+                               torch.tensor([[0, 1, 0]]), zero, zero)
+        one_off = resolve_mutual(cfg, mb, torch.tensor([[1, 0, 1]]),
+                                 torch.tensor([[0, 1, 0]]), zero, zero)
+        self.assertTrue(bool(right["success"][0]))
+        self.assertFalse(bool(one_off["success"][0]),
+                         "a wrong colour still counted as understood")
 
     def test_the_reports_are_the_belief_heads(self):
         cfg = cfg_small()
-        mutual = phase_named(cfg, "refer-mutual")
-        self.assertEqual(mutual.active_heads(FARMER, cfg), list(H_BELIEF[:3]))
-        self.assertEqual(mutual.active_heads(BUYER, cfg), list(H_BELIEF[:3]))
+        mutual = phase_named(cfg, "mutual")
+        # the thing being reported is (fruit, colour, quality)
+        self.assertEqual(mutual.active_heads(FARMER, cfg), list(H_REPORT))
+        self.assertEqual(mutual.active_heads(BUYER, cfg), list(H_REPORT))
 
 
-def _swap_evidence(farmer_ok: bool, buyer_ok: bool) -> dict:
+def _swap_evidence(farmer_ok: bool, buyer_ok: bool, holdout: float = 0.75) -> dict:
     good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
     bad = {"topsim": 0.03, "null": 0.01, "positional": 0.03, "field_coverage": 0.05}
     return {
         "chance": 0.25,
+        # the productivity gate: success on combinations never trained on
+        "seen_success": 0.80, "holdout_success": 0.80 * holdout,
+        "holdout_ratio": holdout,
         "views": [
             {"informer": "farmer", "guesser": "buyer", "success": 0.80 if farmer_ok else 0.28,
              "transfer": 0.70 if farmer_ok else 0.02},
@@ -233,7 +238,7 @@ def _swap_evidence(farmer_ok: bool, buyer_ok: bool) -> dict:
 class TestPerRolePromotion(unittest.TestCase):
     def test_swap_passes_only_when_both_roles_pass(self):
         cfg = cfg_small()
-        swap = phase_named(cfg, "refer-swap")
+        swap = phase_named(cfg, "name-all")
         lo, _ = rung_budget(cfg, swap)
         ok, checks = evaluate_rung(cfg, swap, _swap_evidence(True, True), lo)
         self.assertTrue(ok, checks)
@@ -251,14 +256,14 @@ class TestPerRolePromotion(unittest.TestCase):
     def test_a_pooled_average_cannot_carry_a_silent_role(self):
         """Mean success here is 0.54 and mean positional 0.24 -- both 'fine' pooled."""
         cfg = cfg_small()
-        swap = phase_named(cfg, "refer-swap")
+        swap = phase_named(cfg, "name-all")
         ev = _swap_evidence(True, False)
         ok, _ = evaluate_rung(cfg, swap, ev, rung_budget(cfg, swap)[0])
         self.assertFalse(ok)
 
     def test_mutual_checks_each_reader(self):
         cfg = cfg_small()
-        mutual = phase_named(cfg, "refer-mutual")
+        mutual = phase_named(cfg, "mutual")
         good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
         ev = {"chance": 0.005, "success": 0.30, "views": [{"success": 0.30}],
               "speakers": {"farmer": good, "buyer": good},
@@ -296,7 +301,7 @@ class TestSpeakerPressures(unittest.TestCase):
         cfg = cfg_small()
         c = cfg.channel
         u = self._usage(cfg)
-        refer = phase_named(cfg, "refer")
+        refer = phase_named(cfg, "name-fruit")
         toks = self._batch(cfg, [[1, c.end_id], [2, c.hyphen_id, 3, c.end_id],
                                  [c.end_id], [9, c.end_id]])
         obs = torch.zeros((4, 12), dtype=torch.long)
@@ -311,7 +316,7 @@ class TestSpeakerPressures(unittest.TestCase):
         cfg.reward.convention_min_support = 1
         c = cfg.channel
         u = PopulationUsage(cfg)
-        refer = phase_named(cfg, "refer")
+        refer = phase_named(cfg, "name-fruit")
         # the population says a4 for meaning A and a5 for meaning B
         obs = torch.tensor([[0, 1, 0] + [0] * 9, [1, 2, 1] + [0] * 9])
         for _ in range(20):
@@ -362,7 +367,7 @@ class _FakeBatch:
             rows.append(r)
         self.tokens = torch.tensor(rows)
         self.active = self.tokens != c.pad_id
-        self.phase = phase_named(cfg, "refer-mutual")
+        self.phase = phase_named(cfg, "mutual")
         self.cfg = cfg
 
     def own_positions(self, role):
@@ -396,7 +401,7 @@ class TestLiveQuantityEncoding(unittest.TestCase):
                                                 torch.tensor(qty),
                                                 torch.zeros(B, dtype=torch.long)], 1),
                          b_meaning=torch.zeros((B, 3), dtype=torch.long))
-        refer = phase_named(cfg, "refer")
+        refer = phase_named(cfg, "name-fruit")
         return SimpleNamespace(tokens=toks, sb=sb, phase=refer,
                                own_positions=lambda role: refer.own_positions(cfg, role))
 
@@ -414,7 +419,7 @@ class TestPhaseAwareProbes(unittest.TestCase):
     def test_a_role_that_never_speaks_is_not_probed(self):
         cfg = cfg_small()
         f, b = agents(cfg, 1)
-        refer = phase_named(cfg, "refer")
+        refer = phase_named(cfg, "name-fruit")
         m = M.tuple_meanings(cfg, 5, seed=0)
         self.assertIsNone(M.utterances_for_meanings(cfg, b[0], m, phase=refer))
         self.assertEqual(len(M.utterances_for_meanings(cfg, f[0], m, phase=refer)), 5)
@@ -426,7 +431,7 @@ class TestPhaseAwareProbes(unittest.TestCase):
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(5))
         fi, bi = pairing(64)
         batch, _ = run_and_update_gumbel(cfg, rw.sample(64), f, b, fi, bi,
-                                         phase=phase_named(cfg, "refer"), train=False)
+                                         phase=phase_named(cfg, "name-fruit"), train=False)
         ws = word_stats(cfg, [batch])
         # one real utterance per round, not n_turns of them
         n_msgs = round(ws["silent_frac"] * 64 + (1 - ws["silent_frac"]) * 64)
@@ -465,20 +470,26 @@ class TestEveryFieldIsNeeded(unittest.TestCase):
             self.assertLess(abs(hit - 1.0 / m.shape[1]), 0.04,
                             "structure alone picks the target %.3f of the time" % hit)
 
-    def test_quantity_is_needed_in_the_lineup(self):
+    def test_every_field_is_needed_in_the_open_lineup(self):
+        """No field can ride on the others: each is the only thing that
+        separates the target from some distractor often enough to matter."""
         cfg = cfg_small()
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(8))
         rb = rw.sample(4000)
         t = rb.true_meaning
         others = torch.ones(rb.meanings.shape[:2], dtype=torch.bool)
         others[torch.arange(4000), rb.target] = False
-        vq_same = (rb.meanings[:, :, [0, 2]] == t[:, [0, 2]].unsqueeze(1)).all(-1) & others
-        self.assertGreater(float(vq_same.any(1).float().mean()), 0.40,
-                           "variety and quality alone still pick the target too often")
+        for field, name in enumerate(("fruit", "colour", "quality")):
+            keep = [f for f in range(3) if f != field]
+            same = (rb.meanings[:, :, keep] == t[:, keep].unsqueeze(1)).all(-1) & others
+            share = float(same.any(1).float().mean())
+            self.assertGreater(share, 0.25,
+                               "%s is hardly ever the field that decides (%.3f)"
+                               % (name, share))
 
     def test_mutual_is_judged_field_by_field(self):
         cfg = cfg_small()
-        mutual = phase_named(cfg, "refer-mutual")
+        mutual = phase_named(cfg, "mutual")
         good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
         ev = {"chance": 0.005, "success": 0.30, "views": [{"success": 0.30}],
               "speakers": {"farmer": good, "buyer": good},
@@ -488,32 +499,37 @@ class TestEveryFieldIsNeeded(unittest.TestCase):
               "buyer_field_transfer": [0.9, 0.6, 0.9]}
         ok, checks = evaluate_rung(cfg, mutual, ev, rung_budget(cfg, mutual)[0])
         self.assertFalse(ok)
-        self.assertFalse(checks["farmer decodes: quantity"]["met"])
-        self.assertTrue(checks["buyer decodes: quantity"]["met"])
+        self.assertFalse(checks["farmer decodes: colour"]["met"])
+        self.assertTrue(checks["buyer decodes: colour"]["met"])
 
 
 class TestOrderRung(unittest.TestCase):
     def test_it_sits_between_mutual_and_haggle(self):
         names = [p.name for p in ladder(cfg_small())]
-        self.assertEqual(names.index("order"), names.index("refer-mutual") + 1)
+        self.assertEqual(names.index("order"), names.index("mutual") + 1)
         self.assertEqual(names.index("haggle"), names.index("order") + 1)
 
     def test_the_farmer_fills_the_order_with_its_deal_heads(self):
         cfg = cfg_small()
         order = phase_named(cfg, "order")
-        self.assertEqual(order.active_heads(FARMER, cfg), [H_VARIETY, H_QTY])
+        # fruit, colour and quantity: the whole order
+        self.assertEqual(order.active_heads(FARMER, cfg),
+                         [H_VARIETY, H_BELIEF_COLOR, H_QTY])
         self.assertEqual(order.active_heads(BUYER, cfg), [])
         self.assertEqual(order.speaker_of_turn(0), BUYER)
         sb = SimpleNamespace(want_variety=torch.tensor([0, 1, 2]),
+                             want_color=torch.tensor([1, 1, 1]),
                              need_qty=torch.tensor([3, 4, 5]))
-        dec = torch.zeros((3, 9), dtype=torch.long)
-        dec[:, 1] = torch.tensor([0, 1, 0])
-        dec[:, 2] = torch.tensor([3, 2, 5])
-        sym = torch.zeros(3, dtype=torch.long)
-        res = resolve_order(cfg, sb, dec, sym, sym)
+        dec = torch.zeros((3, N_HEADS), dtype=torch.long)
+        dec[:, H_VARIETY] = torch.tensor([0, 1, 0])
+        dec[:, H_QTY] = torch.tensor([3, 2, 5])
+        dec[:, H_BELIEF_COLOR] = torch.tensor([1, 1, 0])
+        zero = torch.zeros(3)
+        res = resolve_order(cfg, sb, dec, zero, zero)
+        # right; wrong quantity; wrong fruit and colour
         self.assertEqual(res["success"].tolist(), [True, False, False])
         self.assertEqual(res["order_fields"].tolist(),
-                         [[True, True], [True, False], [False, True]])
+                         [[True, True, True], [True, True, False], [False, False, True]])
         self.assertGreater(float(res["farmer_reward"][1]), float(res["farmer_reward"][2]) - 1e-6)
 
 
@@ -536,12 +552,12 @@ class TestSnapshots(unittest.TestCase):
                                              phase=ph, usage=tr.usage)
             tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
             tr.episode = 128
-            tr.curriculum.index = 2
+            tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
             path = tr.save_snapshot("t")
             tr2 = Trainer(cfg, d + "/b", quiet=True)
             tr2.load_snapshot(path)
             self.assertEqual(tr2.episode, 128)
-            self.assertEqual(tr2.curriculum.phase.name, "refer-mutual")
+            self.assertEqual(tr2.curriculum.phase.name, "mutual")
             for a, b in zip(tr.pop.all_agents(), tr2.pop.all_agents()):
                 for (k, x), (_, y) in zip(a.net.state_dict().items(),
                                           b.net.state_dict().items()):
@@ -609,7 +625,7 @@ class TestLanguageProperties(unittest.TestCase):
 
     def test_the_scorecard_covers_every_property(self):
         from orchard.properties import scorecard
-        props = scorecard(cfg_small(), [], {"transitions": [], "reached": "refer"}, None)
+        props = scorecard(cfg_small(), [], {"transitions": [], "reached": "name-fruit"}, None)
         names = {p["property"] for p in props}
         for want in ("reference", "productivity", "intentionality", "decontextualised",
                      "displaced", "interchangeable", "generic", "perspectives",
@@ -644,7 +660,7 @@ class TestWordGrammar(unittest.TestCase):
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(11))
         fi, bi = pairing(256)
         batch, _ = run_and_update_gumbel(cfg, rw.sample_mutual(256), f, b, fi, bi,
-                                         phase=phase_named(cfg, "refer-mutual"))
+                                         phase=phase_named(cfg, "mutual"))
         L = cfg.channel.max_msg_len
         for row in batch.tokens.tolist():
             for t in range(2):
@@ -659,11 +675,11 @@ class TestWordGrammar(unittest.TestCase):
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(12))
         fi, bi = pairing(128)
         batch = run_episodes(cfg, rw.sample(128), f, b, fi, bi,
-                             phase=phase_named(cfg, "refer"))
+                             phase=phase_named(cfg, "name-fruit"))
         for row in batch.tokens.tolist():
             self.assertTrue(_grammatical(cfg, row[:cfg.channel.max_msg_len]))
         m = M.tuple_meanings(cfg, 20, seed=0)
-        for u in M.utterances_for_meanings(cfg, f[0], m, phase=phase_named(cfg, "refer")):
+        for u in M.utterances_for_meanings(cfg, f[0], m, phase=phase_named(cfg, "name-fruit")):
             self.assertTrue(_grammatical(cfg, u))
 
     def test_what_is_rendered_is_what_was_said(self):
@@ -707,10 +723,10 @@ class TestReadableTranscripts(unittest.TestCase):
         cfg.channel.max_symbols = 8
         rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(21))
         tw = TensorWorld(cfg, generator=torch.Generator().manual_seed(21))
-        self._check(self._rounds(cfg, phase_named(cfg, "refer"), rw.sample(16)))
-        self._check(self._rounds(cfg, phase_named(cfg, "refer-swap").with_informer(BUYER),
+        self._check(self._rounds(cfg, phase_named(cfg, "name-fruit"), rw.sample(16)))
+        self._check(self._rounds(cfg, phase_named(cfg, "name-all").with_informer(BUYER),
                                  rw.sample(16, informer=BUYER)))
-        self._check(self._rounds(cfg, phase_named(cfg, "refer-mutual"), rw.sample_mutual(16)))
+        self._check(self._rounds(cfg, phase_named(cfg, "mutual"), rw.sample_mutual(16)))
         self._check(self._rounds(cfg, phase_named(cfg, "order"), tw.sample(16)))
         self._check(self._rounds(cfg, phase_named(cfg, "haggle"), tw.sample(16)))
 
@@ -719,7 +735,7 @@ class TestReportSummary(unittest.TestCase):
     def test_summary_statistics_come_first(self):
         from orchard.report import _summary_lines
         lines = _summary_lines(cfg_small(), {"episode": 1000, "started_utc": "2026-01-01 00:00:00 UTC",
-                                             "curriculum": {"phases": ["refer"], "reached": "refer"}},
+                                             "curriculum": {"phases": ["name-fruit"], "reached": "name-fruit"}},
                                12.0)
         self.assertEqual(lines[0], "## Summary statistics")
         self.assertTrue(any("furthest rung" in l for l in lines))
@@ -746,16 +762,9 @@ class TestLifespanInUpdates(unittest.TestCase):
                 pop.record_episode_participation(f_idx, b_idx, batch_obj)
             self.assertEqual(pop.farmers[0].updates, 3)
             self.assertTrue(pop.farmers[0].is_expired())
-            self.assertEqual(pop.farmers[0].age, 3 * batch // 2)
-
-    def test_presets_keep_the_method_lifespan(self):
-        # only the plumbing check may shorten lives; see PRESET_EXTRA_KEYS
-        for name in ("gpu_small", "gpu_community", "gpu_full", "gpu_duality"):
-            cfg = Config.from_json(str(Path(__file__).resolve().parents[1] / "configs" / ("%s.json" % name)))
-            self.assertEqual((cfg.population.lifespan_min, cfg.population.lifespan_max),
-                             (Config().population.lifespan_min,
-                              Config().population.lifespan_max), name)
-            self.assertGreaterEqual(cfg.population.lifespan_min, 500, name)
+            # One pool takes both seats below the trading rungs, so an agent
+            # plays its share of each -- but still counts one update.
+            self.assertEqual(pop.farmers[0].age, 3 * batch)
 
 
 class TestVerdictUsesTheRungsChance(unittest.TestCase):

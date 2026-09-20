@@ -17,7 +17,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchard.config import Config
-from testscale import method_at_test_scale
 from orchard.env import (BUYER, FARMER, Decision, HonestScriptedAgent,
                          RandomScriptedAgent, buyer_obs, farmer_obs, resolve,
                          run_scripted_episode, speaker_of_turn)
@@ -25,7 +24,7 @@ from orchard.world import K_EMPTY, World, n_obs_slots, obs_schema
 
 
 def small_cfg() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.max_qty = 8
     cfg.world.n_varieties = 3
     cfg.world.n_price_bins = 8
@@ -48,7 +47,7 @@ class TestObservationSeparation(unittest.TestCase):
             self.assertEqual(len(fo), n)
             self.assertEqual(len(bo), n)
             self.assertEqual(fo[:len(sc.farmer.as_tuple())], sc.farmer.as_tuple())
-            self.assertEqual(bo[:4], sc.buyer.as_tuple())
+            self.assertEqual(bo[:len(sc.buyer.as_tuple())], sc.buyer.as_tuple())
             for tup, role in ((fo, FARMER), (bo, BUYER)):
                 for i, kind in enumerate(obs_schema(cfg.world, role)):
                     if kind == K_EMPTY:
@@ -58,16 +57,20 @@ class TestObservationSeparation(unittest.TestCase):
         """Neither observation determines whether a deal is possible."""
         cfg = small_cfg()
         w = World(cfg.world, random.Random(1))
-        by_f: dict[tuple, set[bool]] = {}
-        by_b: dict[tuple, set[bool]] = {}
-        for _ in range(4000):
-            sc = w.sample()
-            by_f.setdefault(farmer_obs(sc, cfg), set()).add(sc.viable)
-            by_b.setdefault(buyer_obs(sc, cfg), set()).add(sc.viable)
-        self.assertTrue(any(len(v) > 1 for v in by_f.values()),
-                        "farmer observation appears to determine viability")
-        self.assertTrue(any(len(v) > 1 for v in by_b.values()),
-                        "buyer observation appears to determine viability")
+        # A barn is detailed enough that two identical ones are rare, so the
+        # honest test holds one side fixed and varies the other: neither half of
+        # the world settles whether a deal is on.
+        from orchard.world import Scenario
+        held_f = w.sample_farmer()
+        seen = {Scenario(farmer=held_f, buyer=w.sample_buyer()).viable
+                for _ in range(400)}
+        self.assertEqual(seen, {True, False},
+                         "one barn always gives the same answer on viability")
+        held_b = w.sample_buyer()
+        seen = {Scenario(farmer=w.sample_farmer(), buyer=held_b).viable
+                for _ in range(400)}
+        self.assertEqual(seen, {True, False},
+                         "one shopping list always gives the same answer on viability")
 
     def test_knowing_one_side_does_not_predict_the_other(self):
         """The property the whole experiment rests on (see the note in world.py).
@@ -92,13 +95,16 @@ class TestObservationSeparation(unittest.TestCase):
                      for q in range(1, nq + 1)) / n
 
         # the best the farmer can do using its own private state
+        def held(s, v):        # the barn's stock of a fruit, over all its colours
+            return sum(s.farmer.stock_of(v, c) for c in range(cfg.world.n_colors))
+
         from_barn = sum(s.buyer.want_variety == max(range(nv),
-                                                    key=lambda v: s.farmer.stocks[v])
+                                                    key=lambda v: held(s, v))
                         for s in scen) / n
         # conditional accuracy: for each barn shape, guess that barn's commonest request
         best_by_barn: dict[tuple, dict[int, int]] = {}
         for s in scen:
-            key = tuple(1 if x > 0 else 0 for x in s.farmer.stocks)
+            key = tuple(1 if held(s, v) > 0 else 0 for v in range(nv))
             best_by_barn.setdefault(key, {})
             d = best_by_barn[key]
             d[s.buyer.want_variety] = d.get(s.buyer.want_variety, 0) + 1
@@ -278,9 +284,9 @@ class TestResolution(unittest.TestCase):
         w = World(cfg.world, random.Random(8))
         sc = w.sample()
         d = Decision(0, 0, 0, 0)
-        a = resolve(cfg, sc, d, d, farmer_tokens=0, buyer_tokens=0)
-        b = resolve(cfg, sc, d, d, farmer_tokens=5, buyer_tokens=0)
-        self.assertAlmostEqual(a.farmer_reward - b.farmer_reward, 5 * cfg.reward.symbol_cost, places=6)
+        a = resolve(cfg, sc, d, d, farmer_cost=0.0, buyer_cost=0.0)
+        b = resolve(cfg, sc, d, d, farmer_cost=0.15, buyer_cost=0.0)
+        self.assertAlmostEqual(a.farmer_reward - b.farmer_reward, 0.15, places=6)
         self.assertAlmostEqual(a.buyer_reward, b.buyer_reward, places=6)
 
 
@@ -292,7 +298,8 @@ class TestWorld(unittest.TestCase):
         for _ in range(3000):
             sc = w.sample(held_out=False)
             self.assertFalse(sc.held_out)
-            self.assertFalse(w.is_held_out(sc.buyer.want_variety, sc.buyer.need_qty))
+            self.assertFalse(w.is_held_out(sc.buyer.want_variety, sc.buyer.want_color,
+                                           sc.buyer.min_quality))
 
     def test_holdout_sampling_returns_held_out(self):
         cfg = small_cfg()

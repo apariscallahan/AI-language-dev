@@ -20,8 +20,8 @@ import torch
 from orchard.agents import make_agent
 from orchard.bottleneck import StoredEpisode, TranscriptStore
 from orchard.config import Config
-from testscale import method_at_test_scale
-from orchard.env import BUYER, FARMER, Decision, parse_words, resolve, word_text
+from orchard.env import (BUYER, FARMER, Decision, length_cost, parse_words,
+                        resolve, scalar_length_cost, word_text)
 from orchard.lexicon import (FormTracker, bucketed_analysis, length_frequency,
                              reference_buyer_obs, split_meanings, word_stats,
                              word_usage_flags)
@@ -31,7 +31,7 @@ from orchard.world import World
 
 
 def small_cfg() -> Config:
-    cfg = method_at_test_scale()
+    cfg = Config()
     cfg.world.n_varieties = 3
     cfg.world.max_qty = 8
     cfg.world.n_price_bins = 6
@@ -100,25 +100,46 @@ class TestSymbolStream(unittest.TestCase):
 
 
 class TestLengthCost(unittest.TestCase):
-    def test_every_emitted_symbol_is_charged(self):
+    def test_a_fused_word_costs_more_than_the_same_atoms_split_up(self):
+        """The whole point of the length cost: press on words, not on sentences.
+
+        A name for a whole (fruit, colour, quality) is one long word; naming the
+        parts is several short ones. If both cost the same per atom there is no
+        reason to ever split, so words are charged per atom *after the first* and
+        each extra word costs a tenth of that.
+        """
+        cfg = small_cfg()
+        c = cfg.channel
+        fused = [3, c.hyphen_id, 7, c.hyphen_id, 1, c.end_id]
+        split = [3, c.space_id, 7, c.space_id, 1, c.end_id]
+        self.assertGreater(scalar_length_cost(cfg, fused), scalar_length_cost(cfg, split))
+        # and the tensor form the training loop uses agrees with the scalar one
+        row = torch.full((1, c.dialogue_len), c.pad_id, dtype=torch.long)
+        row[0, :len(fused)] = torch.tensor(fused)
+        self.assertAlmostEqual(
+            float(length_cost(cfg, row, list(range(c.dialogue_len)))[0]),
+            scalar_length_cost(cfg, fused), places=6)
+
+    def test_a_longer_word_costs_more_and_ending_is_free(self):
+        cfg = small_cfg()
+        c = cfg.channel
+        one = scalar_length_cost(cfg, [3, c.end_id])
+        two = scalar_length_cost(cfg, [3, c.hyphen_id, 7, c.end_id])
+        three = scalar_length_cost(cfg, [3, c.hyphen_id, 7, c.hyphen_id, 1, c.end_id])
+        self.assertLess(one, two)
+        self.assertLess(two, three)
+        self.assertAlmostEqual(three - two, two - one, places=6)
+        self.assertAlmostEqual(scalar_length_cost(cfg, [c.end_id]), 0.0, places=6)
+
+    def test_the_speaker_pays_it_and_the_listener_does_not(self):
         cfg = small_cfg()
         w = World(cfg.world, random.Random(0))
         sc = w.sample()
         d = Decision(0, 0, 0, 0)
-        base = resolve(cfg, sc, d, d, 0, 0).farmer_reward
-        for n in (1, 3, 5):
-            r = resolve(cfg, sc, d, d, farmer_tokens=n, buyer_tokens=0)
-            self.assertAlmostEqual(base - r.farmer_reward, n * cfg.reward.symbol_cost,
-                                   places=6)
-
-    def test_hyphens_and_spaces_cost_the_same_as_atoms(self):
-        """Otherwise structure would be free and agents would pad with it."""
-        c = small_cfg().channel
-        self.assertTrue(c.costed(0))
-        self.assertTrue(c.costed(c.hyphen_id))
-        self.assertTrue(c.costed(c.space_id))
-        self.assertFalse(c.costed(c.end_id), "ending a message must be free")
-        self.assertFalse(c.costed(c.pad_id))
+        base = resolve(cfg, sc, d, d, 0.0, 0.0)
+        paid = resolve(cfg, sc, d, d, farmer_cost=0.12, buyer_cost=0.0)
+        self.assertAlmostEqual(base.farmer_reward - paid.farmer_reward, 0.12, places=6)
+        self.assertAlmostEqual(base.buyer_reward, paid.buyer_reward, places=6)
 
 
 class TestFrequencySkew(unittest.TestCase):
@@ -224,8 +245,10 @@ class TestWordAnalysis(unittest.TestCase):
         a = reference_buyer_obs(cfg, (2, 5))
         b = reference_buyer_obs(cfg, (2, 5))
         self.assertEqual(a, b)
+        # a trading meaning is (fruit, quantity); the shopping list reads
+        # fruit, colour, quantity, ...
         self.assertEqual(a[0], 2)
-        self.assertEqual(a[1], 5)
+        self.assertEqual(a[2], 5)
 
     def test_buckets_split_the_meaning_space(self):
         cfg = small_cfg()

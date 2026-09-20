@@ -300,7 +300,7 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
     rows.append(("started", str(final.get("started_utc", "n/a"))))
     from .config import method_changes
     changes = method_changes(cfg)
-    rows.append(("method", "the code defaults (preset changes scale only)" if not changes
+    rows.append(("method", "the one configuration (nothing simulated was changed)" if not changes
                  else "**changed**: " + ", ".join(
                      "`%s` %s -> %s" % (k, json.dumps(a), json.dumps(b))
                      for k, (a, b) in sorted(changes.items()))))

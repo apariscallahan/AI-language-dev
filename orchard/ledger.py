@@ -137,9 +137,11 @@ class Ledger:
 
             # ground truth -- present in the ledger, never in any agent's input
             "true_farmer_barn": "; ".join(
-                "%s:%d@%s" % (w.variety_names[v], scenario.farmer.stocks[v],
-                              w.quality_names[scenario.farmer.qualities[v]])
-                for v in range(w.n_varieties) if scenario.farmer.stocks[v] > 0) or "empty",
+                "%s %s:%d@%s" % (w.color_names[c], w.variety_names[v],
+                                 scenario.farmer.stock_of(v, c),
+                                 w.quality_names[scenario.farmer.quality_of(v, c)])
+                for v in range(w.n_varieties) for c in range(w.n_colors)
+                if scenario.farmer.stock_of(v, c) > 0) or "empty",
             "true_farmer_stocks": list(scenario.farmer.stocks),
             "true_farmer_qualities": list(scenario.farmer.qualities),
             "true_farmer_offered_stock": scenario.offered_stock,
