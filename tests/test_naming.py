@@ -188,13 +188,17 @@ class TestOnePopulationUntilTrading(unittest.TestCase):
             self.assertEqual(b.net.role, BUYER)
             self.assertEqual(f.net.role, FARMER)
 
-    def test_the_split_happens_where_trading_starts(self):
+    def test_the_split_happens_where_the_two_roles_start_to_differ(self):
+        """One pool for every rung that is one language in two seats."""
         cfg = Config()
         names = [p.name for p in ladder(cfg)]
         at = names.index(cfg.curriculum.split_roles_at)
-        self.assertEqual(cfg.curriculum.split_roles_at, "order")
-        self.assertTrue(all(not ladder(cfg)[i].trading and not ladder(cfg)[i].order
-                            for i in range(at)))
+        self.assertEqual(cfg.curriculum.split_roles_at, "haggle")
+        # nothing below the split pays the two roles differently
+        self.assertTrue(all(not ladder(cfg)[i].trading for i in range(at)))
+        # and the request rungs, which run in both directions, are below it
+        for n in ("ask-qty", "order", "quote", "offer"):
+            self.assertLess(names.index(n), at, "%s is played by split roles" % n)
 
 
 if __name__ == "__main__":

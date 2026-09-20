@@ -309,17 +309,23 @@ class Trainer:
             if ep % stride:
                 continue
             if phase.order:
-                msg = [int(x) for x in batch.tokens[i, :L]]
+                # Whatever this rung asked for, said and heard, side by side.
+                from .curriculum import request_truth
+                dec = (batch.b_dec if phase.reporter == BUYER else batch.f_dec)
+                asked, heard = {}, {}
+                for name, head in phase.ask_heads.items():
+                    asked[name] = int(request_truth(self.cfg, rb, name)[i])
+                    heard[name] = int(dec[i, head])
+                msgs = [[int(x) for x in batch.tokens[i, t * L:(t + 1) * L]]
+                        for t in range(phase.n_turns)]
                 self.lineup_log.write({
                     "episode": ep, "phase": phase.name,
                     "farmer_id": f_ids[i], "buyer_id": b_ids[i],
-                    "want_variety": w.variety_names[int(rb.want_variety[i])],
-                    "need_qty": int(rb.need_qty[i]),
-                    "filled_variety": w.variety_names[int(batch.f_dec[i, 1])],
-                    "filled_qty": int(batch.f_dec[i, 2]),
+                    "asked_for": asked, "reported": heard,
+                    "reporter": "buyer" if phase.reporter == BUYER else "farmer",
                     "correct": bool(batch.res["success"][i]),
-                    "msg_symbols": msg,
-                    "msg_text": render_message(self.cfg, msg),
+                    "msg_symbols": msgs,
+                    "msg_text": [render_message(self.cfg, m) for m in msgs],
                 })
                 continue
             if isinstance(rb, MutualBatch):
@@ -1513,7 +1519,8 @@ class Trainer:
                 # The lineup game has one outcome that matters: did the guess land.
                 succ = batch.success_t
                 hits = int(succ.sum())
-                tag = "mutual" if phase.mutual else ("order" if phase.order else "lineup")
+                tag = "mutual" if phase.mutual else ("request" if phase.order
+                                                    else "lineup")
                 self.failure_counts[tag + "_hit"] = (
                     self.failure_counts.get(tag + "_hit", 0) + hits)
                 self.failure_counts[tag + "_miss"] = (

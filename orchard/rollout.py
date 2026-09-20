@@ -262,7 +262,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     from .batched import ScenarioBatch, resolve_batch
     from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch,
                              ReferentialBatch, ladder, phase_schema,
-                             resolve_mutual, resolve_order, resolve_referential)
+                             resolve_mutual, resolve_request, resolve_referential)
     c = cfg.channel
     if phase is None:
         phase = ladder(cfg)[-1]
@@ -382,7 +382,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
                              f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and tensor_in:
-        res = resolve_order(cfg, scenarios, decs[FARMER], f_len, b_len)
+        res = resolve_request(cfg, phase, scenarios, decs, f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif tensor_in:
         use_bel = cfg.reward.belief_heads

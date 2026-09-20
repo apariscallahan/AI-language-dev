@@ -418,7 +418,13 @@ class CurriculumConfig:
         "name-quality": [80, 1500],
         "name-all": [80, 2500],
         "mutual": [80, 3500],
-        "order": [80, 2500],
+        # The request rungs: each adds one field to an order, so each should be
+        # far cheaper than the naming rung that invented the words.
+        "ask-qty": [80, 2000],
+        "order": [80, 2000],
+        "quote": [80, 2000],
+        "offer": [80, 2500],
+        "judge": [80, 2000],
         "haggle": [80, 3500],
         "bargain": [80, 3500],
         "market": [80, 10**9],
@@ -449,7 +455,13 @@ class CurriculumConfig:
     # Below it everyone is one pool speaking one language, taking both sides of
     # the lineup; at the split each agent is copied into a farmer and a buyer,
     # so both roles start out fluent in the same language.
-    split_roles_at: str = "order"
+    # The rung where the one pool becomes farmers and buyers. Everything below
+    # it is one language in two seats -- the request rungs included, since they
+    # run in both directions (`quote` has the buyer saying prices, `offer` the
+    # farmer) and one pool learns both from the same words. The split exists so
+    # the two sides can diverge in *strategy*, which only starts to matter where
+    # selling and buying pay differently: `haggle`.
+    split_roles_at: str = "haggle"
     # each role, each field (variety, quantity, quality): share of headroom over
     # a muted channel, so no field can ride on the others
     min_field_transfer: float = 0.25

@@ -43,7 +43,7 @@ from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
 from .batched import ScenarioBatch, resolve_batch
 from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch, Phase,
                          ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
-                         phase_schema, resolve_mutual, resolve_order,
+                         phase_schema, resolve_mutual, resolve_request,
                          resolve_referential)
 from .rollout import (BatchRollout, UpdateStats, anneal, belief_columns,
                       group_by_agent, n_outputs, split_decision)
@@ -256,7 +256,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                              dec_sampled[BUYER][:, rep], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and batched:
-        res = resolve_order(cfg, scenarios, dec_sampled[FARMER], f_len, b_len)
+        res = resolve_request(cfg, phase, scenarios, dec_sampled, f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif batched:
         # One pass over the batch instead of B trips through the interpreter.

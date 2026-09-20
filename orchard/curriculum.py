@@ -78,6 +78,15 @@ N_HEADS = 10
 # Reporting a thing: (fruit, colour, quality), the three fields a meaning has.
 H_REPORT = (H_BELIEF[0], H_BELIEF_COLOR, H_BELIEF[2])
 
+# The request rungs. A buyer's order is built up one field at a time -- the same
+# scaffolding the naming rungs use, carried into the trade format -- and the
+# answer rungs run it the other way, with the farmer describing the lot the
+# buyer asked about. Each name maps to the head that has to carry it.
+ASK_HEADS = {"fruit": H_VARIETY, "colour": H_BELIEF_COLOR,
+             "quantity": H_QTY, "price": H_PRICE}
+ANSWER_HEADS = {"stock": H_BELIEF[1], "quality": H_BELIEF[2],
+                "reservation": H_BELIEF[3], "deal": H_ACCEPT}
+
 
 # ==========================================================================
 KIND_REFER, KIND_SWAP, KIND_MUTUAL, KIND_TRADE = "refer", "swap", "mutual", "trade"
@@ -112,6 +121,19 @@ class Phase:
     # Promotion is judged on *this* kind, so acing the rehearsal cannot carry a
     # rung whose new job is not being done.
     primary: int = 3
+    # A request rung (``KIND_ORDER``): which fields of the order have to arrive,
+    # and which of them this rung introduces. Like the naming rungs, a request
+    # rung *adds* a field and keeps the earlier ones in play, and promotion is
+    # judged on the one it added -- a conjunction of four fields would otherwise
+    # hide which one is at chance, which is exactly how `haggle` failed before
+    # (quality 0.88, variety 0.52, quantity 0.20 -- and one number, 0.07).
+    ask: tuple = ()
+    asks_first: str = ""          # the field this rung introduces
+    # Which way the request runs. False: the buyer orders and the farmer fills
+    # it. True: the farmer answers about the lot that was asked for, and the
+    # buyer has to report what it was told -- the direction `haggle` needs and
+    # no rung below it ever trained.
+    answers: bool = False
 
     # ---- what kind of game this is --------------------------------------
     @property
@@ -166,6 +188,17 @@ class Phase:
     def whole(self) -> bool:
         """Is this rung's own job to name a whole (fruit, colour, quality)?"""
         return self.naming and self.primary >= ASK_ALL
+
+    @property
+    def ask_heads(self) -> dict:
+        """The head each asked-for field has to arrive in."""
+        table = ANSWER_HEADS if self.answers else ASK_HEADS
+        return {f: table[f] for f in self.ask}
+
+    @property
+    def reporter(self) -> int:
+        """Who has to get the fields right: the side that was told them."""
+        return BUYER if self.answers else FARMER
 
     @property
     def trading(self) -> bool:
@@ -234,8 +267,9 @@ class Phase:
             # Report the partner's thing: fruit, colour, quality.
             return list(H_REPORT)
         if self.order:
-            # The farmer fills the order with its deal decision; the buyer only asks.
-            return [H_VARIETY, H_BELIEF_COLOR, H_QTY] if role == FARMER else []
+            # Only the side that has to act on what it heard has a decision; the
+            # side holding the facts just says them.
+            return list(self.ask_heads.values()) if role == self.reporter else []
         heads = [H_ACCEPT, H_VARIETY, H_QTY]
         if self.use_price:
             heads.append(H_PRICE)
@@ -286,14 +320,38 @@ def ladder(cfg: Config) -> list[Phase]:
         Phase("mutual", 4, 2, True, False, False,
               "both hold a private thing and each must report the other's; "
               "no price, no accept/reject", kind=KIND_MUTUAL),
-        Phase("order", 5, 1, False, False, False,
-              "trading begins: the buyer asks for a fruit, a colour and a "
-              "quantity; the farmer must fill the order exactly", kind=KIND_ORDER),
-        Phase("haggle", 6, 2, False, True, False,
-              "price and budget appear; one message each, then accept or walk"),
-        Phase("bargain", 7, full, False, True, False,
+        Phase("ask-qty", 5, 1, False, False, False,
+              "the first order: the buyer says how many it needs and the farmer "
+              "has to fill that number. Quantity is the one field the naming "
+              "rungs never asked for, and the rung that follows needs it",
+              kind=KIND_ORDER, ask=("quantity",), asks_first="quantity"),
+        Phase("order", 6, 1, False, False, False,
+              "the whole order: fruit, colour and quantity together, so the words "
+              "from the naming rungs have to work in a request",
+              kind=KIND_ORDER, ask=("fruit", "colour", "quantity"),
+              asks_first="fruit"),
+        Phase("quote", 7, 1, False, False, False,
+              "the order now carries the price the buyer will pay, so every "
+              "price bin needs a word before any price has to be agreed",
+              kind=KIND_ORDER, ask=("fruit", "colour", "quantity", "price"),
+              asks_first="price"),
+        Phase("offer", 8, 2, False, False, False,
+              "the other direction: the buyer asks about a lot and the farmer "
+              "answers with what it holds -- how much, what quality, what it "
+              "wants for it -- and the buyer has to report what it was told",
+              kind=KIND_ORDER, ask=("stock", "quality", "reservation"),
+              asks_first="stock", answers=True),
+        Phase("judge", 9, 2, False, False, False,
+              "the same dialogue, and now one decision: is this deal any good? "
+              "The buyer has to weigh what it was told against what it needs, "
+              "with nothing yet riding on the answer",
+              kind=KIND_ORDER, ask=("deal",), asks_first="deal", answers=True),
+        Phase("haggle", 10, 2, False, True, False,
+              "both sides now decide: budget and reservation make a deal "
+              "refusable, and it only counts if both name the same one"),
+        Phase("bargain", 11, full, False, True, False,
               "several turns, so counter-offers are possible"),
-        Phase("market", 8, full, False, True, True,
+        Phase("market", 12, full, False, True, True,
               "the full economy: stock, restocking, viability"),
     ]
 
@@ -439,6 +497,71 @@ def _fmt(x: float) -> str:
     return "%.3f" % x if x == x else "n/a"
 
 
+def _headroom_floor(muted: float, share: float) -> float:
+    """The score that takes ``share`` of the headroom left above silence."""
+    if muted != muted:
+        return 0.0
+    return muted + (1.0 - muted) * share
+
+
+def evaluate_request_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
+                          updates_in_phase: int, rule: "Promotion"
+                          ) -> tuple[bool, dict[str, Any]]:
+    """Has an order arrived, field by field?
+
+    Judged on the field this rung introduced -- the rest were introduced below
+    it and are checked separately, so a rung cannot pass on work it did last
+    time, and cannot fail invisibly because one field of four is at chance.
+    """
+    c = cfg.curriculum
+    k = c.min_success_over_chance
+    checks: dict[str, tuple[bool, str]] = {}
+    checks["long enough in rung"] = (
+        updates_in_phase >= rule.min_updates,
+        "%d of %d updates" % (updates_in_phase, rule.min_updates))
+
+    new = phase.asks_first or (phase.ask[0] if phase.ask else "")
+    got, muted = _num(ev.get("request_first")), _num(ev.get("muted_request_first"))
+    # An absolute floor, plus a real gain over silence. "Twice the muted rate" is
+    # the bar everywhere else, but it is unreachable for a field a mute agent
+    # already gets most of the time -- `judge` is one binary decision whose base
+    # rate is ~0.68, and 1.36 is not a score. The gain over silence, which the
+    # per-field check below states as a share of the headroom, is the honest form
+    # of the same question and is what an always-accept policy fails.
+    floor = max(rule.min_success, _headroom_floor(muted, c.min_field_transfer))
+    checks["%s arrives" % new] = (
+        got == got and got >= floor,
+        "%s, need %.2f (silence alone scores %s)" % (_fmt(got), floor, _fmt(muted)))
+
+    per = ev.get("request_field_transfer") or []
+    intact = ev.get("request_fields_intact") or []
+    for name, t, a in zip(phase.ask, per, intact):
+        t, a = _num(t), _num(a)
+        label = ("still carries %s" % name if name != new else "%s carries" % name)
+        checks[label] = (
+            t == t and t >= c.min_field_transfer,
+            "%s right, %s of the headroom over a muted channel, need %.2f"
+            % (_fmt(a), _fmt(t), c.min_field_transfer))
+
+    if len(phase.ask) > 1:
+        succ, chance = _num(ev.get("success")), _num(ev.get("chance"))
+        checks["the whole order arrives"] = (
+            succ == succ and (chance != chance or succ >= k * chance),
+            "%s complete, against %s with the channel muted" % (_fmt(succ), _fmt(chance)))
+
+    tr = _num(ev.get("transfer"))
+    checks["channel carries"] = (
+        tr == tr and tr >= c.min_channel_transfer,
+        "%s of the headroom, need %.2f" % (_fmt(tr), c.min_channel_transfer))
+    ts, nl = _num(ev.get("topsim")), _num(ev.get("null"))
+    checks["topsim clear of null"] = (
+        ts == ts and nl == nl and ts - nl >= c.min_topsim_over_null,
+        "%s vs null %s, need +%.2f" % (_fmt(ts), _fmt(nl), c.min_topsim_over_null))
+
+    passed = all(v[0] for v in checks.values())
+    return passed, {n: {"met": v[0], "detail": v[1]} for n, v in checks.items()}
+
+
 def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
                   updates_in_phase: int) -> tuple[bool, dict[str, Any]]:
     """Has this rung demonstrably worked?  Returns (passed, named checks).
@@ -453,6 +576,8 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     """
     c = cfg.curriculum
     rule = promotion_for(cfg, phase)
+    if phase.order:
+        return evaluate_request_rung(cfg, phase, ev, updates_in_phase, rule)
     if not (phase.swaps or phase.mutual):
         spk = ev.get("speakers", {})
         # the describer's structure in the lineup; both speakers' otherwise
@@ -1047,11 +1172,15 @@ def hindsight_targets(cfg: Config, phase: Phase, scen) -> dict[int, dict[int, to
         for role, other in ((FARMER, scen.b_meaning), (BUYER, scen.f_meaning)):
             for i, h in enumerate(H_REPORT):
                 out[role][h] = other[:, i]
+    elif phase.order and hasattr(scen, "want_variety"):
+        # Exactly the fields this rung asks for, in the direction it asks them.
+        for name, head in phase.ask_heads.items():
+            out[phase.reporter][head] = request_truth(cfg, scen, name)
     elif hasattr(scen, "want_variety"):
         out[FARMER][H_VARIETY] = scen.want_variety
         out[FARMER][H_QTY] = scen.need_qty
         out[FARMER][H_BELIEF_COLOR] = scen.want_color
-        if not phase.order:
+        if True:
             out[BUYER][H_VARIETY] = scen.want_variety
             out[BUYER][H_QTY] = scen.need_qty
             for role in (FARMER, BUYER):
@@ -1073,21 +1202,50 @@ def hindsight_targets(cfg: Config, phase: Phase, scen) -> dict[int, dict[int, to
 # ==========================================================================
 # the order rung
 # ==========================================================================
-def resolve_order(cfg: Config, sb, f_dec: torch.Tensor, f_cost: torch.Tensor,
-                  b_cost: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Did the farmer's deal decision fill the buyer's order exactly?
+def request_truth(cfg: Config, sb, name: str) -> torch.Tensor:
+    """The true value of one request field, from whichever side holds it."""
+    if name == "fruit":
+        return sb.want_variety
+    if name == "colour":
+        return sb.want_color
+    if name == "quantity":
+        return sb.need_qty
+    if name == "price":                       # the most the buyer will pay
+        return sb.max_price
+    if name == "stock":                       # of the lot that was asked about
+        return sb.offered_stock.clamp(0, cfg.world.max_qty)
+    if name == "quality":
+        return sb.offered_quality
+    if name == "reservation":                 # the least the farmer will take
+        return sb.reservation
+    if name == "deal":                        # is this one worth doing at all
+        return sb.viable.long()
+    raise KeyError(name)
 
-    Scored on the deal heads (variety, quantity), which no earlier rung used.
-    Both parties are paid for the round -- being understood and understanding
-    are one event here too -- plus partial credit per field, so a farmer that
-    gets the variety right but the quantity wrong is told which half worked.
+
+def resolve_request(cfg: Config, phase, sb, dec: dict, f_cost: torch.Tensor,
+                    b_cost: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Did what one side holds privately arrive intact at the other?
+
+    Every request rung is the same event -- one side says facts only it has, the
+    other has to put them in its decision heads -- and they differ only in which
+    fields are asked for and which way round. Both parties are paid, because
+    being understood and understanding are one event here, plus partial credit
+    per field so a farmer that gets the fruit right and the number wrong is told
+    which half worked.
     """
     R = cfg.reward
-    var_ok = f_dec[:, H_VARIETY] == sb.want_variety
-    col_ok = f_dec[:, H_BELIEF_COLOR] == sb.want_color
-    qty_ok = f_dec[:, H_QTY] == sb.need_qty
-    both = var_ok & col_ok & qty_ok
-    fields = torch.stack([var_ok, col_ok, qty_ok], dim=1)
+    answer = dec[phase.reporter]
+    oks = [answer[:, head] == request_truth(cfg, sb, name)
+           for name, head in phase.ask_heads.items()]
+    fields = torch.stack(oks, dim=1)
+    both = fields.all(dim=1)
+    # the field this rung introduced, reported separately so promotion can be
+    # judged on it rather than on a conjunction that hides it
+    by_name = dict(zip(phase.ask_heads, oks))
+    first = by_name.get(phase.asks_first, oks[0])
+    var_ok = by_name.get("fruit", both)
+    qty_ok = by_name.get("quantity", by_name.get("stock", both))
     frac = fields.float().mean(1)
     base = (R.refer_success * both.float() + R.refer_miss * (~both).float()
             + R.decode * frac)
@@ -1099,11 +1257,13 @@ def resolve_order(cfg: Config, sb, f_dec: torch.Tensor, f_cost: torch.Tensor,
     return {
         "farmer_reward": f, "buyer_reward": b,
         "success": both, "comprehended": both, "both_judged": both,
-        "farmer_decode": frac, "buyer_decode": zero_f,
-        "order_fields": fields,
+        "farmer_decode": frac if phase.reporter == FARMER else zero_f,
+        "buyer_decode": frac if phase.reporter == BUYER else zero_f,
+        "order_fields": fields, "order_first": first,
         "both_accept": both, "agree_variety": var_ok, "agree_qty": qty_ok,
         "agree_price": both,
-        "agreed_variety": f_dec[:, 1], "agreed_qty": f_dec[:, 2], "agreed_price": zero_l,
+        "agreed_variety": answer[:, H_VARIETY], "agreed_qty": answer[:, H_QTY],
+        "agreed_price": zero_l,
         "traded_qty": zero_l, "trade_value": zero_f,
         "farmer_profit": zero_f, "buyer_savings": zero_f,
         "correct_no_deal": no, "missed_deal": no, "one_sided": no, "bad_deal": no,

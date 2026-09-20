@@ -351,7 +351,7 @@ class TestPromotion(unittest.TestCase):
     def test_it_stops_at_the_last_rung(self):
         cfg = cfg_small()
         st = CurriculumState(ladder(cfg))
-        for _ in range(10):
+        for _ in range(len(ladder(cfg)) + 3):
             st.advance(0, {})
         self.assertEqual(st.phase.name, "market")
         self.assertTrue(st.finished)

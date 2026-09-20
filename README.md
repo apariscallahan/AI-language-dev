@@ -376,8 +376,9 @@ the loop so decoding changes a decision, and get the trade arithmetic right as
 well. A run at that setting produced success 0.000 at *every* checkpoint,
 comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
 
-So the task is built up over **nine rungs**, and a rung is only left behind once
-it has demonstrably worked.
+So the task is built up over **thirteen rungs**, and a rung is only left behind
+once it has demonstrably worked. One rule shapes the whole ladder: **each rung
+adds exactly one thing and keeps everything below it in play.**
 
 ### The naming rungs
 
@@ -425,17 +426,58 @@ the target the most central candidate — 42% success with the channel muted
 against 25% chance. The cluster is now shuffled and the target drawn uniformly
 from it, and a test checks that "pick the most central candidate" scores chance.
 
+### The request rungs
+
+Between naming and trading sit four rungs that are one event with the fields
+turned up one at a time: **one side says facts only it holds, and the other has
+to put them in its decision heads.** They are the naming ladder's method carried
+into the trade format, and they exist because the two hardest fields in the
+world — quantity (8 values) and price (6 bins) — have no naming rung at all.
+Nothing else ever teaches them before a deal depends on both.
+
+| rung | what is added | who reports | turns |
+|---|---|---|---|
+| `ask-qty` | **quantity**: the buyer says how many it needs and the farmer has to fill that number | farmer | 1 |
+| `order` | the rest of the order — fruit and colour alongside the quantity | farmer | 1 |
+| `quote` | **price**: the order now carries what the buyer will pay | farmer | 1 |
+| `offer` | **the other direction**: the buyer asks about a lot, the farmer answers with what it holds — how much, what quality, what it wants for it — and the buyer reports what it was told | buyer | 2 |
+| `judge` | **the decision**: the same dialogue, and now the buyer has to say whether the deal is worth doing at all, weighing what it was told against what it needs | buyer | 2 |
+
+Like a naming rung, each is **judged on the field it introduced** and has to
+show it **still carries** the ones below it, field by field against a muted
+channel. A conjunction of four fields would hide which one is at chance, and
+that is exactly what the old ladder did: `haggle` reported 0.07 success, and the
+diagnosis — quality 0.88, variety 0.52, **quantity 0.20** — had to be dug out by
+hand afterwards.
+
+`offer` is the half of the market dialogue that nothing else trains. In every
+rung below it the buyer talks and the farmer acts; in `haggle` the farmer has to
+describe its own barn, and without `offer` that skill would have to appear at
+the same moment as the price agreement and the accept/reject decision.
+
+`judge` exists because of the way `haggle` failed: **always accept**, plus
+base-rate guessing, for 7% success and a channel carrying 0.00–0.02. Roughly 68%
+of rounds are worth doing, so accepting everything scores 0.68 and looks like
+competence. `judge` scores nothing but that decision, and it is judged on the
+**gain over silence** rather than on the raw rate — a pair that accepts
+everything scores exactly what a mute pair scores, which is zero of the
+headroom, and cannot pass. ("Twice the chance rate", the bar everywhere else, is
+not a reachable number when silence already scores 0.68.)
+
 ### The trading rungs
 
 | rung | what is added | turns | chance |
 |---|---|---|---|
 | `mutual` | both hold a private thing and each must report the other's; still no price, no accept/reject | 2 | measured (muted channel) |
-| `order` | trading begins and the pool splits into farmers and buyers, each carrying the language it learned: the buyer asks for a fruit, a colour and a quantity, and the farmer must fill the order exactly | 1 | measured |
-| `haggle` | price and budget, so accept/reject has a payoff — still one message each | 2 | ~0 |
+| `haggle` | the pool splits into farmers and buyers, and the deal starts paying: both sides must name the same one, and it only counts if it is actually executable | 2 | ~0 |
 | `bargain` | several turns, so counter-offers become possible | 4 | ~0 |
 | `market` | the full economy: persistent stock, restocking, viability | 4 | ~0 |
 
-`order` exists because `haggle` needed deal heads that nothing had trained.
+**The role split moved to `haggle`.** Everything below it is one language in two
+seats: the request rungs run in both directions — `quote` has the buyer saying
+prices, `offer` has the farmer saying them — and one pool learns both from the
+same words. The split exists so the two sides can diverge in *strategy*, which
+only starts to matter where selling and buying pay differently.
 
 **Weights carry across every transition.** The population that learned to name is
 the population that learns to haggle — nothing is reinitialised at a boundary.
@@ -475,7 +517,8 @@ saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
 **Every rung has a budget** (`curriculum.rung_budget_updates`, in training
 updates): 80–1,500 for the single-field naming rungs, 80–2,500 for `name-all`
-and `order`, 80–3,500 for `mutual`, `haggle` and `bargain`, open for `market`.
+and `offer`, 80–2,000 for `ask-qty`, `order` and `quote`, 80–3,500 for `mutual`,
+`haggle` and `bargain`, open for `market`.
 Promotion is checked every 25 updates with a light probe, so a rung that works is
 left promptly. A rung whose community is still filling up does not spend its
 budget, and cannot pass, until everyone has arrived. A rung that reaches its

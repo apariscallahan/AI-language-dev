@@ -683,6 +683,14 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     f_decode = float(batch.farmer_decode_t.float().mean())
     b_decode = float(batch.buyer_decode_t.float().mean())
     extra: dict[str, Any] = {}
+    res = batch.res if isinstance(batch.res, dict) else None
+    if res is not None and "order_fields" in res:
+        # A request rung: how often each asked-for field arrived, and how often
+        # the one this rung introduced did. One conjunction would hide a field
+        # sitting at chance, which is how the old `haggle` failure looked.
+        of = res["order_fields"].float()
+        extra["request_fields"] = [float(x) for x in of.mean(0)]
+        extra["request_first"] = float(res["order_first"].float().mean())
     if mutual:
         extra["farmer_report"] = float(batch.res["farmer_report_ok"].float().mean())
         extra["buyer_report"] = float(batch.res["buyer_report_ok"].float().mean())
@@ -867,6 +875,15 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
                                               scrambled["farmer_variety_acc"]),
         "length_only_variety": _headroom(scrambled["farmer_variety_acc"],
                                          muted["farmer_variety_acc"]),
+        **({"request_fields_intact": intact["request_fields"],
+            "request_fields_muted": muted["request_fields"],
+            "request_field_transfer": [_headroom(a, m) for a, m in zip(
+                intact["request_fields"], muted["request_fields"])],
+            "request_first": intact["request_first"],
+            "muted_request_first": muted["request_first"],
+            "request_first_transfer": _headroom(intact["request_first"],
+                                                muted["request_first"])}
+           if "request_fields" in intact else {}),
         **({"intact_farmer_report": intact["farmer_report"],
             "muted_farmer_report": muted["farmer_report"],
             "intact_buyer_report": intact["buyer_report"],
@@ -986,7 +1003,10 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                 out[k + "_transfer"] = abl[k + "_transfer"]
         for k in ("farmer_field_transfer", "buyer_field_transfer",
                   "farmer_fields_intact", "buyer_fields_intact",
-                  "farmer_fields_muted", "buyer_fields_muted"):
+                  "farmer_fields_muted", "buyer_fields_muted",
+                  "request_fields_intact", "request_fields_muted",
+                  "request_field_transfer", "request_first",
+                  "muted_request_first", "request_first_transfer"):
             if k in abl:
                 out[k] = abl[k]
         out["views"].append(row)

@@ -92,7 +92,8 @@ method             : the one configuration -- size aside, nothing simulated was 
 Every community is **founded by 2 agents** whatever the preset, and the founders
 take all four naming rungs alone; newcomers start arriving at `mutual`, one every
 40 updates. A rung that is still filling up does not spend its budget and cannot
-pass, so growth never eats a rung's time.
+pass, so growth never eats a rung's time. The pool stays one pool until
+`haggle`, where each agent is copied into a farmer and a buyer.
 
 ---
 
@@ -127,8 +128,10 @@ pass, so growth never eats a rung's time.
 | `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
 | `name-all` | the first rung gated on **held-out combinations**. Watch trained-vs-reserved success in the checks: a code of whole-thing names shows a wide gap and stalls here. That is the gate working, not a bug. Watch each seat's field coverage too. |
 | `mutual` | both report the other's thing; held-out gated. Speaker costs, community growth and hindsight feedback all switch on here. |
-| `order` | the pool splits into farmers and buyers (the log says so). The farmer must fill fruit, colour and quantity exactly. |
-| `haggle` | channel transfer well above zero, not just success from base rates. Exact price-bin agreement is the likely bottleneck. |
+| `ask-qty`, `order`, `quote` | the buyer orders and the farmer fills it, one more field each time: quantity, then fruit and colour, then price. Each prints `<field> arrives` for the field it introduced and `still carries <field>` for the rest -- a rung whose new field climbs while an older one falls to chance is forgetting, not learning. |
+| `offer` | the other direction: the farmer describes the lot it was asked about and the buyer reports it. The first rung where the farmer says anything about its own barn, and the half of the market dialogue nothing else trains. |
+| `judge` | the buyer decides whether the deal is worth doing. Judged on the gain over silence, not the raw rate: ~68% of rounds are worth doing, so accepting everything scores 0.68 and still fails -- which is exactly how `haggle` used to fail. |
+| `haggle` | the pool splits into farmers and buyers (the log says so). Channel transfer well above zero, not just success from base rates. Exact price-bin agreement is the likely bottleneck. |
 | throughout | the report's **word classes** row (do separate words specialise to separate fields? — the adjective question), cross-role overlap (should stay high: one pool, one language), and the share of utterances at the buffer end (~0). |
 
 **Expect chance for a while.** The first code forms suddenly and late: the runs
@@ -222,7 +225,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
 | `reward.costs_from_rung` | the rung from which the speaker pays for length and rarity and is paid for agreeing (`mutual`). Earlier, the cheapest way to be short and to agree is to say the same short nothing. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
-| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`order`). |
+| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the request rungs included -- they run in both directions. |
 | `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |
 | `world.holdout_combo_frac` | share of (fruit, colour, quality) combinations reserved and never trained on (0.25, a Latin square). |
 | `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones (0.60). The productivity gate. |
