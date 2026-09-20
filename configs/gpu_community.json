@@ -12,7 +12,7 @@
   },
   "train": {
     "batch_size": 4096,
-    "episodes": 60000000,
+    "episodes": 100000000,
     "grad_checkpoint": true
   },
   "log": {

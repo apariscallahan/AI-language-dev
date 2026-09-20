@@ -368,11 +368,13 @@ class RewardConfig:
     # second rung, the population collapsed onto one one-atom word (coherence
     # 1.000, 1.0 atoms per word, 17 distinct words among 15 speakers) and colour
     # never left chance -- the cheapest way to agree, before a word for colour
-    # exists, is for everyone to say the same short nothing. The naming rungs are
-    # where the words have to be invented; the pressure to make them short and
-    # shared belongs after that, and `mutual` is where two speakers first have to
-    # understand each other at once.
-    costs_from_rung: str = "mutual"
+    # exists, is for everyone to say the same short nothing.
+    # The rule that follows: the costs stay off while a rung still has to
+    # *invent* a word, and come on at the first rung that only reuses them.
+    # That is `offer` -- the farmer describes a lot with the quantity, quality
+    # and price words the rungs below it built -- and it covers the two fields
+    # no naming rung teaches: quantity (`ask-qty`) and price (`quote`).
+    costs_from_rung: str = "offer"
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -994,8 +996,20 @@ def validate(cfg: Config) -> None:
     phase_named(cfg, cfg.train.hindsight_from_rung)          # must name a rung
     phase_named(cfg, cfg.reward.costs_from_rung)
     phase_named(cfg, cfg.population.grow_from_rung)
+    from .curriculum import ladder
+    rungs = {p.name for p in ladder(cfg)}
     for name, (lo, hi) in dict(cfg.curriculum.rung_budget_updates).items():
         assert 0 <= int(lo) <= int(hi), "rung %s: budget must be (min, max) updates" % name
+        # A budget for a rung that does not exist is silently ignored, and the
+        # rung it was meant for quietly falls back to the default. Three separate
+        # settings in this project outlived the rung they named.
+        assert name in rungs, (
+            "curriculum.rung_budget_updates names %r, which is not a rung: %s"
+            % (name, ", ".join(sorted(rungs))))
+    if cfg.curriculum.start_phase:
+        assert cfg.curriculum.start_phase in rungs, (
+            "curriculum.start_phase is %r, which is not a rung: %s"
+            % (cfg.curriculum.start_phase, ", ".join(sorted(rungs))))
     assert cfg.curriculum.check_every_updates >= 1
     assert cfg.log.checkpoint_every_updates >= 1
     assert cfg.population.grow_every_updates >= 1

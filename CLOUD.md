@@ -66,7 +66,7 @@ run length and how much output there is — and nothing else
 |---|---|---|---|---|---|
 | *(none)* | 2 → 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M | the reference scale, and the one a CPU can check |
 | `gpu_small` | 2 → 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
-| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M | the main run: a community big enough that a code has to work for strangers |
+| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 100M | the main run: a community big enough that a code has to work for strangers |
 | `gpu_large` | 2 → 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M | the big one; benchmark before committing to it |
 
 ```bash
@@ -85,7 +85,7 @@ The header prints scale and method apart, and the method line should read that
 nothing simulated was changed:
 
 ```
-scale              : pool of 2 growing to 32, then 32 + 32 once trading starts; d=96 x 3 layers, batch 4,096, 60,000,000 episodes
+scale              : pool of 2 growing to 32, then 32 + 32 once trading starts; d=96 x 3 layers, batch 4,096, 100,000,000 episodes
 method             : the one configuration -- size aside, nothing simulated was changed
 ```
 
@@ -116,6 +116,13 @@ pass, so growth never eats a rung's time. The pool stays one pool until
   each against its own muted baseline. Coverage is per field: **fruit, colour,
   quality**. `silent` and `at buffer end` should both be near 0 — the first means
   agents saying nothing, the second means babbling into the cap.
+
+  On a request rung the same line also names each field of the order and how
+  often it arrived, which is the number to watch there:
+
+```
+[checkpoint 12,800] rung quote | success 0.120 (muted 0.020) | channel 0.31 of headroom | fruit 0.81, colour 0.77, quantity 0.44, price 0.19 | buyer coverage 0.400 [0.50 0.40 0.30]
+```
 - **rung transitions**, with every criterion, passed or not;
 - **budget stops**, naming exactly what was unmet;
 - the **final verdict** and the report path.
@@ -127,9 +134,9 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 | `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. |
 | `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
 | `name-all` | the first rung gated on **held-out combinations**. Watch trained-vs-reserved success in the checks: a code of whole-thing names shows a wide gap and stalls here. That is the gate working, not a bug. Watch each seat's field coverage too. |
-| `mutual` | both report the other's thing; held-out gated. Speaker costs, community growth and hindsight feedback all switch on here. |
+| `mutual` | both report the other's thing; held-out gated. Community growth and hindsight feedback switch on here; the speaker costs wait until `offer`. |
 | `ask-qty`, `order`, `quote` | the buyer orders and the farmer fills it, one more field each time: quantity, then fruit and colour, then price. Each prints `<field> arrives` for the field it introduced and `still carries <field>` for the rest -- a rung whose new field climbs while an older one falls to chance is forgetting, not learning. |
-| `offer` | the other direction: the farmer describes the lot it was asked about and the buyer reports it. The first rung where the farmer says anything about its own barn, and the half of the market dialogue nothing else trains. |
+| `offer` | the other direction: the farmer describes the lot it was asked about and the buyer reports it. The speaker costs come on here -- the first rung that invents no new word, so `silent` and `atoms/word` should drop without success dropping with them. The first rung where the farmer says anything about its own barn, and the half of the market dialogue nothing else trains. |
 | `judge` | the buyer decides whether the deal is worth doing. Judged on the gain over silence, not the raw rate: ~68% of rounds are worth doing, so accepting everything scores 0.68 and still fails -- which is exactly how `haggle` used to fail. |
 | `haggle` | the pool splits into farmers and buyers (the log says so). Channel transfer well above zero, not just success from base rates. Exact price-bin agreement is the likely bottleneck. |
 | throughout | the report's **word classes** row (do separate words specialise to separate fields? — the adjective question), cross-role overlap (should stay high: one pool, one language), and the share of utterances at the buffer end (~0). |
@@ -223,7 +230,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `--n-farmers`, `--n-buyers` | community size per role (a scale key, like the presets). |
 | `population.founders_farmers/_buyers` | how many agents found the community. 0 = start at full size, which does not work above 2 + 2. |
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
-| `reward.costs_from_rung` | the rung from which the speaker pays for length and rarity and is paid for agreeing (`mutual`). Earlier, the cheapest way to be short and to agree is to say the same short nothing. |
+| `reward.costs_from_rung` | the rung from which the speaker pays for length and rarity and is paid for agreeing (`offer`, the first rung that invents no new word). Earlier, the cheapest way to be short and to agree is to say the same short nothing. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
 | `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the request rungs included -- they run in both directions. |
 | `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |
@@ -385,7 +392,7 @@ grep -E "rung|PHASE" runs/<run>/run.log | tail -20
 python -m unittest discover -s tests
 ```
 
-170 tests, about 80 seconds. Worth doing on the GPU box, not just locally:
+178 tests, about two minutes. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
 readable scalar one, and `tests/test_config.py` that there is one configuration
 and no device-specific arithmetic.

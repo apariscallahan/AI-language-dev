@@ -382,7 +382,8 @@ adds exactly one thing and keeps everything below it in play.**
 
 ### The naming rungs
 
-Four of the nine are about naming, and nothing is traded until they are done.
+Four of the thirteen are about naming, and nothing is traded until they are
+done.
 Each is a lineup: the describer sees one thing and which field it is being asked
 about, the guesser sees three candidates and picks. The describer alternates
 batch by batch, so every agent does both jobs — a single fixed describer produces
@@ -390,8 +391,8 @@ a one-way code (in the run that motivated it, the farmer's utterances had
 positional structure 0.03 while the buyer's had 0.39, and every farmer newborn's
 token accuracy was 0.000).
 
-Below the trading rungs **both seats are filled from one pool of agents**, so
-there is one language rather than two that have to be reconciled afterwards.
+Until `haggle` **both seats are filled from one pool of agents**, so there is
+one language rather than two that have to be reconciled afterwards.
 
 **A naming rung adds a kind of round; it never swaps to one.** `name-color` is
 60% colour rounds and 40% fruit rounds, so the fruit words stay in use and stay
@@ -583,7 +584,7 @@ not restrictions: nothing ever stops an agent from saying anything.
 | `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
-**All of it is off until `mutual`** (`reward.costs_from_rung`). A language has to
+**All of it is off until `offer`** (`reward.costs_from_rung`) — off through every rung that still has to invent a word, on at the first rung that only reuses them. A language has to
 exist before it can be economised, and the failure is not subtle: with the costs
 on from the second rung a GPU run collapsed onto a single one-atom utterance —
 coherence 1.000, 1.00 atoms per word, ~1 word per utterance, 17 distinct words
@@ -917,8 +918,10 @@ agreeing exactly with the readable scalar one; the reward loop; the held-out set
 and the lineup builder (no reserved combination is ever a training target, every
 candidate could be the answer, and "pick the most central candidate" scores
 chance); one configuration on every device with no device-specific arithmetic;
-every schedule in updates; gradient checkpointing changing nothing. 170 tests,
-about 80 seconds.
+every schedule in updates; gradient checkpointing changing nothing. Every rung
+of the ladder plays a real training step, passes on perfect evidence and fails
+on empty evidence — the check that would have caught the trading rungs going
+unexercised for as long as they did. 178 tests, about two minutes.
 
 **Demonstrated in runs.** Founding at 2 + 2 and growing gets a lineup code off
 chance where 6 + 6 never does; the code forms suddenly and late (~300–600
@@ -936,6 +939,9 @@ updates); alternating describers are necessary; hindsight feedback must wait.
 - Whether separate words specialise to separate fields — the adjective question,
   and the point of the whole naming ladder. The report's "word classes" row is
   where it would show.
+- **The request rungs have never been run for real.** `ask-qty`, `order`,
+  `quote`, `offer` and `judge` are new, and what is verified is that they play,
+  score and judge correctly — not that a population learns them.
 - `haggle` and above. Price coordination (both sides must pick the same bin,
   `reward.price_tol` = 0) is the likely next bottleneck; if it stalls there, that
   is a candidate for a further rung rather than for quietly loosening the test.
@@ -1030,7 +1036,7 @@ output — and nothing else:
 |---|---|---|---|---|
 | *(none)* | 2 → 6, then 6 + 6 | d48, 2 layers, 55k params | 256 | 6M |
 | `gpu_small` | 2 → 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M |
-| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 60M |
+| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 100M |
 | `gpu_large` | 2 → 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M |
 
 The run header prints the two separately — a `scale` line and a `method` line —

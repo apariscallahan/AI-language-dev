@@ -704,12 +704,12 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
         A("")
         inh = cur.get("inherited") or {}
         if inh:
-            A("| later phase | words in use | inherited from `refer` | new here | inherited share |")
+            A("| rung | words in use | already in use below it | new here | inherited share |")
             A("|---|---|---|---|---|")
             for name, d in inh.items():
                 A("| `%s` | %d | %d | %d | %.0f%% |"
                   % (name, int(d.get("words_in_use", 0)),
-                     int(d.get("inherited_from_refer", 0)), int(d.get("new_here", 0)),
+                     int(d.get("inherited", 0)), int(d.get("new_here", 0)),
                      100 * float(d.get("inherited_share", 0.0))))
             A("")
         new_words = cur.get("new_words") or {}

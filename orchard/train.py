@@ -36,13 +36,11 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
 from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
-                         evaluate_rung, growth_applies, ladder, promotion_for,
-                         rung_budget)
+                         evaluate_rung, growth_applies, ladder, rung_budget)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
 from .population import BirthEvent, Population
-from .render import render_transcript
 from .world import World
 
 
@@ -243,7 +241,8 @@ class Trainer:
         }
         reached = cur.phase.index
         for p in cur.phases[1:reached + 1]:
-            out.setdefault("inherited", {})[p.name] = self.provenance.inherited(p.name)
+            out.setdefault("inherited", {})[p.name] = self.provenance.inherited(
+                p.name, [q.name for q in cur.phases[:p.index]])
             out.setdefault("new_words", {})[p.name] = self.provenance.new_in_phase(p.name)
         # what each newborn was actually shown, which is what decides transmission
         bns = [r.get("bottleneck", {}) or {} for r in self.newborn_reports]
@@ -1437,9 +1436,18 @@ class Trainer:
         st = row.get("stability") or {}
         w = row.get("words") or {}
         ov = row.get("cross_role_overlap") or {}
+        per_field = ""
+        fields = ev.get("request_fields_intact")
+        if fields:
+            # On a request rung the interesting number is which field arrived,
+            # not the conjunction: "quantity 0.17" is a diagnosis, "0.005" is not.
+            names = self.curriculum.phase.ask or range(len(fields))
+            per_field = " | " + ", ".join(
+                "%s %s" % (n, f(v, "%.2f")) for n, v in zip(names, fields))
         self.log.always(
-            "[checkpoint %s] rung %s | success %s | channel %s of headroom | %s"
-            % ("{:,}".format(self.episode), row.get("phase"), succ, f(ev.get("transfer"), "%.2f"),
+            "[checkpoint %s] rung %s | success %s | channel %s of headroom%s | %s"
+            % ("{:,}".format(self.episode), row.get("phase"), succ,
+               f(ev.get("transfer"), "%.2f"), per_field,
                "; ".join(roles) or "no speakers probed"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "

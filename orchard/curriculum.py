@@ -66,7 +66,7 @@ import torch
 
 from .config import Config
 from .env import BUYER, FARMER
-from .world import K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY
+from .world import K_COLOR, K_EMPTY, K_FIELD, K_QUALITY, K_VARIETY
 
 # Head layout shared by every phase.  Sampling all of them keeps tensor shapes
 # constant across a transition; each phase says which ones actually count.
@@ -462,7 +462,10 @@ def promotion_for(cfg: Config, phase: Phase) -> Promotion:
         # its own job. What the rehearsal has to show is checked separately.
         chance = round_chance(cfg, phase.primary)
         return Promotion(
-            min_success=max(c.refer_min_success, 2.0 * chance),
+            # The floor and the "clear of chance" multiple are the same question
+            # asked twice; the multiple was hardcoded here, so tuning
+            # `min_success_over_chance` moved one bar and not the other.
+            min_success=max(c.refer_min_success, c.min_success_over_chance * chance),
             min_success_over_chance=c.min_success_over_chance,
             min_topsim_over_null=c.min_topsim_over_null,
             min_channel_transfer=c.min_channel_transfer,
@@ -1177,23 +1180,21 @@ def hindsight_targets(cfg: Config, phase: Phase, scen) -> dict[int, dict[int, to
         for name, head in phase.ask_heads.items():
             out[phase.reporter][head] = request_truth(cfg, scen, name)
     elif hasattr(scen, "want_variety"):
-        out[FARMER][H_VARIETY] = scen.want_variety
-        out[FARMER][H_QTY] = scen.need_qty
+        # A trading rung: both sides state the deal, so both are told what it was.
+        for role in (FARMER, BUYER):
+            out[role][H_VARIETY] = scen.want_variety
+            out[role][H_QTY] = scen.need_qty
+            out[role][H_ACCEPT] = scen.viable.long()
         out[FARMER][H_BELIEF_COLOR] = scen.want_color
-        if True:
-            out[BUYER][H_VARIETY] = scen.want_variety
-            out[BUYER][H_QTY] = scen.need_qty
-            for role in (FARMER, BUYER):
-                out[role][H_ACCEPT] = scen.viable.long()
-            if cfg.reward.belief_heads:
-                b = H_BELIEF
-                out[FARMER][b[0]] = scen.want_variety
-                out[FARMER][b[1]] = scen.need_qty
-                out[FARMER][b[2]] = scen.min_quality
-                out[FARMER][b[3]] = scen.max_price
-                out[BUYER][b[1]] = scen.offered_stock.clamp(0, w.max_qty)
-                out[BUYER][b[2]] = scen.offered_quality
-                out[BUYER][b[3]] = scen.reservation
+        if cfg.reward.belief_heads:
+            b = H_BELIEF
+            out[FARMER][b[0]] = scen.want_variety
+            out[FARMER][b[1]] = scen.need_qty
+            out[FARMER][b[2]] = scen.min_quality
+            out[FARMER][b[3]] = scen.max_price
+            out[BUYER][b[1]] = scen.offered_stock.clamp(0, w.max_qty)
+            out[BUYER][b[2]] = scen.offered_quality
+            out[BUYER][b[3]] = scen.reservation
     # only heads the rung actually scores for that role
     return {r: {h: t for h, t in d.items() if h in phase.active_heads(r, cfg)}
             for r, d in out.items()}
@@ -1262,7 +1263,10 @@ def resolve_request(cfg: Config, phase, sb, dec: dict, f_cost: torch.Tensor,
         "order_fields": fields, "order_first": first,
         "both_accept": both, "agree_variety": var_ok, "agree_qty": qty_ok,
         "agree_price": both,
-        "agreed_variety": answer[:, H_VARIETY], "agreed_qty": answer[:, H_QTY],
+        # Only what this rung actually asked for; an unasked head is an untrained
+        # sample, and a log is worse for carrying one than for carrying nothing.
+        "agreed_variety": (answer[:, H_VARIETY] if "fruit" in phase.ask else zero_l),
+        "agreed_qty": (answer[:, H_QTY] if "quantity" in phase.ask else zero_l),
         "agreed_price": zero_l,
         "traded_qty": zero_l, "trade_value": zero_f,
         "farmer_profit": zero_f, "buyer_savings": zero_f,

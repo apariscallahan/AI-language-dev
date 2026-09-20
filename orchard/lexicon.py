@@ -700,13 +700,21 @@ class WordProvenance:
         return [{"word": w, "count": n, "settled": self.settled_phase.get(w) == phase_name,
                  "first_episode": self.first_episode[w]} for w, n in rows[:limit]]
 
-    def inherited(self, later_phase: str, earlier_phase: str = "refer") -> dict[str, Any]:
-        """How much of a later phase's vocabulary was already there."""
+    def inherited(self, later_phase: str, earlier: Sequence[str] = ()) -> dict[str, Any]:
+        """How much of a rung's vocabulary was already in use before it.
+
+        ``earlier`` is every rung that came before this one. It used to default to
+        one rung called "refer", which stopped existing three renames ago, so
+        every rung reported that none of its words were inherited -- the opposite
+        of what the run was doing, and the exact question the report asks.
+        """
         used_later = set(self.counts_by_phase[later_phase])
-        from_earlier = {w for w in used_later if self.first_phase.get(w) == earlier_phase}
+        before = set(earlier)
+        from_earlier = {w for w in used_later if self.first_phase.get(w) in before}
         return {
             "words_in_use": len(used_later),
-            "inherited_from_%s" % earlier_phase: len(from_earlier),
+            "inherited": len(from_earlier),
+            "inherited_from": sorted(before),
             "new_here": len(used_later) - len(from_earlier),
             "inherited_share": (len(from_earlier) / len(used_later)) if used_later else 0.0,
         }

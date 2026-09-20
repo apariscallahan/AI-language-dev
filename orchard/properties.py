@@ -259,10 +259,18 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
         "an earlier round's item would test this)")
 
     # ---- interchangeable -------------------------------------------------
-    swap = next((t for t in curriculum.get("transitions", []) if t.get("from") == "refer-swap"), None)
+    # Which rungs these are comes from the ladder. Hard-coded names ("refer-swap",
+    # "refer-mutual") outlived the rungs themselves, so both properties reported
+    # "not reached" however far a run got.
+    from .curriculum import ladder
+    rungs = ladder(cfg)
+    swap_name = next((p.name for p in rungs if p.swaps and p.whole), "")
+    mutual_name = next((p.name for p in rungs if p.mutual), "")
+    swap = next((t for t in curriculum.get("transitions", [])
+                 if t.get("from") == swap_name), None)
     ov, _ = _latest(rows, lambda r: _num((r.get("cross_role_overlap") or {}).get("weighted_overlap")))
     cx, _ = _latest(rows, lambda r: _num((r.get("stability") or {}).get("coherence_cross")))
-    if swap is None and "refer-swap" not in reached:
+    if swap is None and swap_name not in reached:
         add("interchangeable", "both roles describe and decode; cross-role overlap",
             float("nan"), NOT_REACHED)
     else:
@@ -296,7 +304,8 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
                                        bdis if bdis is not None else float("nan")))
 
     # ---- perspectives ----------------------------------------------------
-    mut = next((t for t in curriculum.get("transitions", []) if t.get("from") == "refer-mutual"), None)
+    mut = next((t for t in curriculum.get("transitions", [])
+                if t.get("from") == mutual_name), None)
     if mut is not None:
         add("perspectives", "each role reports the other's private meaning (mutual rung, "
             "per role)", 1.0, PRESENT, "passed per role at episode %s" % mut.get("episode"))

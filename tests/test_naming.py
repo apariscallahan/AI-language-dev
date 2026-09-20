@@ -71,9 +71,23 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
                                  "%s charges for speaking" % p.name)
                 self.assertFalse(growth_applies(cfg, p),
                                  "%s grows the community" % p.name)
-        self.assertTrue(costs_apply(cfg, phase_named(cfg, "mutual")))
         self.assertTrue(growth_applies(cfg, phase_named(cfg, "mutual")))
         self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
+
+    def test_the_costs_wait_for_every_rung_that_invents_a_word(self):
+        """Length and rarity are pressures on a word that exists."""
+        from orchard.curriculum import costs_apply
+        cfg = Config()
+        invents = [p for p in ladder(cfg)
+                   if p.referential or (p.order and p.asks_first in
+                                        ("quantity", "price"))]
+        for p in invents:
+            self.assertFalse(costs_apply(cfg, p),
+                             "%s charges for speaking while it is still "
+                             "inventing %s" % (p.name, p.asks_first or "words"))
+        last = max(p.index for p in invents)
+        self.assertTrue(costs_apply(cfg, ladder(cfg)[last + 1]),
+                        "the costs never come on")
 
     def test_a_query_round_varies_only_the_field_it_asks_about(self):
         cfg = Config()

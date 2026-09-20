@@ -35,7 +35,7 @@ from typing import Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from .agents import Agent, dialogue_offset, own_dialogue_positions
+from .agents import Agent, dialogue_offset
 from .config import Config
 from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, grammar_allowed, length_cost, resolve,

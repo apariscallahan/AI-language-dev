@@ -926,10 +926,18 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
     meanings, is how context-free the form-meaning pairing is.
     """
     from .conventions import similarity
-    from .curriculum import phase_named
+    from .curriculum import ladder
     from .lexicon import reference_buyer_obs
-    lineup = phase_named(cfg, "refer-swap").with_informer(BUYER)
-    trade = phase_named(cfg, "haggle")
+    # Taken from the ladder, not by name: this asked for "refer-swap" for long
+    # enough that the rungs were renamed under it, and the KeyError was swallowed
+    # by the caller, so the measure silently reported nothing for every run.
+    rungs = ladder(cfg)
+    naming = next((p for p in rungs if p.swaps and p.whole), None)
+    trade = next((p for p in rungs if p.trading), None)
+    if naming is None or trade is None:
+        return {"n": 0, "consistency": float("nan"),
+                "note": "the ladder has no naming rung or no trading rung"}
+    lineup = naming.with_informer(BUYER)
     tup = tuple_meanings(cfg, n, seed=4242)
     req = []
     for m in tup:
