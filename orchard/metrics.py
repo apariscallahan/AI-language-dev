@@ -632,8 +632,20 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     if pairing is not None:
         f_idx, b_idx = pairing
     else:
-        f_idx = torch.tensor([rng.choice(list(f_sel)) for _ in range(n)], dtype=torch.long)
-        b_idx = torch.tensor([rng.choice(list(b_sel)) for _ in range(n)], dtype=torch.long)
+        fs, bs = list(f_sel), list(b_sel)
+        f_list = [rng.choice(fs) for _ in range(n)]
+        # Seat the pairs the way training does. Until the roles split, one pool
+        # fills both seats and training never puts an agent opposite itself
+        # (Population.pair); drawing the seats independently did, half the time
+        # with two founders. That asked every promotion check a question training
+        # never asks -- can an agent read its *own* words -- and two founders who
+        # had each invented a dialect the other could read scored 0.92 in
+        # training and 0.60 here, and a working rung ran out its budget.
+        shared = getattr(pop, "shared", False)
+        b_list = [rng.choice([b for b in bs if b != f] or bs) if shared else rng.choice(bs)
+                  for f in f_list]
+        f_idx = torch.tensor(f_list, dtype=torch.long)
+        b_idx = torch.tensor(b_list, dtype=torch.long)
     batch = run_episodes(cfg, scen, pop.farmers, pop.buyers, f_idx, b_idx, device=device,
                          channel_mode=channel_mode, phase=phase)
     # Tensor views, so a 4096-episode evaluation is a few reductions rather than

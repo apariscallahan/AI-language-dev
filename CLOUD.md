@@ -132,7 +132,7 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 
 | rung | what to look for |
 |---|---|
-| `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. |
+| `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. `coherence 0.500` through the naming rungs is expected: the two founders each keep a dialect the other can read, and converge once the community arrives at `mutual`. The rolling success on the status line and the checkpoint's success should agree roughly; a wide gap between them means training and measurement are asking different questions. |
 | `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
 | `name-all` | the hard one: three fields in one utterance. Watch **words per utterance** climb toward 3 and **coverage** toward 0.30 — a run that sticks at ~1.5 words and coverage ~0.15 is naming one field and guessing the rest. The checkpoint line prints `held-out vs trained`; they should stay close (a wide gap is memorisation, and has never been seen here). |
 | `mutual` | both report the other's thing; held-out gated. Community growth and hindsight feedback switch on here; the speaker costs wait until `offer`. |
@@ -373,15 +373,50 @@ leaves a readable `report.md`, full metrics and a ledger. Interrupting is safe.
 
 ---
 
-## 12. Long runs over SSH
+## 12. Keeping a run alive when you disconnect
+
+A run started straight from a terminal is a child of that terminal's shell, so
+it dies when the terminal goes away -- closing an SSH session, or a browser
+terminal (the RunPod web terminal, Jupyter's) disconnecting because the laptop
+slept. Start it inside `tmux`, which lives on the machine, not in your browser:
 
 ```bash
-nohup bash cloud_run.sh > run.out 2>&1 &
+tmux new -s orchard
+```
+
+Then, inside it, start or resume the run as usual:
+
+```bash
+CONFIG=configs/gpu_community.json bash cloud_run.sh
+```
+
+Detach with **Ctrl+B, then D** -- the run keeps going -- and close the tab or
+put the laptop to sleep. Come back to it from any new terminal:
+
+```bash
+tmux attach -t orchard
+```
+
+If `tmux` is missing (`command not found`):
+
+```bash
+apt-get update && apt-get install -y tmux
+```
+
+Without `tmux`, `nohup` survives a disconnect too, with the output in a file
+rather than on screen:
+
+```bash
+CONFIG=configs/gpu_community.json nohup bash cloud_run.sh > run.out 2>&1 &
 ```
 
 ```bash
 tail -f run.out
 ```
+
+Either way, only the *terminal* is safe to lose. Stopping the pod stops the run;
+the run folder is on the pod's volume, so it resumes from its last snapshot (§4)
+once the pod is back.
 
 Which rung is it on:
 

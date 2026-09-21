@@ -1049,6 +1049,57 @@ class TestExplorationIsRestoredEachRung(unittest.TestCase):
         self.assertIn("updates_in_phase", src)
 
 
+class TestMeasurementSeatsPairsLikeTraining(unittest.TestCase):
+    """A promotion check must ask the question training asks.
+
+    Training never seats an agent opposite itself (`Population.pair`); the
+    evaluation drew the two seats independently, so with two founders half of
+    every check was an agent reading its own words. Two founders who had each
+    invented a dialect the other could read scored 0.92 in training and 0.60 in
+    the check, and `name-fruit` ran out its budget with a working code.
+    """
+
+    def _pool(self, n):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = n
+        cfg.population.founders_farmers = cfg.population.founders_buyers = n
+        torch.manual_seed(0)
+        return cfg, Population(cfg, random.Random(0))
+
+    def _seats(self, cfg, pop, n_eps=400):
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
+        phase = phase_named(cfg, "name-fruit")
+        out = M._play(cfg, pop, None, n_eps, list(range(len(pop.farmers))),
+                      list(range(len(pop.buyers))), rng=random.Random(0),
+                      phase=phase, sampler=lambda n, held_out=False: rw.sample(n))
+        return out["pairing"]
+
+    def test_training_never_seats_an_agent_opposite_itself(self):
+        cfg, pop = self._pool(2)
+        self.assertTrue(pop.shared)
+        f, b = pop.pair(64)
+        self.assertFalse(bool((f == b).any()))
+
+    def test_neither_does_the_evaluation(self):
+        for n in (2, 3):
+            cfg, pop = self._pool(n)
+            f, b = self._seats(cfg, pop)
+            self.assertFalse(bool((f == b).any()),
+                             "a %d-agent pool was measured talking to itself" % n)
+            # and every agent still takes both seats
+            self.assertEqual(set(f.tolist()), set(range(n)))
+            self.assertEqual(set(b.tolist()), set(range(n)))
+
+    def test_split_roles_are_left_alone(self):
+        """Once farmers and buyers are different agents, index i is two agents."""
+        cfg, pop = self._pool(2)
+        pop.split_roles(0)
+        self.assertFalse(pop.shared)
+        f, b = self._seats(cfg, pop)
+        self.assertTrue(bool((f == b).any()),
+                        "farmer i and buyer i are different agents and may meet")
+
+
 class TestWordGrammar(unittest.TestCase):
     def test_every_utterance_alternates_atoms_and_marks(self):
         cfg = cfg_small()

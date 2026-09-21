@@ -404,7 +404,20 @@ positional structure 0.03 while the buyer's had 0.39, and every farmer newborn's
 token accuracy was 0.000).
 
 Until `haggle` **both seats are filled from one pool of agents**, so there is
-one language rather than two that have to be reconciled afterwards.
+one language rather than two that have to be reconciled afterwards. An agent is
+never seated opposite itself — not in training (`Population.pair`), and not in
+any measurement either. The measurements used to draw the two seats
+independently, so with two founders half of every promotion check was an agent
+reading its *own* words, which training never asks for. Two founders who had
+each invented a dialect the other could read scored 0.92 in training and 0.60
+in the check, and `name-fruit` ran out its budget with a working code.
+
+Two founders who never die do each keep a dialect through the naming rungs:
+`coherence 0.500` in the checkpoint line means they agree on no form at all,
+each reading the other's. Deaths used to paper over this — a newborn apprenticed
+to the survivor inherited its words — at the cost of half the population.
+Convergence now comes where the project means it to: at `mutual`, newcomers are
+taught from transcripts of both, and turnover leaves the commoner form.
 
 **A naming rung adds a kind of round; it never swaps to one.** `name-color` is
 60% colour rounds and 40% fruit rounds, so the fruit words stay in use and stay
