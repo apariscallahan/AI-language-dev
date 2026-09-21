@@ -620,7 +620,7 @@ not restrictions: nothing ever stops an agent from saying anything.
 | `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
-**All of it is off until `offer`** (`reward.costs_from_rung`) — off through every rung that still has to invent a word, on at the first rung that only reuses them. A language has to
+**The costs — length and rarity — are off until `offer`** (`reward.costs_from_rung`): off through every rung that still has to invent a word, on at the first rung that only reuses them. **The convention bonus comes on earlier, at `mutual`** (`reward.convention_from_rung`), with the community: it pays for agreeing rather than for economy, and it cannot punish a new word, because a form only counts once it has 12 recent uses behind it. It has to arrive there — the two founders keep a dialect each through the naming rungs, and something must pay a community of newcomers to settle on one word per meaning. A language has to
 exist before it can be economised, and the failure is not subtle: with the costs
 on from the second rung a GPU run collapsed onto a single one-atom utterance —
 coherence 1.000, 1.00 atoms per word, ~1 word per utterance, 17 distinct words

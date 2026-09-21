@@ -141,7 +141,11 @@ class Population:
                 if id(agent) in seen:          # one pool fills both seats
                     continue
                 seen.add(id(agent))
-                agent.lifespan = agent.updates + self._sample_lifespan(True)
+                # An ordinary lifespan, not the founding stagger: the stagger can
+                # draw lifespan_min // 8 (112 updates), and a founder dying that
+                # soon after deaths begin takes half the fluent speakers with it
+                # while the community is still a handful of apprentices.
+                agent.lifespan = agent.updates + self._sample_lifespan(False)
 
     # ------------------------------------------------------------------
     def _sample_lifespan(self, initial: bool) -> int:

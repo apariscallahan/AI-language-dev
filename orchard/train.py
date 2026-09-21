@@ -36,8 +36,8 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
 from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
-                         evaluate_rung, growth_applies, ladder, rung_budget,
-                         turnover_applies)
+                         convention_applies, evaluate_rung, growth_applies,
+                         ladder, rung_budget, turnover_applies)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -169,6 +169,8 @@ class Trainer:
         # with lineups that need every field named, success stalled at ~0.42 with
         # the costs 66% on, where a run with them ~off passed at 0.62.)
         self.cost_gate = 0.0 if cfg.curriculum.enabled else 1.0
+        # the convention bonus has its own rung (`reward.convention_from_rung`)
+        self.convention_gate = 0.0 if cfg.curriculum.enabled else 1.0
         # Set once, when the first death is allowed; see `restagger`.
         self._turnover_started = False
         self.rung_success = RollingStat(window=2000)
@@ -632,6 +634,7 @@ class Trainer:
         cur.checks_run = int(st["curriculum"]["checks_run"])
         self.cost_gate = float(st["cost_gate"])
         self._turnover_started = bool(st.get("turnover_started", False))
+        self.update_cost_gate()
         self.updates = int(st.get("updates", st.get("batch_no", 0)))
         cur.updates_in_phase = int(st["curriculum"].get(
             "updates_in_phase", cur.episodes_in_phase // max(1, old_batch)))
@@ -747,9 +750,11 @@ class Trainer:
         population can satisfy completely without naming anything.
         """
         if not self.cfg.curriculum.enabled:
-            self.cost_gate = 1.0
+            self.cost_gate = self.convention_gate = 1.0
             return
-        self.cost_gate = 1.0 if costs_apply(self.cfg, self.curriculum.phase) else 0.0
+        phase = self.curriculum.phase
+        self.cost_gate = 1.0 if costs_apply(self.cfg, phase) else 0.0
+        self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
 
     def maybe_check_promotion(self) -> None:
         """The light, frequent check -- so a rung that has worked is left promptly."""
@@ -884,11 +889,12 @@ class Trainer:
             L("                     (budgets in training updates; promotion checked every "
               "%d updates; on a rung's max without meeting its criteria: %s)"
               % (c.curriculum.check_every_updates, c.curriculum.on_stall))
-        L("speaker pressures  : %.3f per atom after the first in a word, %.3f per word, "
-          "up to %.3f per novel word, %.3f for matching the population's convention; "
-          "all of it from `%s` on, off while the words are still being invented"
-          % (c.reward.atom_cost, c.reward.word_cost, c.reward.rarity_cost,
-             c.reward.convention, c.reward.costs_from_rung))
+        L("speaker pressures  : %.3f for using the community's word, from `%s` on; "
+          "%.3f per atom after the first in a word, %.3f per word and up to %.3f per "
+          "novel word from `%s` on, off while words are still being invented"
+          % (c.reward.convention, c.reward.convention_from_rung,
+             c.reward.atom_cost, c.reward.word_cost, c.reward.rarity_cost,
+             c.reward.costs_from_rung))
         from .hardware import describe
         L("hardware           : %s" % describe(self.torch_device, c))
         L("chance success rate: %.4f  (two uniformly random agents)" % self.chance)
@@ -1253,10 +1259,11 @@ class Trainer:
           "(1 = all agents say the same thing for the same meaning)"
           % (stab["coherence_buyer"], stab["coherence_farmer"],
              stab.get("coherence_cross", float("nan"))))
-        L("  speaker pressures : %s" % (
+        L("  speaker pressures : agreement %s; length and new words %s" % (
+            "on" if self.convention_gate >= 1.0
+            else "off until `%s`" % self.cfg.reward.convention_from_rung,
             "on" if row.get("speaker_cost_gate", 1.0) >= 1.0
-            else "off until `%s`, while words are still being invented"
-                 % self.cfg.reward.costs_from_rung))
+            else "off until `%s`" % self.cfg.reward.costs_from_rung))
         us = row.get("usage") or {}
         if us:
             L("  recent usage      : %d word types in circulation, %d established; "
@@ -1517,7 +1524,7 @@ class Trainer:
             batch, _ = run_and_update_gumbel(
                 cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
                 update=self.updates, device=self.device, phase=phase, usage=self.usage,
-                cost_scale=self.cost_gate,
+                cost_scale=self.cost_gate, convention_scale=self.convention_gate,
                 phase_update=(self.curriculum.updates_in_phase
                               if cfg.train.anneal_per_rung else None))
 
@@ -1563,8 +1570,14 @@ class Trainer:
                 self.train_success.extend(float(o.success) for o in batch.outcomes)
                 self.train_comprehension.extend(
                     float(o.comprehended) for o in batch.outcomes)
-            self.train_reward.extend(
-                (o.farmer_reward + o.buyer_reward) / 2 for o in batch.outcomes)
+            if batch.res is not None:
+                # the tensor path builds no Outcome objects, so reading them kept
+                # this at 0.000 in every run's metrics and reward plot
+                mean_reward = (batch.res["farmer_reward"] + batch.res["buyer_reward"]) / 2
+                self.train_reward.extend(mean_reward.float().tolist())
+            else:
+                self.train_reward.extend(
+                    (o.farmer_reward + o.buyer_reward) / 2 for o in batch.outcomes)
 
             if lineup_like:
                 self.write_lineups(batch, scen, self.episode, phase)

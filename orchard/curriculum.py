@@ -375,6 +375,11 @@ def costs_apply(cfg: Config, phase: Phase) -> bool:
     return phase.index >= phase_named(cfg, cfg.reward.costs_from_rung).index
 
 
+def convention_applies(cfg: Config, phase: Phase) -> bool:
+    """Is a speaker paid for using the community's word? (``reward.convention_from_rung``)"""
+    return phase.index >= phase_named(cfg, cfg.reward.convention_from_rung).index
+
+
 def growth_applies(cfg: Config, phase: Phase) -> bool:
     """May newcomers join in this rung? (``population.grow_from_rung``)"""
     return phase.index >= phase_named(cfg, cfg.population.grow_from_rung).index
@@ -676,10 +681,18 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         if not d:
             continue
         s, ch = _num(d.get("success")), round_chance(cfg, kind)
+        # A detector for forgetting, not a second promotion: the kind was
+        # promoted at the full bar once already, and a rung spends its first
+        # stretch exploring (`train.anneal_per_rung`), which shakes every word a
+        # little. What must not happen is a field sliding back to chance, so the
+        # bar is the share of the headroom the channel checks use everywhere.
+        # (At the full bar, the one run that exercised this passed at 0.670
+        # against 0.667 -- a coin toss away from stalling a rung that worked.)
+        floor = _headroom_floor(ch, c.min_channel_transfer)
         checks["still names %s" % ROUND_NAMES[kind]] = (
-            s == s and s >= k * ch,
-            "%s on %s rounds, need %.1fx chance %.3f"
-            % (_fmt(s), ROUND_NAMES[kind], k, ch))
+            s == s and s >= floor,
+            "%s on %s rounds, need %.2f -- %.2f of the headroom over chance %.3f"
+            % (_fmt(s), ROUND_NAMES[kind], floor, c.min_channel_transfer, ch))
     if phase.mutual:
         succ, chance = _num(ev.get("success")), _num(ev.get("chance"))
         checks["both decode in the same round"] = (

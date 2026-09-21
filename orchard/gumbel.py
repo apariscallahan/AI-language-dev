@@ -69,7 +69,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                           device: str = "cpu",
                           train: bool = True, phase: Optional[Phase] = None,
                           generator: Optional[torch.Generator] = None,
-                          usage=None, cost_scale: float = 1.0
+                          usage=None, cost_scale: float = 1.0,
+                          convention_scale: Optional[float] = None
                           ) -> tuple[BatchRollout, UpdateStats]:
     """Play a batch with a reparameterised message channel, then learn from it.
 
@@ -298,13 +299,16 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
     terms = {}
     if usage is not None:
-        conv_on = g > 0 or not cfg.reward.convention_gated
+        # The convention bonus has its own gate (`reward.convention_from_rung`):
+        # agreeing is not economising. The rarity cost stays with the costs.
+        cg = g if convention_scale is None else float(min(1.0, max(0.0, convention_scale)))
+        conv_on = cg > 0 or not cfg.reward.convention_gated
         terms = usage.speaker_terms(phase, tokens, obs_of, rarity=g > 0,
                                     convention=conv_on)
         for role, d in terms.items():
             d["rarity"] = g * d["rarity"]
             if cfg.reward.convention_gated:
-                d["convention"] = g * d["convention"]
+                d["convention"] = cg * d["convention"]
             extra = d["convention"] - d["rarity"]
             shape[role] = shape[role] - d["rarity"]
             agree[role] = d["convention"]

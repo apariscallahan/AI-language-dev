@@ -396,6 +396,16 @@ class RewardConfig:
     # and price words the rungs below it built -- and it covers the two fields
     # no naming rung teaches: quantity (`ask-qty`) and price (`quote`).
     costs_from_rung: str = "offer"
+    # The rung from which the convention bonus pays a speaker for using the
+    # community's word for a meaning -- separately from the costs above, because
+    # it is a pressure to *agree*, not to economise, and it cannot punish
+    # inventing: a form only counts once it has `convention_min_support` recent
+    # uses behind it. It comes on with the community. The founders now keep a
+    # dialect each through the naming rungs (nobody dies there any more), and
+    # with this folded into the costs, a community of 32 formed at `mutual` with
+    # nothing paying anyone to agree for five more rungs. The rarity cost stays
+    # with the costs: it charges a *new* word, which `ask-qty` and `quote` need.
+    convention_from_rung: str = "mutual"
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -1032,6 +1042,7 @@ def validate(cfg: Config) -> None:
     from .curriculum import phase_named
     phase_named(cfg, cfg.train.hindsight_from_rung)          # must name a rung
     phase_named(cfg, cfg.reward.costs_from_rung)
+    phase_named(cfg, cfg.reward.convention_from_rung)
     phase_named(cfg, cfg.population.grow_from_rung)
     from .curriculum import ladder
     rungs = {p.name for p in ladder(cfg)}

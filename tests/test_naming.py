@@ -74,6 +74,25 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
         self.assertTrue(growth_applies(cfg, phase_named(cfg, "mutual")))
         self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
 
+    def test_agreement_arrives_with_the_community(self):
+        """The convention bonus is paid from the rung newcomers arrive in.
+
+        The founders keep a dialect each through the naming rungs, so something
+        has to pay the community to settle on one word per meaning once there is
+        a community -- and it must not wait for the costs, which stay off until
+        no rung is inventing words any more.
+        """
+        from orchard.curriculum import convention_applies, costs_apply, growth_applies
+        cfg = Config()
+        first = lambda f: next(p for p in ladder(cfg) if f(cfg, p))
+        self.assertEqual(first(convention_applies).name, first(growth_applies).name)
+        self.assertLess(first(convention_applies).index, first(costs_apply).index,
+                        "agreement waits for the costs again")
+        for p in ladder(cfg):
+            if p.referential:
+                self.assertFalse(convention_applies(cfg, p),
+                                 "%s pays two founders to agree with each other" % p.name)
+
     def test_the_costs_wait_for_every_rung_that_invents_a_word(self):
         """Length and rarity are pressures on a word that exists."""
         from orchard.curriculum import costs_apply
