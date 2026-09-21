@@ -290,7 +290,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def write_lineups(self, batch, rb, episode0: int, phase) -> None:
         """One row per lineup / mutual round: what was shown, said and picked."""
-        from .curriculum import H_BELIEF, H_CHOICE, MutualBatch
+        from .curriculum import H_CHOICE, H_REPORT, MutualBatch
         from .env import BUYER as _B, FARMER as _F
         from .render import render_message
         w = self.cfg.world
@@ -332,7 +332,7 @@ class Trainer:
             if isinstance(rb, MutualBatch):
                 msgs = [[int(x) for x in batch.tokens[i, t * L:(t + 1) * L]]
                         for t in range(phase.n_turns)]
-                rep = list(H_BELIEF[:3])
+                rep = list(H_REPORT)
                 self.lineup_log.write({
                     "episode": ep, "phase": phase.name,
                     "farmer_id": f_ids[i], "buyer_id": b_ids[i],

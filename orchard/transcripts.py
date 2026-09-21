@@ -26,11 +26,34 @@ from .env import BUYER, FARMER, ROLE_NAMES
 
 
 def _tuple(cfg: Config, t) -> str:
+    """A thing, as (fruit, colour, quality).
+
+    The middle field was printed as a quantity -- "PEAR x3 HIGH" -- for as long
+    as the world has had colours, which made a colour round read as three
+    quantities of the same fruit.
+    """
     w = cfg.world
-    v, q, u = int(t[0]), int(t[1]), int(t[2])
+    v, c, u = int(t[0]), int(t[1]), int(t[2])
     vn = w.variety_names[v] if 0 <= v < w.n_varieties else "?"
+    cn = w.color_names[c] if 0 <= c < w.n_colors else "?"
     un = w.quality_names[u] if 0 <= u < w.n_quality else "?"
-    return "%s x%d %s" % (vn, q, un)
+    return "%s %s %s" % (cn, vn, un)
+
+
+def _field_value(cfg: Config, name: str, v: int) -> str:
+    """One field of a request, in words."""
+    w = cfg.world
+    if name == "fruit":
+        return w.variety_names[v] if 0 <= v < w.n_varieties else "?"
+    if name == "colour":
+        return w.color_names[v] if 0 <= v < w.n_colors else "?"
+    if name == "quality":
+        return w.quality_names[v] if 0 <= v < w.n_quality else "?"
+    if name in ("price", "reservation"):
+        return _price(cfg, v)
+    if name == "deal":
+        return "worth doing" if v else "not worth it"
+    return str(v)                      # quantity, stock
 
 
 def _price(cfg: Config, b: int) -> str:
@@ -81,7 +104,7 @@ def _viability(cfg: Config, sc) -> str:
 def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
                  episode: Optional[int] = None) -> list[str]:
     """Header plus the three lines (expected / dialogue / outcome) for round ``i``."""
-    from .curriculum import H_BELIEF, H_CHOICE, MutualBatch, ReferentialBatch
+    from .curriculum import H_CHOICE, H_REPORT, MutualBatch, ReferentialBatch
     w = cfg.world
     sb = batch.sb
     toks = [int(x) for x in batch.tokens[i]]
@@ -113,13 +136,13 @@ def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
         ]
 
     if isinstance(sb, MutualBatch):
-        rep = list(H_BELIEF[:3])
+        rep = list(H_REPORT)
         fm, bm = sb.f_meaning[i], sb.b_meaning[i]
         fr = [int(x) for x in batch.f_dec[i, rep]]
         br = [int(x) for x in batch.b_dec[i, rep]]
 
         def verdict(fields) -> str:
-            names = ("variety", "quantity", "quality")
+            names = ("fruit", "colour", "quality")
             wrong = [n for n, good in zip(names, fields) if not bool(good)]
             return "right" if not wrong else "%s wrong" % " and ".join(wrong)
         ffields = batch.res["farmer_fields"][i].tolist() if "farmer_fields" in batch.res else [False] * 3
@@ -137,22 +160,35 @@ def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
     # an order or a trade: a ScenarioBatch (or a list of Scenarios)
     sc = batch.scenario(i)
     b = sc.buyer
-    want = "%s x%d" % (w.variety_names[b.want_variety], b.need_qty)
+    want = "%s %s x%d" % (w.color_names[b.want_color],
+                          w.variety_names[b.want_variety], b.need_qty)
     fd = [int(x) for x in batch.f_dec[i, :4]]
     bd = [int(x) for x in batch.b_dec[i, :4]]
     if getattr(phase, "order", False):
-        filled = "%s x%d" % (w.variety_names[fd[1]] if 0 <= fd[1] < w.n_varieties else "?", fd[2])
-        wrong = []
-        if fd[1] != b.want_variety:
-            wrong.append("variety")
-        if fd[2] != b.need_qty:
-            wrong.append("quantity")
+        # Whatever this rung asked for, and whatever came back: the fields differ
+        # rung by rung (quantity, then fruit and colour, then price, and in
+        # `offer` the farmer's own lot instead).
+        from .curriculum import request_truth
+        dec = batch.b_dec if phase.reporter == BUYER else batch.f_dec
+        said, heard, wrong = [], [], []
+        for name, head in phase.ask_heads.items():
+            truth = int(request_truth(cfg, batch.sb, name)[i])
+            got = int(dec[i, head])
+            said.append("%s %s" % (name, _field_value(cfg, name, truth)))
+            heard.append("%s %s" % (name, _field_value(cfg, name, got)))
+            if got != truth:
+                wrong.append(name)
+        who = "buyer" if phase.reporter == BUYER else "farmer"
+        teller = "farmer" if phase.reporter == BUYER else "buyer"
         return [
-            "%s | buyer %s orders, farmer %s fills" % (tag, bname, fname),
-            "  expected : the buyer wants %s; the farmer must fill exactly that" % want,
+            "%s | %s %s tells, %s %s reports" % (
+                tag, teller, bname if teller == "buyer" else fname,
+                who, bname if who == "buyer" else fname),
+            "  expected : %s" % ", ".join(said),
             "  dialogue : %s" % dialogue,
-            "  outcome  : the farmer filled %s -- %s"
-            % (filled, "CORRECT" if ok else "WRONG (%s)" % " and ".join(wrong)),
+            "  outcome  : reported %s -- %s"
+            % (", ".join(heard),
+               "CORRECT" if ok else "WRONG (%s)" % " and ".join(wrong)),
         ]
 
     f = sc.farmer

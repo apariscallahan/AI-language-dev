@@ -377,9 +377,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
                                   f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif mutual:
-        rep = list(H_BELIEF[:3])
-        res = resolve_mutual(cfg, scenarios, decs[FARMER][:, rep], decs[BUYER][:, rep],
-                             f_len, b_len)
+        res = resolve_mutual(cfg, scenarios, decs[FARMER], decs[BUYER], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and tensor_in:
         res = resolve_request(cfg, phase, scenarios, decs, f_len, b_len)

@@ -30,10 +30,11 @@ from orchard import metrics as M
 from orchard.bottleneck import TranscriptStore, train_newborn
 from orchard.config import Config
 from orchard.conventions import PopulationUsage
-from orchard.curriculum import (H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_QTY, H_REPORT,
-                                H_VARIETY, MutualBatch, N_HEADS,
-                                ReferentialWorld, evaluate_rung, ladder, phase_named,
-                                resolve_mutual, resolve_request, rung_budget)
+from orchard.curriculum import (H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_QTY,
+                                H_REPORT, H_VARIETY, MutualBatch, N_HEADS,
+                                ReferentialWorld, evaluate_rung, hindsight_targets,
+                                ladder, phase_named, resolve_mutual, resolve_request,
+                                rung_budget)
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import run_and_update_gumbel
 from orchard.lexicon import cross_role_overlap, live_encoding, word_stats
@@ -168,52 +169,87 @@ class TestBottleneckIsRoleCorrect(unittest.TestCase):
 
 
 class TestMutualRung(unittest.TestCase):
+    """The report is read out of the heads the rung scores, and only those.
+
+    Every caller used to slice the columns itself. They disagreed: the reward
+    read `H_BELIEF[:3]`, whose middle head is a belief about *quantity*, and
+    scored it against the colour -- so the middle field of every mutual round
+    could only be right by luck, and the rung could never have been passed.
+    These tests hand `resolve_mutual` whole decision rows, so the selection is
+    part of what is tested.
+    """
+
+    def _rows(self, reports):
+        """(B, N_HEADS) decisions carrying `reports` in the scored heads."""
+        dec = torch.zeros((len(reports), N_HEADS), dtype=torch.long)
+        for i, r in enumerate(reports):
+            for k, h in enumerate(H_REPORT):
+                dec[i, h] = int(r[k])
+            # the head the reward used to read, filled with something that would
+            # pass for a colour if anyone read it again
+            dec[i, H_BELIEF[1]] = 8
+        return dec
+
     def test_both_must_report_the_other(self):
         cfg = cfg_small()
-        f_m = torch.tensor([[0, 3, 1], [1, 5, 2]])
-        b_m = torch.tensor([[2, 1, 0], [0, 7, 1]])
+        f_m = torch.tensor([[0, 3, 1], [1, 2, 2]])
+        b_m = torch.tensor([[2, 1, 0], [0, 3, 1]])
         mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
-        sym = torch.zeros(2, dtype=torch.long)
-        res = resolve_mutual(cfg, mb, f_report=b_m.clone(), b_report=f_m.clone(),
-                             f_cost=sym.float(), b_cost=sym.float())
-        self.assertTrue(bool(res["success"].all()))
+        sym = torch.zeros(2)
+        res = resolve_mutual(cfg, mb, self._rows(b_m), self._rows(f_m), sym, sym)
+        self.assertTrue(bool(res["success"].all()),
+                        "a perfect report did not count: the reward read other heads")
         wrong = f_m.clone()
         wrong[0, 0] = (wrong[0, 0] + 1) % cfg.world.n_varieties
-        res = resolve_mutual(cfg, mb, f_report=b_m.clone(), b_report=wrong,
-                             f_cost=sym.float(), b_cost=sym.float())
+        res = resolve_mutual(cfg, mb, self._rows(b_m), self._rows(wrong), sym, sym)
         self.assertEqual(res["success"].tolist(), [False, True])
         self.assertEqual(res["farmer_report_ok"].tolist(), [True, True])
         self.assertEqual(res["buyer_report_ok"].tolist(), [False, True])
 
-    def test_quantity_is_exact_by_default(self):
-        cfg = cfg_small()
-        mb = MutualBatch(f_meaning=torch.tensor([[0, 4, 0]]),
-                         b_meaning=torch.tensor([[1, 4, 1]]))
-        sym = torch.zeros(1, dtype=torch.long)
-        off_by_one = resolve_mutual(cfg, mb, torch.tensor([[1, 5, 1]]),
-                                    torch.tensor([[0, 4, 0]]), sym, sym)
-        self.assertFalse(bool(off_by_one["farmer_report_ok"][0]))
-
     def test_every_field_of_the_report_must_be_right(self):
         """A thing is (fruit, colour, quality) and all three are reported exactly."""
         cfg = cfg_small()
-        mb = MutualBatch(f_meaning=torch.tensor([[0, 1, 0]]),
-                         b_meaning=torch.tensor([[1, 2, 1]]))
+        f_m, b_m = torch.tensor([[0, 1, 0]]), torch.tensor([[1, 2, 1]])
+        mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
         zero = torch.zeros(1)
-        right = resolve_mutual(cfg, mb, torch.tensor([[1, 2, 1]]),
-                               torch.tensor([[0, 1, 0]]), zero, zero)
-        one_off = resolve_mutual(cfg, mb, torch.tensor([[1, 0, 1]]),
-                                 torch.tensor([[0, 1, 0]]), zero, zero)
+        right = resolve_mutual(cfg, mb, self._rows(b_m), self._rows(f_m), zero, zero)
         self.assertTrue(bool(right["success"][0]))
-        self.assertFalse(bool(one_off["success"][0]),
-                         "a wrong colour still counted as understood")
+        for field in range(3):
+            off = b_m.clone()
+            off[0, field] = (off[0, field] + 1) % 3
+            res = resolve_mutual(cfg, mb, self._rows(off), self._rows(f_m), zero, zero)
+            self.assertFalse(bool(res["success"][0]),
+                             "a wrong %s still counted as understood"
+                             % ("fruit", "colour", "quality")[field])
 
-    def test_the_reports_are_the_belief_heads(self):
+    def test_the_reward_reads_the_heads_the_rung_scores(self):
         cfg = cfg_small()
         mutual = phase_named(cfg, "mutual")
-        # the thing being reported is (fruit, colour, quality)
         self.assertEqual(mutual.active_heads(FARMER, cfg), list(H_REPORT))
         self.assertEqual(mutual.active_heads(BUYER, cfg), list(H_REPORT))
+        # a report that is perfect in the scored heads and junk everywhere else
+        f_m, b_m = torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, 1]])
+        mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
+        f_dec, b_dec = self._rows(b_m), self._rows(f_m)
+        junk = [h for h in range(N_HEADS) if h not in H_REPORT]
+        f_dec[:, junk] = 7
+        b_dec[:, junk] = 7
+        zero = torch.zeros(1)
+        res = resolve_mutual(cfg, mb, f_dec, b_dec, zero, zero)
+        self.assertTrue(bool(res["success"][0]),
+                        "the reward depends on a head the rung never trains")
+
+    def test_hindsight_teaches_the_same_heads(self):
+        cfg = cfg_small()
+        mutual = phase_named(cfg, "mutual")
+        mb = MutualBatch(f_meaning=torch.tensor([[1, 2, 3]]),
+                         b_meaning=torch.tensor([[2, 3, 1]]))
+        tgt = hindsight_targets(cfg, mutual, mb)
+        self.assertEqual(sorted(tgt[FARMER]), sorted(H_REPORT))
+        self.assertEqual(sorted(tgt[BUYER]), sorted(H_REPORT))
+        # and each head is taught the field it is scored on
+        for k, h in enumerate(H_REPORT):
+            self.assertEqual(int(tgt[FARMER][h][0]), int(mb.b_meaning[0, k]))
 
 
 def _swap_evidence(farmer_ok: bool, buyer_ok: bool, holdout: float = 0.75) -> dict:

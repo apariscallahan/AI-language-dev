@@ -1107,18 +1107,25 @@ def report_fields(cfg: Config, report: torch.Tensor, truth: torch.Tensor) -> tor
     return report == truth
 
 
-def resolve_mutual(cfg: Config, mb: MutualBatch, f_report: torch.Tensor,
-                   b_report: torch.Tensor, f_cost: torch.Tensor,
+def resolve_mutual(cfg: Config, mb: MutualBatch, f_dec: torch.Tensor,
+                   b_dec: torch.Tensor, f_cost: torch.Tensor,
                    b_cost: torch.Tensor) -> dict[str, torch.Tensor]:
     """Score a batch of mutual rounds.
 
-    ``f_report`` is the farmer's (variety, quantity, quality) report of the
-    buyer's meaning, and vice versa. Each side is paid for reading the other
-    (``decode``) and for being read (``understood``) field by field, which is
-    what gives each message a gradient, plus the full round bonus only when both
-    reports are right at once.
+    ``f_dec`` is the farmer's whole decision row; its report of the buyer's
+    thing is read out of ``H_REPORT`` here, and nowhere else. Every caller used
+    to slice the columns itself, and they disagreed: the reward read
+    ``H_BELIEF[:3]``, whose middle head is a belief about *quantity*, and scored
+    it against the colour -- a field the rung trains on a different head
+    (``H_BELIEF_COLOR``) and which therefore could only ever be right by luck.
+
+    Each side is paid for reading the other (``decode``) and for being read
+    (``understood``) field by field, which is what gives each message a
+    gradient, plus the full round bonus only when both reports are right at once.
     """
     R = cfg.reward
+    rep = list(H_REPORT)
+    f_report, b_report = f_dec[:, rep], b_dec[:, rep]
     f_fields = report_fields(cfg, f_report, mb.b_meaning)
     b_fields = report_fields(cfg, b_report, mb.f_meaning)
     f_ok, b_ok = f_fields.all(dim=1), b_fields.all(dim=1)

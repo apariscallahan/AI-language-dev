@@ -251,9 +251,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                                   f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif mutual:
-        rep = list(H_BELIEF[:3])
-        res = resolve_mutual(cfg, scenarios, dec_sampled[FARMER][:, rep],
-                             dec_sampled[BUYER][:, rep], f_len, b_len)
+        res = resolve_mutual(cfg, scenarios, dec_sampled[FARMER],
+                             dec_sampled[BUYER], f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif phase.order and batched:
         res = resolve_request(cfg, phase, scenarios, dec_sampled, f_len, b_len)
