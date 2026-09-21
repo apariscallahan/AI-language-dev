@@ -425,6 +425,17 @@ kind by kind. Forgetting fruit to learn colour is not progress.
 | `name-quality` | quality rounds. Every round still asks one field, but which field changes, so a word has to mean the same thing wherever it appears. | 50% quality, 25% fruit, 25% colour | 1/3 |
 | `name-all` | rounds where the candidates differ in any field, mostly one-field near misses, so the whole (fruit, colour, quality) is named at once | 70% all fields, 10% each single field | 1/3 |
 
+**A guess is paid for how much of the thing it got.** A lineup round pays
+`reward.refer_partial` (0.45) for each field the chosen candidate shares with
+the target, on top of the whole-round bonus. Every other rung on the ladder
+already paid per field; the lineup did not, so a guess that got two fields of
+three was worth exactly as much as one that got none, and nothing rewarded a
+message for *narrowing the field down*. That left `name-all` — which needs all
+three fields in one utterance — with no staircase between "one field" and "all
+of them". A run stalled there at 0.60 while naming each field on its own at
+0.74, 0.87 and 0.97, with utterances 1.5 words long where three were needed.
+Partial credit does not count as success: promotion still needs the exact pick.
+
 **The single-field rungs come first because they are learnable from nothing.** A
 code has to exist before it can be made compositional: `name-fruit` needs one
 word per fruit and nothing else, and the rungs that follow reuse those words
@@ -636,6 +647,15 @@ word use (1.0 = one shared vocabulary, 0.0 = two foreign codes).
 
 ## 7. Generations and the transmission bottleneck
 
+**Nobody dies until `mutual`** (`population.turnover_from_rung`), the rung
+newcomers start arriving in. Turnover exists to force a code a stranger can
+learn; while two founders are still inventing it there is no stranger, and a
+death costs half the population. Measured on a run that stalled: six
+replacements in 3,200 updates, the first at update 205 — before the first code
+had formed — and success rose after each newborn settled and sagged in between.
+Ages accumulate anyway, so when turnover starts the living cohort is given fresh
+staggered lifespans rather than expiring in the same update.
+
 Agents age, die at a randomised lifespan (900–1,600 training updates), and are
 replaced by newborns with fresh random weights. Deaths are staggered
 (`population.initial_stagger`), so at any moment some agents already know the
@@ -722,8 +742,13 @@ infinite-bandwidth cheat the brief warns about. Only the backward pass uses the
 relaxation. The trade decision stays discrete and stays on REINFORCE. No babbling
 or auto-encoding pretraining was needed.
 
-Temperature anneals 1.5 → 0.5 over 1,000 updates; entropy bonuses anneal over
-800. `train.gumbel_mix_reinforce` (0.1) mixes a score-function term back over the
+Temperature anneals 1.5 → 0.5 over 1,000 updates and entropy bonuses over 800,
+**counted within each rung** (`train.anneal_per_rung`). They used to count from
+the start of the run, which was fine when a run was one rung; with thirteen,
+everything sat at its floor from update 1,000 on, so `name-all` — which begins
+around update 2,000 and has to find three-word utterances where one used to do —
+explored nothing. In the run that stalled there, the only new word-forms came
+from newborns. `train.gumbel_mix_reinforce` (0.1) mixes a score-function term back over the
 symbols — see [§11](#11-findings-with-the-evidence) for why it has to exist.
 
 ### Everything is counted in training updates

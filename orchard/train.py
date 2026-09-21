@@ -36,7 +36,8 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
 from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
-                         evaluate_rung, growth_applies, ladder, rung_budget)
+                         evaluate_rung, growth_applies, ladder, rung_budget,
+                         turnover_applies)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -162,12 +163,14 @@ class Trainer:
         # before it can be economised: charged from the first episode, even the
         # old 0.012 per symbol drove the lineup's describer towards silence long
         # before the lineup had taken off (ladder2 took off at ~80k episodes).
-        # So the costs are off for the whole first rung and fully on from its
-        # promotion onwards -- including haggle, where the earlier vocabulary
-        # exploded. (A version that ramped them up with the first rung's success
-        # capped it: with lineups that need every field named, success stalled at
-        # ~0.42 with the costs 66% on, where a run with them ~off passed at 0.62.)
+        # So they stay off while a rung still has to *invent* a word and come on
+        # at the first rung that only reuses them -- `reward.costs_from_rung`.
+        # (A version that ramped them up with the first rung's success capped it:
+        # with lineups that need every field named, success stalled at ~0.42 with
+        # the costs 66% on, where a run with them ~off passed at 0.62.)
         self.cost_gate = 0.0 if cfg.curriculum.enabled else 1.0
+        # Set once, when the first death is allowed; see `restagger`.
+        self._turnover_started = False
         self.rung_success = RollingStat(window=2000)
         # Training updates so far: one per batch. Budgets, promotion checks,
         # checkpoints, anneals, growth and lifespans all count these.
@@ -586,6 +589,7 @@ class Trainer:
                            "transitions": self.curriculum.transitions,
                            "checks_run": self.curriculum.checks_run},
             "cost_gate": self.cost_gate, "updates": self.updates,
+            "turnover_started": self._turnover_started,
             "next_grow": self._next_grow, "community_log": self.community_log,
             "farmers": [agent_state(a) for a in self.pop.farmers],
             "buyers": [agent_state(a) for a in self.pop.buyers],
@@ -627,6 +631,7 @@ class Trainer:
         cur.transitions = list(st["curriculum"]["transitions"])
         cur.checks_run = int(st["curriculum"]["checks_run"])
         self.cost_gate = float(st["cost_gate"])
+        self._turnover_started = bool(st.get("turnover_started", False))
         self.updates = int(st.get("updates", st.get("batch_no", 0)))
         cur.updates_in_phase = int(st["curriculum"].get(
             "updates_in_phase", cur.episodes_in_phase // max(1, old_batch)))
@@ -832,8 +837,10 @@ class Trainer:
               % (c.population.n_farmers, c.population.n_buyers))
         L("turnover           : %s%s" % (
             "ON" if c.population.turnover else "OFF",
-            "  (lifespan %d-%d training updates)" % (c.population.lifespan_min,
-                                                     c.population.lifespan_max)
+            "  (lifespan %d-%d training updates, from `%s` on -- nobody dies while "
+            "the founders are still inventing the language)"
+            % (c.population.lifespan_min, c.population.lifespan_max,
+               c.population.turnover_from_rung)
             if c.population.turnover else ""))
         bn = c.bottleneck
         regime = ("fixed cap of %d transcripts" % bn.n_samples if bn.n_samples > 0
@@ -1246,8 +1253,10 @@ class Trainer:
           "(1 = all agents say the same thing for the same meaning)"
           % (stab["coherence_buyer"], stab["coherence_farmer"],
              stab.get("coherence_cross", float("nan"))))
-        L("  speaker pressures : %s" % ("on" if row.get("speaker_cost_gate", 1.0) >= 1.0
-                                          else "off until the first rung is passed"))
+        L("  speaker pressures : %s" % (
+            "on" if row.get("speaker_cost_gate", 1.0) >= 1.0
+            else "off until `%s`, while words are still being invented"
+                 % self.cfg.reward.costs_from_rung))
         us = row.get("usage") or {}
         if us:
             L("  recent usage      : %d word types in circulation, %d established; "
@@ -1438,6 +1447,13 @@ class Trainer:
         st = row.get("stability") or {}
         w = row.get("words") or {}
         ov = row.get("cross_role_overlap") or {}
+        # Trained against never-trained, where the rung measures it: the one
+        # number that says whether a code generalises or has been memorised.
+        held = ev.get("holdout_success")
+        zs = ""
+        if isinstance(held, (int, float)) and held == held:
+            zs = " | held-out %s vs trained %s" % (f(held, "%.2f"),
+                                                   f(ev.get("seen_success"), "%.2f"))
         per_field = ""
         fields = ev.get("request_fields_intact")
         if fields:
@@ -1447,9 +1463,9 @@ class Trainer:
             per_field = " | " + ", ".join(
                 "%s %s" % (n, f(v, "%.2f")) for n, v in zip(names, fields))
         self.log.always(
-            "[checkpoint %s] rung %s | success %s | channel %s of headroom%s | %s"
+            "[checkpoint %s] rung %s | success %s | channel %s of headroom%s%s | %s"
             % ("{:,}".format(self.episode), row.get("phase"), succ,
-               f(ev.get("transfer"), "%.2f"), per_field,
+               f(ev.get("transfer"), "%.2f"), zs, per_field,
                "; ".join(roles) or "no speakers probed"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "
@@ -1501,7 +1517,9 @@ class Trainer:
             batch, _ = run_and_update_gumbel(
                 cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
                 update=self.updates, device=self.device, phase=phase, usage=self.usage,
-                cost_scale=self.cost_gate)
+                cost_scale=self.cost_gate,
+                phase_update=(self.curriculum.updates_in_phase
+                              if cfg.train.anneal_per_rung else None))
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
             if batch.res is not None:
@@ -1564,7 +1582,16 @@ class Trainer:
                 # everyone has arrived, so that time does not come out of its
                 # budget (see `growing_now`).
                 self.curriculum.updates_in_phase += 1
-            self.pop.turn_over(self.episode, on_birth=self.on_birth)
+            if turnover_applies(cfg, phase):
+                if not self._turnover_started:
+                    # ages ran on while nobody was dying, so the whole cohort is
+                    # already past its lifespan; spread the first deaths out
+                    self._turnover_started = True
+                    self.pop.restagger()
+                    self.log.always(
+                        "  [community] agents start dying of old age at `%s`"
+                        % phase.name)
+                self.pop.turn_over(self.episode, on_birth=self.on_birth)
             self.maybe_grow()
             self.write_progress()
             self.heartbeat()

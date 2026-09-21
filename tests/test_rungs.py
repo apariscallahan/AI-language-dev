@@ -32,12 +32,14 @@ from orchard.config import Config
 from orchard.conventions import PopulationUsage
 from orchard.curriculum import (H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_QTY,
                                 H_REPORT, H_VARIETY, MutualBatch, N_HEADS,
-                                ReferentialWorld, evaluate_rung, hindsight_targets,
+                                ReferentialBatch, ReferentialWorld, evaluate_rung,
+                                hindsight_targets, resolve_referential,
                                 ladder, phase_named, resolve_mutual, resolve_request,
                                 rung_budget)
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import run_and_update_gumbel
 from orchard.lexicon import cross_role_overlap, live_encoding, word_stats
+from orchard.population import Population
 
 from test_curriculum import agents, cfg_small
 
@@ -952,6 +954,99 @@ class TestNoEmptyTurns(unittest.TestCase):
                                 "%s = %r: a silent lesson was taught" % (name, v))
         for prm in newborn.net.parameters():
             self.assertTrue(bool(torch.isfinite(prm).all()))
+
+
+class TestTheLineupPaysForGettingClose(unittest.TestCase):
+    """A guess is paid for how much of the thing it got.
+
+    Every other rung pays `decode` per field; the lineup paid nothing at all for
+    a near miss, so `name-all` -- the rung that needs three fields in one
+    utterance -- had no staircase between "one field" and "all of them". The run
+    that stalled there named each field on its own at 0.74 / 0.87 / 0.97 and all
+    three at once at 0.60, with utterances 1.5 words long.
+    """
+
+    def _round(self, cfg, pick):
+        m = torch.tensor([[[1, 2, 3], [1, 2, 0], [0, 0, 0]]])   # target, near miss, wild
+        rb = ReferentialBatch(meanings=m, target=torch.tensor([0]),
+                              query=torch.tensor([3]),
+                              held_out=torch.tensor([False]), day=0, informer=FARMER)
+        zero = torch.zeros(1)
+        return resolve_referential(cfg, rb, torch.tensor([pick]), zero, zero)
+
+    def test_a_near_miss_beats_a_wild_miss(self):
+        cfg = cfg_small()
+        right = float(self._round(cfg, 0)["farmer_reward"][0])
+        near = float(self._round(cfg, 1)["farmer_reward"][0])
+        wild = float(self._round(cfg, 2)["farmer_reward"][0])
+        self.assertGreater(right, near)
+        self.assertGreater(near, wild, "two fields of three paid the same as none")
+        self.assertTrue(self._round(cfg, 0)["success"][0])
+        self.assertFalse(self._round(cfg, 1)["success"][0],
+                         "partial credit must not count as success")
+
+    def test_it_can_be_turned_off(self):
+        cfg = cfg_small()
+        cfg.reward.refer_partial = 0.0
+        self.assertAlmostEqual(float(self._round(cfg, 1)["farmer_reward"][0]),
+                               float(self._round(cfg, 2)["farmer_reward"][0]), places=6)
+
+
+class TestNobodyDiesWhileTheCodeIsBeingInvented(unittest.TestCase):
+    """Turnover costs half a two-agent pool, and there is nothing to transmit yet."""
+
+    def test_deaths_wait_for_the_rung_newcomers_arrive_in(self):
+        from orchard.curriculum import growth_applies, turnover_applies
+        cfg = Config()
+        for p in ladder(cfg):
+            if p.naming and p.referential:
+                self.assertFalse(turnover_applies(cfg, p),
+                                 "%s kills a founder mid-invention" % p.name)
+            # deaths and newcomers start together: a death is only survivable
+            # once there is a community to absorb it
+            self.assertEqual(turnover_applies(cfg, p), growth_applies(cfg, p),
+                             "%s: turnover and growth disagree" % p.name)
+
+    def test_the_switch_still_turns_it_all_off(self):
+        from orchard.curriculum import turnover_applies
+        cfg = Config()
+        cfg.population.turnover = False
+        self.assertFalse(any(turnover_applies(cfg, p) for p in ladder(cfg)))
+
+    def test_a_cohort_that_outlived_its_span_does_not_die_at_once(self):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 4
+        torch.manual_seed(0)
+        pop = Population(cfg, random.Random(0))
+        for a in pop.farmers:
+            a.updates = 10 ** 5                     # long past any lifespan
+        self.assertTrue(all(a.is_expired() for a in pop.farmers))
+        pop.restagger()
+        self.assertFalse(any(a.is_expired() for a in pop.farmers),
+                         "every agent would have died in the same update")
+        deaths = sorted(a.lifespan - a.updates for a in pop.farmers)
+        self.assertGreater(deaths[-1] - deaths[0], 0, "the deaths are not staggered")
+
+
+class TestExplorationIsRestoredEachRung(unittest.TestCase):
+    def test_the_anneals_count_updates_in_the_rung(self):
+        from orchard.gumbel import gumbel_tau
+        cfg = cfg_small()
+        self.assertTrue(cfg.train.anneal_per_rung)
+        # a rung that starts 2,000 updates into the run still starts warm
+        self.assertGreater(gumbel_tau(cfg, 0), gumbel_tau(cfg, cfg.train.tau_anneal_updates))
+        self.assertAlmostEqual(gumbel_tau(cfg, 0), cfg.train.gumbel_tau, places=6)
+
+    def test_the_trainer_hands_the_rungs_own_clock_to_the_anneal(self):
+        import inspect
+        from orchard.gumbel import run_and_update_gumbel
+        from orchard import train as T
+        self.assertIn("phase_update", inspect.signature(run_and_update_gumbel).parameters)
+        src = inspect.getsource(T.Trainer.run)
+        self.assertIn("phase_update", src,
+                      "the training loop never passes the rung's own update count")
+        self.assertIn("updates_in_phase", src)
 
 
 class TestWordGrammar(unittest.TestCase):

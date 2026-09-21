@@ -315,6 +315,15 @@ class RewardConfig:
     # The lineup game pays both sides for the same event, because there being
     # understood and understanding are the same thing.
     refer_success: float = 1.0
+    # What a wrong guess is still paid, per field it shares with the target. The
+    # lineup was the one rung in the ladder with no partial credit -- every other
+    # one pays `decode` per field -- so a guess that got two fields of three was
+    # worth exactly as much as one that got none, and nothing rewarded a message
+    # for narrowing the field down. Measured on the run that stalled at
+    # `name-all`: each field named on its own scored 0.74 / 0.87 / 0.97, all
+    # three at once 0.60, with utterances 1.5 words long where three were needed.
+    # This is the staircase from "one field" to "all of them".
+    refer_partial: float = 0.45
     refer_miss: float = -0.1
 
     decode: float = 0.45            # I worked out your situation
@@ -519,6 +528,14 @@ class PopulationConfig:
     # and stayed at chance throughout. The founders take the naming rungs; the
     # community arrives to inherit a language that already works.
     grow_from_rung: str = "mutual"
+    # The rung from which agents start dying of old age, which is the same one
+    # newcomers start arriving in. Turnover exists to force a code a stranger can
+    # learn; while the founders are still inventing it there is no stranger and
+    # nothing to transmit, and a death costs half of a two-agent pool. Measured
+    # on the run that stalled: six replacements in 3,200 updates, the first at
+    # update 205 -- before the first code had formed -- and success rose after
+    # each newborn settled and decayed between.
+    turnover_from_rung: str = "mutual"
     grow_every_updates: int = 40
     turnover: bool = True                 # master switch for birth/death (spec 9)
     # In training updates the agent took part in: how much it has learned, the
@@ -576,7 +593,15 @@ class TrainConfig:
     # rather than left to drift out of date.
     gumbel_tau: float = 1.5
     gumbel_tau_final: float = 0.5
-    tau_anneal_updates: int = 1000        # temperature reaches its final value here
+    tau_anneal_updates: int = 1000
+    # Whether the temperature and entropy anneals count updates *in the current
+    # rung* rather than since the run began. They ran once, globally, and the
+    # ladder has since grown to thirteen rungs: everything was at its floor by
+    # update 1,000, so `name-all` -- which starts around 2,000 and has to find
+    # three-word utterances where one used to do -- explored nothing at all. On
+    # the run that stalled there, the only new forms came from newborns, and
+    # success rose each time one settled and decayed in between.
+    anneal_per_rung: bool = True        # temperature reaches its final value here
     # Straight-through Gumbel gives the symbol policy a gradient from the
     # listener, but *not* from the episode return -- so the per-symbol length cost
     # never reaches it and utterances run to the cap.  This mixes a score-function

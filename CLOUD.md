@@ -134,7 +134,7 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 |---|---|
 | `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. |
 | `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
-| `name-all` | the first rung gated on **held-out combinations**. Watch trained-vs-reserved success in the checks: a code of whole-thing names shows a wide gap and stalls here. That is the gate working, not a bug. Watch each seat's field coverage too. |
+| `name-all` | the hard one: three fields in one utterance. Watch **words per utterance** climb toward 3 and **coverage** toward 0.30 — a run that sticks at ~1.5 words and coverage ~0.15 is naming one field and guessing the rest. The checkpoint line prints `held-out vs trained`; they should stay close (a wide gap is memorisation, and has never been seen here). |
 | `mutual` | both report the other's thing; held-out gated. Community growth and hindsight feedback switch on here; the speaker costs wait until `offer`. |
 | `ask-qty`, `order`, `quote` | the buyer orders and the farmer fills it, one more field each time: quantity, then fruit and colour, then price. Each prints `<field> arrives` for the field it introduced and `still carries <field>` for the rest -- a rung whose new field climbs while an older one falls to chance is forgetting, not learning. |
 | `offer` | the other direction: the farmer describes the lot it was asked about and the buyer reports it. The speaker costs come on here -- the first rung that invents no new word, so `silent` and `atoms/word` should drop without success dropping with them. The first rung where the farmer says anything about its own barn, and the half of the market dialogue nothing else trains. |
@@ -240,6 +240,9 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `curriculum.min_field_transfer`, `curriculum.min_field_coverage` | every field is checked for every role; coverage is what catches a code that names one field in every slot. |
 | `reward.belief_qty_tol` | how exactly a reported quantity has to match (1). |
 | `reward.atom_cost`, `reward.word_cost` | length is charged per atom after the first in a word (0.03), and much less per word (0.005): short words, not short sentences. |
+| `reward.refer_partial` | what a lineup guess is paid per field it shares with the target (0.45). The staircase from naming one field to naming all three; 0 restores all-or-nothing. |
+| `population.turnover_from_rung` | the rung agents start dying of old age in (`mutual`, the same one newcomers arrive in). Earlier, a death costs half a two-agent pool. |
+| `train.anneal_per_rung` | whether the temperature and entropy anneals count updates in the current rung rather than since the run started (true). Off means no exploration past update 1,000. |
 | `channel.atomic_vocab` | how many meaningless atoms words are built from (16). |
 | `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 — a buffer, not a pressure; the length cost sets length) and the number of turns (4). |
 | `channel.enforce_word_grammar` | atoms and marks alternate, so `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |

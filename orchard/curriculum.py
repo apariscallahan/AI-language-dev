@@ -380,6 +380,13 @@ def growth_applies(cfg: Config, phase: Phase) -> bool:
     return phase.index >= phase_named(cfg, cfg.population.grow_from_rung).index
 
 
+def turnover_applies(cfg: Config, phase: Phase) -> bool:
+    """Do agents die of old age in this rung? (``population.turnover_from_rung``)"""
+    if not cfg.population.turnover:
+        return False
+    return phase.index >= phase_named(cfg, cfg.population.turnover_from_rung).index
+
+
 def rung_budget(cfg: Config, phase: Phase) -> tuple[int, int]:
     """(minimum, maximum) training updates this rung may take."""
     c = cfg.curriculum
@@ -1039,7 +1046,15 @@ def resolve_referential(cfg: Config, rb: ReferentialBatch, choice: torch.Tensor,
     """
     R = cfg.reward
     correct = choice == rb.target
-    reward = R.refer_success * correct.float() + R.refer_miss * (~correct).float()
+    rows = torch.arange(choice.shape[0], device=choice.device)
+    # How much of the thing the guess actually got: the fields the chosen
+    # candidate shares with the target. In a round that turns on one field this
+    # is a constant and does nothing; in a round that turns on all three it is
+    # the difference between a near miss and a wild one.
+    shared = (rb.meanings[rows, choice] == rb.meanings[rows, rb.target]).float()
+    partial = shared.mean(dim=1)
+    reward = (R.refer_success * correct.float() + R.refer_miss * (~correct).float()
+              + R.refer_partial * partial)
     # Each role pays for the symbols *it* emitted. Callers count those from the
     # phase's own speaker schedule; the old fixed buyer-opens schedule billed the
     # lineup's describer nothing, which is how 38% of utterances ended up at the
@@ -1055,7 +1070,7 @@ def resolve_referential(cfg: Config, rb: ReferentialBatch, choice: torch.Tensor,
         "farmer_reward": f, "buyer_reward": b,
         "success": correct, "comprehended": correct,
         "both_judged": correct,
-        "farmer_decode": correct.float(), "buyer_decode": correct.float(),
+        "farmer_decode": partial, "buyer_decode": partial,
         "choice": choice, "target": rb.target,
         "both_accept": correct,
         "agree_variety": correct, "agree_qty": correct, "agree_price": correct,

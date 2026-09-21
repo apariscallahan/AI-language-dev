@@ -127,6 +127,22 @@ class Population:
         self.births.append(ev)
         return ev
 
+    def restagger(self) -> None:
+        """Give everyone alive a fresh, staggered lifespan from where they are.
+
+        Called once, when turnover starts. Ages accumulate whether or not anyone
+        is dying, so a cohort that lived through the naming rungs is already past
+        its lifespan by then and would otherwise die to the last agent in one
+        update.
+        """
+        seen = set()
+        for role in (FARMER, BUYER):
+            for agent in self.pool(role):
+                if id(agent) in seen:          # one pool fills both seats
+                    continue
+                seen.add(id(agent))
+                agent.lifespan = agent.updates + self._sample_lifespan(True)
+
     # ------------------------------------------------------------------
     def _sample_lifespan(self, initial: bool) -> int:
         p = self.cfg.population

@@ -977,6 +977,11 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
       "requires information neither agent holds alone, so the shaping does not "
       "remove the need to communicate -- but it does mean success rate alone is not "
       "proof of language, which is why topsim and coherence are reported beside it.")
+    A("- In a lineup round that includes it, a guess is also paid `reward.refer_partial` "
+      "for each field the candidate it picked shares with the target. Only the exact "
+      "pick counts as success; the partial term exists because nothing else rewarded "
+      "a message for narrowing the field down, which left the rung that needs all "
+      "three fields at once with no gradient between naming one and naming them all.")
     A("- Topological similarity is measured on greedily-decoded first utterances, so "
       "the meaning-to-message mapping is a deterministic function. Live play samples "
       "from the policy and is noisier.")

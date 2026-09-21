@@ -132,6 +132,8 @@ class TestSchedulesCountUpdates(unittest.TestCase):
                     continue                    # documented as updates; tested below
                 if f.name.endswith("_from_rung"):
                     continue                    # names a rung, not an amount of learning
+                if f.type in ("bool", bool):
+                    continue                    # a switch, not a schedule
                 self.assertTrue(f.name.endswith("_updates"),
                                 "%s.%s looks like a schedule but is not in updates"
                                 % (sect, f.name))

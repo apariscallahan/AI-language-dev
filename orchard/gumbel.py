@@ -65,7 +65,8 @@ def gumbel_tau(cfg: Config, update: int) -> float:
 def run_and_update_gumbel(cfg: Config, scenarios,
                           farmers: Sequence[Agent], buyers: Sequence[Agent],
                           f_idx: torch.Tensor, b_idx: torch.Tensor, *,
-                          update: int = 0, device: str = "cpu",
+                          update: int = 0, phase_update: Optional[int] = None,
+                          device: str = "cpu",
                           train: bool = True, phase: Optional[Phase] = None,
                           generator: Optional[torch.Generator] = None,
                           usage=None, cost_scale: float = 1.0
@@ -81,10 +82,14 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     coining cost and earn the convention bonus, and -- if training -- the batch is
     folded into it afterwards.
 
-    ``cost_scale`` in [0, 1] scales the speaker's costs -- the symbol cost and
-    the coining cost, and the convention bonus only if
-    ``reward.convention_gated``. The trainer raises it as the first rung starts
-    to work and holds it at 1 from then on (see ``Trainer.update_cost_gate``).
+    ``cost_scale`` in [0, 1] scales the speaker's costs -- the length and coining
+    costs, and the convention bonus only if ``reward.convention_gated``. The
+    trainer raises it at ``reward.costs_from_rung`` and holds it at 1 from then
+    on (see ``Trainer.update_cost_gate``).
+
+    ``phase_update`` is how far into its own rung the run is. The temperature and
+    entropy anneals count that rather than the whole run when
+    ``train.anneal_per_rung`` is on, so a rung that starts late still explores.
     """
     c = cfg.channel
     t = cfg.train
@@ -104,7 +109,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     B = len(scenarios)
     D = c.dialogue_len
     NT = c.n_token_ids
-    tau = gumbel_tau(cfg, update)
+    # How far into its *own* rung the run is, which is what the anneals count
+    # when `train.anneal_per_rung` is on.
+    anneal_at = update if phase_update is None else int(phase_update)
+    tau = gumbel_tau(cfg, anneal_at)
 
     if batched:
         f_obs = scenarios.obs(cfg, FARMER)
@@ -327,10 +335,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         return batch, stats
 
     # ---- one joint objective ---------------------------------------------
-    ent_tok_coef = anneal(t.entropy_coef, t.entropy_coef_final, update,
+    ent_tok_coef = anneal(t.entropy_coef, t.entropy_coef_final, anneal_at,
                           t.entropy_anneal_updates)
     ent_dec_coef = anneal(t.decision_entropy_coef, t.decision_entropy_coef_final,
-                          update, t.entropy_anneal_updates)
+                          anneal_at, t.entropy_anneal_updates)
     rew_of = {FARMER: f_rew, BUYER: b_rew}
     loss = torch.zeros((), device=device)
     value_loss_total = 0.0
