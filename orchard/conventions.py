@@ -60,15 +60,34 @@ from .world import K_EMPTY, K_FIELD
 
 
 def _edit(a: Sequence[int], b: Sequence[int]) -> int:
+    """Levenshtein distance, written for the call count rather than for looks.
+
+    This is 97% of what the convention bonus costs, and the bonus is charged per
+    episode against a sample of other meanings' forms, so it runs tens of
+    thousands of times per training update. The row is carried in a rolling
+    variable and written in place instead of being rebuilt, and the three-way
+    minimum is unrolled: `min(x, y, z)` is a function call per cell.
+    """
     if len(a) < len(b):
         a, b = b, a
-    prev = list(range(len(b) + 1))
+    nb = len(b)
+    if nb == 0:
+        return len(a)
+    prev = list(range(nb + 1))
     for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
+        left = i                       # cur[j-1], carried rather than indexed
+        diag = prev[0]                 # prev[j-1]
+        prev[0] = i
+        for j in range(1, nb + 1):
+            up = prev[j]                           # delete
+            v = diag if ca == b[j - 1] else diag + 1   # substitute
+            if left + 1 < v:                       # insert
+                v = left + 1
+            if up + 1 < v:
+                v = up + 1
+            diag = up
+            prev[j] = left = v
+    return prev[nb]
 
 
 def similarity(a: Sequence[int], b: Sequence[int]) -> float:
@@ -195,14 +214,19 @@ class PopulationUsage:
         return firsts, words
 
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
-        n = n_real_fields(self.cfg, role, phase)
+        """(meaning kind, what was asked, what it is about) per episode.
+
+        One gather and one transfer: ``obs`` is on the training device, and
+        bringing the query slots across separately would be a second
+        synchronisation per role per update.
+        """
         kind = phase.meaning_kind(role)
+        n = n_real_fields(self.cfg, role, phase)
         q = query_slots(self.cfg, role, phase)
-        asked = obs[:, q].tolist() if q else None
-        rows = obs[:, :n].tolist()
-        if asked is None:
-            return [(kind,) + tuple(r) for r in rows]
-        return [(kind,) + tuple(a) + tuple(r) for r, a in zip(rows, asked)]
+        # A slice is a view; gathering columns copies. The trading rungs have no
+        # query slot, so they keep the slice and stay exactly as they were.
+        sel = obs[:, :n] if not q else obs[:, q + list(range(n))]
+        return [(kind,) + tuple(r) for r in sel.tolist()]
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
@@ -257,7 +281,8 @@ class PopulationUsage:
                 kind = phase.meaning_kind(role)
                 need = R.convention_min_support / max(self.scale, 1e-12)
                 est = [k for k, v in self.form_total.items() if k[0] == kind and v >= need]
-                others = self._rng.sample(est, min(16, len(est)))
+                n_contrast = max(1, int(R.convention_contrast_samples))
+                others = self._rng.sample(est, min(n_contrast, len(est)))
                 other_modal = [(k, self.modal(k)) for k in others]
                 other_modal = [(k, m) for k, m in other_modal if m]
                 other_keys = {ko: mo for ko, mo in other_modal}
@@ -308,6 +333,43 @@ class PopulationUsage:
                 self.forms[k][tuple(u)] += inc
                 self.form_total[k] += inc
         self.episodes += n_episodes
+
+    def key_arities(self) -> dict[str, int]:
+        """How long a key is, per meaning kind, under the current code.
+
+        Constant within a kind -- the schema decides it -- and it changed when
+        the key started carrying what was asked.
+        """
+        from .curriculum import ladder
+        out: dict[str, int] = {}
+        for ph in ladder(self.cfg):
+            for v in ph.views():
+                for role in (FARMER, BUYER):
+                    if not v.speaks(self.cfg, role):
+                        continue
+                    out[v.meaning_kind(role)] = (
+                        1 + len(query_slots(self.cfg, role, v))
+                        + n_real_fields(self.cfg, role, v))
+        return out
+
+    def drop_stale_forms(self) -> int:
+        """Forget conventions recorded under a key format this code no longer writes.
+
+        A snapshot from before the key carried *what was asked* stores keys of a
+        different arity. Nothing crashes if they are kept -- the new keys simply
+        start without support -- but the stale ones stay in the contrast set for
+        a couple of half-lives, so a speaker is scored against the modal forms
+        of meanings that are not what those keys now denote. They rebuild within
+        an update at any real batch size, so dropping them is cheap and honest.
+        The word counts are untouched: a word is keyed by its atoms.
+        """
+        want = self.key_arities()
+        stale = [k for k in self.forms
+                 if k and k[0] in want and len(k) != want[k[0]]]
+        for k in stale:
+            self.forms.pop(k, None)
+            self.form_total.pop(k, None)
+        return len(stale)
 
     def summary(self) -> dict[str, Any]:
         s = self.scale

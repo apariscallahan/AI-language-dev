@@ -676,6 +676,7 @@ not restrictions: nothing ever stops an agent from saying anything.
 | `reward.word_cost` | 0.005 | per word — a sixth of an atom, so sentences are cheap and words are not |
 | `reward.rarity_cost` | 0.05 | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life_updates` = 80), centred on the batch so it favours established forms without ever favouring silence |
 | `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
+| `reward.convention_contrast_samples` | 4 | how many other meanings that contrast is averaged over. It is the whole cost of the term — host-side edit distances, one per episode for the bonus and this many per distinct utterance for the contrast, and an unsure speaker repeats nothing so nothing caches. At batch 4,096: 0.29 s per update at 4, 0.75 s at 16 (what it was hardcoded to), against a ~2.7 s update |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
 One rule decides when each of them starts: **a pressure to reuse a word is off

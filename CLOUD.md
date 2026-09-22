@@ -175,7 +175,14 @@ RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh
 
 A resumed run picks up whatever code it is started with, so this is also how to
 move a running experiment onto newer code: stop it just after a checkpoint,
-update, resume. Older snapshots load too.
+update, resume. Older snapshots load too. What carries over is the population
+and its history; the *rules* are whatever the new code and config say, so a
+resumed run re-measures the rung it is on under the new measurements and applies
+whatever speaker pressures the new schedule turns on. One thing does not carry
+over: the recent-usage record is keyed by meaning, and when the key changed to
+carry *what was asked* the old keys stopped matching. They are dropped on load
+and the resume line says how many; they rebuild within one update, and the word
+counts (keyed by the word) are untouched.
 
 Branch an experiment off any rung — the header will list what you changed:
 
@@ -243,6 +250,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
 | `reward.costs_from_rung` | the rung from which the speaker pays for length and for new words (`offer`, the first rung that invents no new word). Earlier, the cheapest way to be short is to say the same short nothing. |
 | `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, the first rung that invents no word of its own -- it only has to say three that already exist). It cannot punish a new word -- a form only counts once it has 12 recent uses -- and it cannot collapse the language, because it is contrastive. Waiting for `mutual` left four rungs in which nothing paid a speaker for repeating itself: two founders with no form in common (coherence 0.15-0.17) and 686 distinct words over sampled play for a 64-thing world. |
+| `reward.convention_contrast_samples` | how many other meanings' forms each utterance is contrasted with (4). This is the whole cost of the convention bonus, and it is host-side Python while the device waits: at batch 4,096 it is 0.29 s per update at 4 and 0.75 s at 16 (the old hardcoded value), against a ~2.7 s update. Lower it if the GPU is being starved. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
 | `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the request rungs included -- they run in both directions. |
 | `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |

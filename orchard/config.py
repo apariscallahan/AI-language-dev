@@ -378,6 +378,23 @@ class RewardConfig:
     # convention has ``convention_min_support`` recent uses behind it.
     convention: float = 0.30
     convention_min_support: int = 12
+    # How many other meanings' conventions a form is contrasted with. The
+    # contrast is what stops "one form for everything" earning the bonus, and
+    # it is the whole cost of the term: one edit distance per episode pays the
+    # bonus, `convention_contrast_samples` per *distinct* utterance pay for the
+    # contrast, and a speaker still unsure of its words repeats almost nothing,
+    # so nothing caches. It was hardcoded at 16, which nothing below `mutual`
+    # ever paid for. Measured at batch 4,096 on a rung whose utterances are
+    # nearly all distinct, against a ~2.7 s update:
+    #
+    #     samples      1      2      4      8     16
+    #     per update  0.15s  0.22s  0.29s  0.44s  0.75s
+    #
+    # The estimate is a mean over a sample either way, so fewer samples is a
+    # noisier per-episode baseline rather than a different one, and this is a
+    # shaping term averaged over thousands of episodes. 16 reproduces what
+    # `mutual` and above used to do.
+    convention_contrast_samples: int = 4
     # Whether the convention bonus waits for a working channel like the costs do.
     # Measured: ungated, even strongly weighted, it raised coherence among six
     # speakers from random weights only to ~0.2 and did not get their lineup off

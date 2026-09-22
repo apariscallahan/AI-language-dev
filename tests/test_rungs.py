@@ -1376,6 +1376,70 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
                           % (phase.name, probe[0][3], sorted(played)))
 
 
+class TestTheConventionTermCanAffordToRun(unittest.TestCase):
+    """It is charged per episode against a sample of other meanings' forms, so
+    at a GPU batch it runs tens of thousands of edit distances per update --
+    the whole cost of the term, and pure host-side Python while the device
+    waits. Both the distance and the sample size were tuned for that; neither
+    may change what is computed."""
+
+    def _ref_edit(self, a, b):
+        """The textbook version the tightened one replaced."""
+        if len(a) < len(b):
+            a, b = b, a
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
+
+    def test_the_tightened_edit_distance_is_the_same_distance(self):
+        from orchard.conventions import _edit
+        rng = random.Random(7)
+        for _ in range(4000):
+            a = [rng.randrange(6) for _ in range(rng.randrange(0, 10))]
+            b = [rng.randrange(6) for _ in range(rng.randrange(0, 10))]
+            self.assertEqual(_edit(a, b), self._ref_edit(a, b),
+                             "edit(%s, %s) changed" % (a, b))
+        # the cases the rolling row is easiest to get wrong on
+        self.assertEqual(_edit([], []), 0)
+        self.assertEqual(_edit([1, 2, 3], []), 3)
+        self.assertEqual(_edit([], [1, 2]), 2)
+        self.assertEqual(_edit([1, 2, 3], [1, 2, 3]), 0)
+        self.assertEqual(_edit([1, 2, 3], [1, 9, 3]), 1)
+        self.assertEqual(_edit([1, 2, 3], [1, 3]), 1)
+
+    def test_the_contrast_sample_is_a_knob_and_is_honoured(self):
+        cfg = cfg_small()
+        cfg.reward.convention_min_support = 1
+        c = cfg.channel
+        phase = phase_named(cfg, "name-all")
+        seen = {}
+        for n in (1, 8):
+            cfg.reward.convention_contrast_samples = n
+            u = PopulationUsage(cfg)
+            obs = torch.tensor([[i % 3, (i // 3) % 3, i % 2, 3] + [0] * 8
+                                for i in range(12)])
+            toks = torch.full((12, c.dialogue_len), c.pad_id, dtype=torch.long)
+            for i in range(12):
+                toks[i, :2] = torch.tensor([4 + i % 5, c.end_id])
+            for _ in range(6):
+                u.observe(u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs}), 12)
+            calls = []
+            import orchard.conventions as C
+            real = C.similarity
+            C.similarity = lambda a, b: (calls.append(1), real(a, b))[1]
+            try:
+                u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs})
+            finally:
+                C.similarity = real
+            seen[n] = len(calls)
+        self.assertLess(seen[1], seen[8],
+                        "the contrast sample size did nothing: %s" % seen)
+
+
 class TestSharedPoolIsNotComparedWithItself(unittest.TestCase):
     """Below ``split_roles_at`` one pool fills both seats, so "the two roles"
     are the same agents. Comparing them measured self-agreement: with two
@@ -1440,3 +1504,50 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
         keys = u._keys(market, BUYER, obs)
         self.assertEqual(len(keys), 2)
         self.assertEqual(keys[0], keys[1])
+
+    def test_the_key_reads_kind_then_question_then_meaning(self):
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        phase = phase_named(cfg, "name-all")
+        obs = torch.tensor([[1, 2, 0, 3] + [0] * 8])
+        self.assertEqual(u._keys(phase, FARMER, obs)[0], ("tuple", 3, 1, 2, 0))
+
+    def test_a_resumed_run_forgets_conventions_in_the_older_key_format(self):
+        """Snapshots written before the key carried the question are shorter.
+
+        Kept, they sit in the contrast set for a couple of half-lives, scoring
+        speakers against the modal forms of meanings those keys no longer
+        denote. Word counts are keyed by the word and are untouched.
+        """
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        old_key = ("tuple", 1, 2, 0)            # no question in it
+        new_key = ("tuple", 3, 1, 2, 0)
+        for k in (old_key, new_key):
+            u.forms[k][(4,)] = 20.0
+            u.form_total[k] = 20.0
+        u.words[(4,)] = 40.0
+        u.word_total = 40.0
+        self.assertEqual(u.drop_stale_forms(), 1)
+        self.assertIn(new_key, u.form_total)
+        self.assertNotIn(old_key, u.form_total)
+        self.assertNotIn(old_key, u.forms)
+        self.assertEqual(u.word_total, 40.0, "the word counts were disturbed")
+        self.assertEqual(u.drop_stale_forms(), 0, "it is not idempotent")
+
+    def test_every_kind_of_meaning_has_one_key_length(self):
+        """`drop_stale_forms` is only safe if arity is fixed per meaning kind."""
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        want = u.key_arities()
+        for phase in ladder(cfg):
+            for view in phase.views():
+                for role in (FARMER, BUYER):
+                    if not view.speaks(cfg, role):
+                        continue
+                    obs = torch.zeros((1, 40), dtype=torch.long)
+                    key = u._keys(view, role, obs)[0]
+                    self.assertEqual(len(key), want[key[0]],
+                                     "%s/%s writes a %r key of length %d, not %d"
+                                     % (phase.name, role, key[0], len(key),
+                                        want[key[0]]))
