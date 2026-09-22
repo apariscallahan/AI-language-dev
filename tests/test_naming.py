@@ -315,3 +315,124 @@ class TestOnePopulationUntilTrading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheCostsWaitForTheChannel(unittest.TestCase):
+    """Costs arrive when a rung's own channel works, not when the rung starts.
+
+    `mutual` invents no new *word*, which is what `Phase.invents` asks, but it
+    does have to make its messages longer -- `name-all` ran at ~2.4 atoms and
+    `mutual` grew that to ~3.6 unaided. Charging per atom from the rung's first
+    update throttled exactly that: the hyphen fell out of use entirely (1.00
+    atoms per word), capping a word at one of 16 atoms, so ~51 messages had to
+    carry 48 meanings. At the same episode count success was 0.023 against the
+    0.142 the same rung reached with the costs off.
+    """
+
+    def _trainer(self, tmp, rung="mutual"):
+        from orchard.train import Trainer
+        cfg = Config()
+        cfg.model.d_model, cfg.model.n_layers, cfg.model.d_ff = 32, 1, 64
+        cfg.train.batch_size, cfg.train.device, cfg.log.plot = 32, "cpu", False
+        tr = Trainer(cfg, tmp, quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(rung)
+        tr.update_cost_gate()
+        return cfg, tr
+
+    def _feed(self, tr, rate, n=1200):
+        import torch
+        tr.update_cost_gate(torch.full((n,), float(rate)))
+
+    def test_a_rung_that_is_not_working_yet_pays_nothing(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        self.assertEqual(tr.cost_gate, 0.0, "charged before a single batch")
+        self._feed(tr, 0.0)
+        self.assertEqual(tr.cost_gate, 0.0, "charged a rung at zero success")
+        self._feed(tr, cfg.curriculum.mutual_min_success * 0.5)
+        self.assertEqual(tr.cost_gate, 0.0, "charged a rung at half its floor")
+        tr.close()
+
+    def test_it_ramps_in_once_the_floor_is_cleared(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        self._feed(tr, cfg.curriculum.mutual_min_success * 2)
+        self.assertEqual(tr.cost_gate, 0.0, "the ramp jumped straight to full")
+        self.assertIsNotNone(tr._costs_ramp_from, "the ramp never started")
+        seen = []
+        for step in (1, 50, 100, 200, 400):
+            tr.updates = tr._costs_ramp_from + step
+            self._feed(tr, cfg.curriculum.mutual_min_success * 2)
+            seen.append(tr.cost_gate)
+        self.assertEqual(seen, sorted(seen), "the ramp is not monotone: %s" % seen)
+        self.assertGreater(seen[0], 0.0)
+        self.assertLess(seen[1], 1.0, "fully charged within 50 updates")
+        self.assertEqual(seen[-1], 1.0, "never reaches full strength")
+        tr.close()
+
+    def test_a_rung_that_invents_still_pays_nothing_however_well_it_does(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp(), rung="quote")
+        for _ in range(3):
+            self._feed(tr, 1.0)
+        self.assertEqual(tr.cost_gate, 0.0,
+                         "`quote` is still naming price and was charged anyway")
+        tr.close()
+
+    def test_the_old_step_gate_is_still_reachable(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        cfg.reward.costs_ramp_trigger = 0.0
+        tr.update_cost_gate()
+        self.assertEqual(tr.cost_gate, 1.0)
+        tr.close()
+
+
+class TestTheBottleneckWithholdsMeanings(unittest.TestCase):
+    """`coverage` decides how many transcripts a learner sees; this decides how
+    many *meanings*. Compositionality in iterated learning comes off the second
+    axis: the learner has to produce forms for meanings nobody taught it, and
+    only a code with reusable parts can. Shown every meaning, it memorises the
+    table as faithfully as its parents and the bottleneck selects for nothing --
+    measured as `mutual` reaching field coverage 0.84 on a code that scored 0.36
+    on trained combinations and 0.01 on held-out ones."""
+
+    def _store(self, cfg, n_meanings=12, per=6):
+        import torch
+        from orchard.bottleneck import StoredEpisode, TranscriptStore
+        st = TranscriptStore(cfg)
+        c = cfg.channel
+        for m in range(n_meanings):
+            for _ in range(per):
+                st._buf.append(StoredEpisode(
+                    f_obs=torch.zeros(4, dtype=torch.long),
+                    b_obs=torch.zeros(4, dtype=torch.long),
+                    tokens=torch.full((c.dialogue_len,), c.pad_id, dtype=torch.long),
+                    active=torch.zeros(c.dialogue_len, dtype=torch.bool),
+                    f_dec=torch.zeros(10, dtype=torch.long),
+                    b_dec=torch.zeros(10, dtype=torch.long),
+                    episode=0, f_generation=0, b_generation=0, meaning=(m, 0)))
+        return st
+
+    def test_each_newborn_has_a_different_gap(self):
+        cfg = Config()
+        st = self._store(cfg)
+        gaps = [st.withhold_meanings(random.Random(seed)) for seed in range(6)]
+        for g in gaps:
+            self.assertTrue(g, "nothing was withheld at all")
+            self.assertLess(len(g), 12, "a newborn was shown no meanings")
+            self.assertAlmostEqual(len(g) / 12, cfg.bottleneck.meaning_holdout,
+                                   delta=0.15)
+        self.assertGreater(len({frozenset(g) for g in gaps}), 1,
+                           "every newborn gets the same gap, so the same meanings "
+                           "are lost to the whole population")
+
+    def test_nothing_is_withheld_when_it_is_switched_off(self):
+        cfg = Config()
+        cfg.bottleneck.meaning_holdout = 0.0
+        self.assertEqual(self._store(cfg).withhold_meanings(random.Random(0)), set())
+
+    def test_a_thin_store_is_left_alone(self):
+        cfg = Config()
+        self.assertEqual(self._store(cfg, n_meanings=3).withhold_meanings(
+            random.Random(0)), set())

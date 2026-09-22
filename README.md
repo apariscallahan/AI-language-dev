@@ -714,6 +714,28 @@ trained ones — a productivity ratio of 0.03 against a 0.60 bar, flat over 200
 updates while every other number improved. High coverage with near-zero held-out
 *is* the signature of a memorised code, which is why both are measured.
 
+**They also ramp in rather than switching on.** Turning them on at `mutual`'s
+first update was measured, and it throttled the channel instead of shaping it:
+the atom cost drove words to exactly 1.00 atoms — the hyphen went unused
+entirely — which caps a word at one of 16 atoms, so at 1.19 words per utterance
+about 51 possible messages had to carry 48 meanings. Against the same episode
+count with the costs off, success was 0.023 where it had been 0.142 and the
+lexicon 14 words where it had been 88. `mutual` invents no new *word*, but it
+does have to make its messages longer — `name-all` ran at ~2.4 atoms and
+`mutual` grew that to ~3.6 unaided — and charging per atom while the message has
+to grow is the documented failure in another dress.
+
+So within a rung the gate waits for that rung's own rolling success to reach
+`reward.costs_ramp_trigger` × its promotion floor, then ramps to full over
+`reward.costs_ramp_updates`. A language has to exist before it can be
+economised; that rule was already applied across rungs, and this applies it
+inside one. The run log says when it fires:
+
+```
+[costs] mutual reached 0.104 (1.0x its 0.10 floor): the speaker starts paying
+        for length and novelty, ramped in over 200 updates
+```
+
 The costs are the pressure it was missing. Among codes with room for the 48
 trained meanings:
 
@@ -861,6 +883,28 @@ Sampling stays proportional to how often each meaning actually came up
 (`bottleneck.frequency_skew` = 1.0), so the *composition* of a newborn's
 experience still mirrors the parent generation's — it is simply no longer
 artificially thin.
+
+### The other axis: meanings, not transcripts
+
+`coverage` is about how many *transcripts* a learner sees, and 1.0 is right on
+that axis for the reason above. Compositionality comes off a different one. In
+Kirby's iterated-learning models a grammar emerges because the learner is shown
+a **subset of the meanings** and has to produce forms for the rest — and only a
+code with reusable parts can. Shown every meaning, a learner memorises the
+lookup table exactly as faithfully as its parents did, and the bottleneck
+selects for nothing.
+
+That is what a run showed at `mutual`: field coverage 0.84 on a code scoring
+0.36 on trained combinations and **0.01 on held-out** ones, a productivity ratio
+of 0.03 against the 0.60 bar. Forty-eight memorised labels, transmitted
+perfectly. The mechanism §4 is built on was present and had nothing to select.
+
+So **`bottleneck.meaning_holdout` (0.25) withholds a slice of the meaning space
+from each newborn** — its utterances for those meanings are simply not in the
+curriculum, and it has to work them out from the rest. The slice is drawn fresh
+per newborn, so nothing is lost to the *population*: every learner has a
+different gap. A learner that would be starved outright is given everything
+instead, and each birth records how much was held back.
 
 Every birth records what vocabulary it was actually shown, and the report gives
 retention for common and rare forms **separately** rather than as an aggregate,

@@ -243,6 +243,27 @@ class TranscriptStore:
             added += 1
         return added
 
+    def withhold_meanings(self, rng: random.Random) -> set:
+        """A slice of the meaning space this newborn will never be shown.
+
+        The other half of the transmission bottleneck. ``coverage`` decides how
+        many *transcripts* a learner sees; this decides how many *meanings*, and
+        they are different axes. Iterated learning produces a grammar because
+        the learner has to produce forms for meanings nobody taught it, and only
+        a code with reusable parts can; shown every meaning, it can memorise the
+        table as faithfully as its parents and the bottleneck selects for
+        nothing. Drawn fresh per newborn, so no meaning is lost to the
+        population -- each learner has a different gap.
+        """
+        share = float(self.cfg.bottleneck.meaning_holdout)
+        if share <= 0:
+            return set()
+        seen = sorted({it.meaning for it in self._buf})
+        if len(seen) < 4:                 # too few to hold any back meaningfully
+            return set()
+        k = min(len(seen) - 1, max(1, int(round(share * len(seen)))))
+        return set(rng.sample(seen, k))
+
     def sample(self, n: int, rng: random.Random) -> list[StoredEpisode]:
         """Draw the newborn's curriculum, skewed by meaning frequency.
 
@@ -360,6 +381,18 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     want = (bc.n_samples if bc.n_samples > 0
             else min(bc.max_samples, max(1, int(round(bc.coverage * len(store))))))
     samples = store.sample(want, rng)
+    # The meanings this newborn is not taught, and has to work out for itself.
+    withheld = store.withhold_meanings(rng)
+    if withheld:
+        kept = [s for s in samples if s.meaning not in withheld]
+        # Never starve a learner outright: if holding meanings back leaves too
+        # little to learn from at all, it learns from everything instead.
+        if len(kept) >= 8:
+            info["withheld_meanings"] = len(withheld)
+            info["withheld_share"] = round(1 - len(kept) / max(1, len(samples)), 3)
+            samples = kept
+        else:
+            withheld = set()
     if len(samples) < 8:
         info["skipped"] = "not enough successful transcripts yet"
         return info
