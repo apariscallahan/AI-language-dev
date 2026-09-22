@@ -431,6 +431,27 @@ class RewardConfig:
     # so the task forbids it -- unlike the convention bonus, whose collapse was
     # both cheap and well paid.
     costs_from_rung: str = "mutual"
+    # The costs do not arrive at full strength the moment a rung starts. They
+    # wait until that rung's own channel is working -- rolling success at this
+    # multiple of the rung's promotion floor -- and then ramp in over
+    # `costs_ramp_updates`. 0 for the trigger restores the old step gate.
+    #
+    # Turning them on at the first update of `mutual` was measured, and it
+    # throttled the channel instead of shaping it: the atom cost drove words to
+    # exactly 1.00 atoms (the hyphen went unused at all), which caps a word at
+    # one of 16 atoms, and at 1.19 words per utterance that is ~51 possible
+    # messages for 48 meanings -- a bijection with no slack. Against the same
+    # episode count with the costs off, success was 0.023 where it had been
+    # 0.142, and the lexicon 14 words where it had been 88. `mutual` invents no
+    # new *word*, but it does have to make its messages longer -- `name-all`
+    # ran at ~2.4 atoms and `mutual` grew that to ~3.6 unaided -- and charging
+    # per atom while the message has to grow is the documented failure in
+    # another dress.
+    #
+    # A language has to exist before it can be economised. That rule was already
+    # applied across rungs; this applies it inside one.
+    costs_ramp_trigger: float = 1.0      # x the rung's own success floor
+    costs_ramp_updates: int = 200        # 0 -> 1 over this many updates after that
     # The rung from which the convention bonus pays a speaker for using the
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish
@@ -638,6 +659,26 @@ class BottleneckConfig:
     # This is the lever for vocabulary loss and regularisation across
     # generations, so it is a first-class knob rather than a constant.
     frequency_skew: float = 1.0
+    # Share of *meanings* withheld from each newborn's apprenticeship. Not
+    # transcripts -- meanings: a random slice of the meaning space, different
+    # for every newborn, whose utterances it is never shown and must work out
+    # for itself from the rest.
+    #
+    # This is the half of iterated learning that `coverage` above cannot give.
+    # Coverage is about how many *tokens* a learner sees, and the argument for
+    # setting it to 1.0 -- that children acquire essentially all the vocabulary
+    # around them -- is sound on that axis. Compositionality comes off a
+    # different one: in Kirby's iterated-learning models a grammar emerges
+    # because the learner is shown a *subset of the meanings* and has to produce
+    # forms for the rest, and only a code with reusable parts can. Shown every
+    # meaning, a learner can memorise a lookup table exactly as faithfully as
+    # its parents did, and the bottleneck selects for nothing.
+    #
+    # Measured, with this at 0: `mutual` reached field coverage 0.84 on a code
+    # that scored 0.36 on trained combinations and 0.01 on held-out ones -- a
+    # productivity ratio of 0.03 against the 0.60 bar. 48 memorised labels,
+    # transmitted perfectly.
+    meaning_holdout: float = 0.25
     token_loss_weight: float = 1.0
     decision_loss_weight: float = 1.0
 

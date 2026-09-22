@@ -37,7 +37,7 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
 from .conventions import PopulationUsage
 from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
                          costs_apply, evaluate_rung, growth_applies, ladder,
-                         pooled_at, rung_budget, turnover_applies)
+                         pooled_at, promotion_for, rung_budget, turnover_applies)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -176,6 +176,9 @@ class Trainer:
         # Set once, when the first death is allowed; see `restagger`.
         self._turnover_started = False
         self.rung_success = RollingStat(window=2000)
+        # The update at which this rung's costs began ramping in; None until its
+        # channel has shown it works. Reset with the rung.
+        self._costs_ramp_from: "int | None" = None
         # Training updates so far: one per batch. Budgets, promotion checks,
         # checkpoints, anneals, growth and lifespans all count these.
         self.updates = 0
@@ -517,6 +520,7 @@ class Trainer:
             done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
             self.rung_success = RollingStat(window=2000)
+            self._costs_ramp_from = None
             self.update_cost_gate()
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
             cur.transitions[-1]["updates_in_previous_phase"] = done_updates
@@ -747,6 +751,9 @@ class Trainer:
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
         self._episode_at_start = self.episode
         self._beat = (time.time(), self.episode)
+        # The ramp is a property of how far *this* rung has got, and the rolling
+        # success it keys off starts empty, so it re-earns its trigger.
+        self._costs_ramp_from = None
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
@@ -832,19 +839,56 @@ class Trainer:
                 and growth_applies(self.cfg, self.curriculum.phase))
 
     def update_cost_gate(self, succ: torch.Tensor = None) -> None:
-        """Speaker costs: off until ``reward.costs_from_rung``, on from there.
+        """Speaker costs: which rung, and how far into it the channel has got.
 
-        Nothing is charged for while the words are still being invented. Making
-        a word short, rare-free and shared is a pressure on a word that exists;
-        applied earlier it is a pressure to say as little as possible, which the
-        population can satisfy completely without naming anything.
+        Nothing is charged for while the words are still being invented, which
+        `curriculum.costs_apply` decides per rung. But a rung that invents no
+        new *word* can still need its messages to grow -- `mutual` went from
+        ~2.4 atoms to ~3.6 unaided -- and a per-atom charge from its first
+        update throttles exactly that. Measured: the hyphen fell out of use
+        entirely (1.00 atoms per word), which caps a word at one of 16 atoms,
+        leaving ~51 possible messages for 48 meanings; success at the same
+        episode count was 0.023 against 0.142 with the costs off.
+
+        So within a rung the gate waits for that rung's own success to reach
+        `reward.costs_ramp_trigger` x its promotion floor, then ramps to full
+        over `reward.costs_ramp_updates`. A language has to exist before it can
+        be economised; this is that rule applied inside a rung rather than
+        across them.
         """
         if not self.cfg.curriculum.enabled:
             self.cost_gate = self.convention_gate = 1.0
             return
         phase = self.curriculum.phase
-        self.cost_gate = 1.0 if costs_apply(self.cfg, phase) else 0.0
         self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
+        if not costs_apply(self.cfg, phase):
+            self.cost_gate = 0.0
+            self._costs_ramp_from = None
+            return
+        if succ is not None:
+            self.rung_success.extend(succ.float().tolist())
+        r = self.cfg.reward
+        if r.costs_ramp_trigger <= 0:
+            self.cost_gate = 1.0
+            return
+        if self._costs_ramp_from is None:
+            floor = promotion_for(self.cfg, phase).min_success
+            # Enough of the rung seen to trust the number, then the bar itself.
+            if len(self.rung_success) < 1000:
+                self.cost_gate = 0.0
+                return
+            if self.rung_success.mean < r.costs_ramp_trigger * floor:
+                self.cost_gate = 0.0
+                return
+            self._costs_ramp_from = self.updates
+            self.log.always(
+                "  [costs] %s reached %.3f (%.1fx its %.2f floor): the speaker starts "
+                "paying for length and novelty, ramped in over %s updates"
+                % (phase.name, self.rung_success.mean, r.costs_ramp_trigger, floor,
+                   "{:,}".format(max(0, r.costs_ramp_updates))))
+        over = max(0, int(r.costs_ramp_updates))
+        done = self.updates - self._costs_ramp_from
+        self.cost_gate = 1.0 if over <= 0 else min(1.0, max(0.0, done / over))
 
     def maybe_check_promotion(self) -> None:
         """The light, frequent check -- so a rung that has worked is left promptly."""
