@@ -219,6 +219,10 @@ class Trainer:
         from .transcripts import TranscriptWriter
         self.transcripts = TranscriptWriter(cfg, out_dir)
         self._beat = (time.time(), 0)
+        # Episodes already played before this process started; 0 unless resumed.
+        # Throughput and ETA are about what this process is doing, not about a
+        # count it inherited.
+        self._episode_at_start = 0
         self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
@@ -628,7 +632,16 @@ class Trainer:
 
         from .agents import make_agent
         from .population import BirthEvent
-        st = torch.load(path, map_location=self.device, weights_only=False)
+        # On the host, whatever the run is training on. A snapshot is a file,
+        # and every consumer below places what it needs: `load_state_dict` copies
+        # across devices for both the nets and their optimisers, and the
+        # transcript store is host-side by construction. Mapping the whole file
+        # onto the training device instead put the store on the GPU, so after a
+        # resume it held device tensors from before and host tensors from after
+        # -- which `train_newborn` stacks together at the first birth whose rung
+        # has both. It also loaded every agent's weights and Adam state onto the
+        # card at once, which is the largest allocation a resume makes.
+        st = torch.load(path, map_location="cpu", weights_only=False)
         self.episode = int(st["episode"])
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])
@@ -719,6 +732,12 @@ class Trainer:
         self._stale_forms = u.drop_stale_forms()
         so = st["store"]
         self.store._buf = list(so["buf"])[:self.store.capacity]
+        # Belt and braces, and it repairs a snapshot written by a run that had
+        # already pulled its store onto the device.
+        stray = self.store.to_host()
+        if stray:
+            self.log.always("  [resume] brought %d stored transcripts back to the host"
+                            % stray)
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
         self.store.total_added = int(so["total_added"])
         self.store.meaning_counts = Counter(so["meaning_counts"])
@@ -726,6 +745,8 @@ class Trainer:
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        self._episode_at_start = self.episode
+        self._beat = (time.time(), self.episode)
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
@@ -852,7 +873,13 @@ class Trainer:
         self._last_progress = now
         elapsed = self.log.elapsed()
         total = max(1, self.cfg.train.episodes)
-        rate = self.episode / elapsed if elapsed > 0 else 0.0
+        # Episodes *this process* has played over the time it has been up. A
+        # resumed run carries its predecessor's episode count but not its wall
+        # clock, so dividing the whole count by this process's elapsed time
+        # reported a rate it had never reached and an ETA to match -- and,
+        # unlike the heartbeat's, it stayed wrong for the rest of the run.
+        done = max(0, self.episode - self._episode_at_start)
+        rate = done / elapsed if elapsed > 0 and done else 0.0
         remaining = (total - self.episode) / rate if rate > 0 else float("nan")
         payload = {
             "state": state,
