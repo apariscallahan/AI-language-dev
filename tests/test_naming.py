@@ -103,6 +103,75 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
                         "nothing pays for reusing a word on the rung whose whole "
                         "job is to reuse three of them")
 
+    def test_the_costs_are_a_per_rung_rule_not_a_threshold(self):
+        """`ask-qty` and `quote` sit above `mutual` and still have a word to
+        invent, so no single threshold gets this right: at `offer` it spares
+        them but also spares `mutual` and `order`, which invent nothing; at
+        `mutual` it charges them while they are still naming quantity and price.
+        """
+        from orchard.curriculum import costs_apply
+        cfg = Config()
+        want = {"name-fruit": False, "name-color": False, "name-quality": False,
+                "name-all": False, "mutual": True, "ask-qty": False,
+                "order": True, "quote": False, "offer": True, "judge": True,
+                "haggle": True, "bargain": True, "market": True}
+        for p in ladder(cfg):
+            self.assertEqual(costs_apply(cfg, p), want[p.name],
+                             "%s: costs %s, expected %s"
+                             % (p.name, costs_apply(cfg, p), want[p.name]))
+        # and the floor still holds them off entirely if a run wants that
+        cfg.reward.costs_from_rung = "market"
+        self.assertFalse(costs_apply(cfg, phase_named(cfg, "mutual")))
+        self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
+
+    def test_the_costs_price_a_fused_name_above_a_compositional_one(self):
+        """Why `mutual` gets them: it is the first rung with no lineup, so
+        nothing else there forces a message to decompose.
+
+        The pressure has to survive the obvious objection -- that a length cost
+        just makes everything shorter, and the shortest code is the collapse
+        this project keeps rediscovering. It does not, because the collapse
+        cannot carry the meaning space: the task forbids what the cost would
+        otherwise reward. That is the difference from the convention bonus,
+        whose collapse was both cheap and well paid.
+        """
+        import torch
+        from orchard.env import length_cost
+        cfg = Config()
+        c, w = cfg.channel, cfg.world
+        meanings = w.n_varieties * w.n_colors * w.n_quality
+
+        def cost_of(words):
+            out = []
+            for word in words:
+                for j, a in enumerate(word):
+                    if j:
+                        out.append(c.hyphen_id)
+                    out.append(a)
+                out.append(c.space_id)
+            out[-1] = c.end_id
+            toks = torch.full((1, c.dialogue_len), c.pad_id, dtype=torch.long)
+            toks[0, :len(out)] = torch.tensor(out)
+            v = float(length_cost(cfg, toks, list(range(c.max_msg_len)))[0])
+            return v, c.atomic_vocab ** sum(len(x) for x in words)
+
+        one_atom, room = cost_of([[1]])
+        self.assertLess(room, meanings,
+                        "one atom can encode the whole world, so the cheapest "
+                        "code is the collapse and this pressure is unsafe")
+        fused_2, room_2 = cost_of([[1, 2]])
+        split_2, _ = cost_of([[1], [2]])
+        fused_3, _ = cost_of([[1, 2, 3]])
+        split_3, room_3 = cost_of([[1], [2], [3]])
+        self.assertGreaterEqual(room_2, meanings)
+        self.assertGreaterEqual(room_3, meanings)
+        self.assertGreater(fused_2, split_2 * 2,
+                           "a fused two-atom label is not meaningfully dearer "
+                           "than two short words (%.4f vs %.4f)" % (fused_2, split_2))
+        self.assertGreater(fused_3, split_3 * 2,
+                           "a fused three-atom label is not meaningfully dearer "
+                           "than three short words (%.4f vs %.4f)" % (fused_3, split_3))
+
     def test_the_costs_wait_for_every_rung_that_invents_a_word(self):
         """Length and rarity are pressures on a word that exists."""
         from orchard.curriculum import costs_apply
