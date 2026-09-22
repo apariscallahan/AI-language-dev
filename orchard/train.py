@@ -219,6 +219,10 @@ class Trainer:
         from .transcripts import TranscriptWriter
         self.transcripts = TranscriptWriter(cfg, out_dir)
         self._beat = (time.time(), 0)
+        # Episodes already played before this process started; 0 unless resumed.
+        # Throughput and ETA are about what this process is doing, not about a
+        # count it inherited.
+        self._episode_at_start = 0
         self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
@@ -726,6 +730,8 @@ class Trainer:
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        self._episode_at_start = self.episode
+        self._beat = (time.time(), self.episode)
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
@@ -852,7 +858,13 @@ class Trainer:
         self._last_progress = now
         elapsed = self.log.elapsed()
         total = max(1, self.cfg.train.episodes)
-        rate = self.episode / elapsed if elapsed > 0 else 0.0
+        # Episodes *this process* has played over the time it has been up. A
+        # resumed run carries its predecessor's episode count but not its wall
+        # clock, so dividing the whole count by this process's elapsed time
+        # reported a rate it had never reached and an ETA to match -- and,
+        # unlike the heartbeat's, it stayed wrong for the rest of the run.
+        done = max(0, self.episode - self._episode_at_start)
+        rate = done / elapsed if elapsed > 0 and done else 0.0
         remaining = (total - self.episode) / rate if rate > 0 else float("nan")
         payload = {
             "state": state,

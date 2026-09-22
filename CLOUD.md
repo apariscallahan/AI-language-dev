@@ -173,6 +173,24 @@ spot or pre-emptible instance, rerun it pointing `RUN` at the same folder:
 RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh
 ```
 
+To see what there is to resume from before choosing -- which rung each snapshot
+stopped on, how far in, how big the community was, and whether its two seats are
+still one pool:
+
+```bash
+python -m orchard.run --snapshots                     # everything under runs/
+python -m orchard.run --snapshots runs/<run folder>   # or one run
+```
+
+To see what there is to resume from before choosing -- which rung each snapshot
+stopped on, how far in, how big the community was, and whether its two seats are
+still one pool:
+
+```bash
+python -m orchard.run --snapshots                     # everything under runs/
+python -m orchard.run --snapshots runs/<run folder>   # or one run
+```
+
 A resumed run picks up whatever code it is started with, so this is also how to
 move a running experiment onto newer code: stop it just after a checkpoint,
 update, resume. Older snapshots load too. What carries over is the population

@@ -878,6 +878,76 @@ class TestResumeKeepsOnePool(unittest.TestCase):
                         "drifted copies were read as one pool")
         tr.close()
 
+    def test_the_snapshot_listing_says_which_are_safe(self):
+        """`--snapshots` is how you choose one to resume from, so it has to tell
+        a healthy pool from two sets of copies."""
+        import io, tempfile
+        from contextlib import redirect_stdout
+        from orchard.run import list_snapshots
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/run", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
+        path = tr.save_snapshot("latest")
+        tr.close()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(d), 0)
+        out = buf.getvalue()
+        self.assertIn("mutual", out)
+        self.assertIn("one pool", out)
+        self.assertNotIn("drifted", out)
+        # a single file, and a directory with nothing in it
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(path), 0)
+        self.assertIn("one pool", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(tempfile.mkdtemp()), 1)
+        self.assertIn("no snapshots", buf.getvalue())
+
+    def test_throughput_is_measured_from_where_this_process_started(self):
+        """A resumed run inherits an episode count but not a wall clock.
+
+        Dividing the whole count by this process's elapsed time reported a rate
+        it had never reached: the first heartbeat after resuming an 18.4M-episode
+        run read 137,215 eps/s against a real 700, and `progress.json` -- which
+        a progress bar reads -- kept a version of that error all run.
+        """
+        import json, os, tempfile, time
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.episode = 18_436_096
+        path = tr.save_snapshot("t")
+        tr.close()
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        self.assertEqual(tr2._beat[1], tr2.episode,
+                         "the heartbeat window still starts at episode 0")
+        self.assertEqual(tr2._episode_at_start, tr2.episode)
+        time.sleep(0.05)
+        played = 4096
+        tr2.episode += played
+        tr2.write_progress()
+        with open(os.path.join(d, "b", "progress.json")) as fh:
+            rate = json.load(fh)["episodes_per_second"]
+        self.assertLess(rate, 10 * played,
+                        "throughput still counts the episodes it inherited: %.0f" % rate)
+        tr2.close()
+
+    def test_a_fresh_run_measures_everything_it_played(self):
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        tr = Trainer(cfg, tempfile.mkdtemp(), quiet=True)
+        self.assertEqual(tr._episode_at_start, 0)
+        self.assertEqual(tr._beat[1], 0)
+        tr.close()
+
     def test_pooled_at_follows_the_split(self):
         from orchard.curriculum import pooled_at
         cfg = self._cfg()

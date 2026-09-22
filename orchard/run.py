@@ -11,6 +11,7 @@ point of the whole exercise: same code, same seed, one mechanism removed.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -294,6 +295,60 @@ def compare(paths: list[str], out: str) -> int:
 
 
 # --------------------------------------------------------------------------
+def list_snapshots(where: str) -> int:
+    """What is in each snapshot, and is it safe to resume from?
+
+    Printed before choosing one to carry on from: which rung it stopped on, how
+    far in, how big the community was, and -- the one that is not obvious --
+    whether its two seats are still one pool. Below
+    ``curriculum.split_roles_at`` they have to be, and a snapshot written by a
+    run that resumed before that was guaranteed holds two sets of copies that
+    have been training apart.
+    """
+    import torch
+
+    from .curriculum import ladder
+    from .train import Trainer
+
+    names = [ph.name for ph in ladder(Config())]
+    if os.path.isfile(where):
+        paths = [where]
+    else:
+        paths = sorted(p for p in glob.glob(os.path.join(where, "**", "*.pt"),
+                                            recursive=True))
+    if not paths:
+        print("no snapshots under %s" % os.path.abspath(where))
+        print("(runs keep them in <run>/snapshots/; pass a run folder, that "
+              "folder, or a single .pt)")
+        return 1
+    print("%-34s %-12s %-9s %-9s %s"
+          % ("snapshot", "rung", "update", "pool", "state"))
+    affected = 0
+    for path in paths:
+        try:
+            st = torch.load(path, map_location="cpu", weights_only=False)
+            i = int(st["curriculum"]["index"])
+            split = Trainer._pool_had_split(st)
+            affected += int(split)
+            print("%-34s %-12s %-9s %-9s %s"
+                  % (os.path.relpath(path, where if os.path.isdir(where) else "."),
+                     names[i] if i < len(names) else i,
+                     "{:,}".format(int(st.get("updates", 0))),
+                     "%d+%d" % (len(st["farmers"]), len(st["buyers"])),
+                     "two sets of copies, drifted apart" if split else "one pool"))
+        except Exception as exc:               # a half-written .pt must not stop the list
+            print("%-34s %s" % (os.path.relpath(path), "unreadable: %s" % exc))
+    if affected:
+        print("")
+        print("%d of these were written by a run that had resumed before the pool "
+              "aliasing was fixed." % affected)
+        print("Resuming one is allowed: the farmer copies are kept, the buyer ones "
+              "dropped, and the run says so.")
+        print("A snapshot marked `one pool` is the cleaner place to carry on from "
+              "if you have one at a rung you are happy to redo from.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchard", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -303,6 +358,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="environment-only check with scripted agents (spec step 1)")
     p.add_argument("--compare", nargs="+", default=None,
                    help="finished run directories to overlay")
+    p.add_argument("--snapshots", nargs="?", type=str, const="runs", default=None,
+                   metavar="PATH",
+                   help="list the snapshots under PATH (a run folder, a snapshots "
+                        "folder, or one .pt; default runs/) with the rung, update and "
+                        "community each holds and whether its pool is intact, then exit")
     p.add_argument("--compare-out", type=str, default="runs/comparison")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--resume", type=str, default=None,
@@ -317,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.compare:
         return compare(args.compare, args.compare_out)
+    if args.snapshots:
+        return list_snapshots(args.snapshots)
 
     cfg = config_from_args(args)
     if args.smoke:
