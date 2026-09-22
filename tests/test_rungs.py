@@ -1226,3 +1226,217 @@ class TestVerdictUsesTheRungsChance(unittest.TestCase):
         v = assess(cfg_small(), final, 0.0)       # 0.0: the trading task's chance
         self.assertEqual(v["verdict"], "NO EMERGENCE")
         self.assertFalse(v["checks"]["learned_to_trade"])
+
+
+class TestAPerfectSpeakerPasses(unittest.TestCase):
+    """The bars are measured, so a flawless describer has to clear them.
+
+    ``TestEveryRungIsReachable`` hands ``evaluate_rung`` an evidence dict of
+    ones, which proves the *rule* can pass but never asks whether the
+    *measurements* can produce those numbers. They could not. ``name-all`` is
+    the only rung judged on message structure, and it is also the rung that
+    mixes queries most -- 70% whole things, 30% single fields -- so 30% of its
+    probes asked a perfect describer for one field and then scored its one-word
+    answer against all three. A flawless, fully compositional, noise-free
+    speaker measured that way reached field coverage 0.33-0.49 against a 0.30
+    bar and topsim 0.32 against its own shuffled null. A real run cannot beat
+    a perfect one, so the rung could not be left.
+    """
+
+    def _cfg(self):
+        cfg = Config()
+        cfg.model.d_model, cfg.model.d_ff = 48, 96
+        return cfg
+
+    def _perfect_speaker(self, cfg):
+        """Name exactly the field(s) asked for, one short word each."""
+        from orchard.curriculum import ASK_ALL
+        sp = cfg.channel.space_id
+        block = [0, cfg.world.n_varieties,
+                 cfg.world.n_varieties + cfg.world.n_colors]
+
+        def speak(m):
+            query = m[3]
+            if query != ASK_ALL:
+                return [block[query] + m[query]]
+            return [block[0] + m[0], sp, block[1] + m[1], sp, block[2] + m[2]]
+        return speak
+
+    def _measure(self, cfg, phase, n):
+        from orchard.properties import field_coverage
+        from orchard.world import K_EMPTY, K_FIELD
+        view = phase.views()[0]
+        kinds = M.phase_kinds(cfg, FARMER, view)
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
+        speak = self._perfect_speaker(cfg)
+        meanings = M.tuple_meanings(cfg, n, seed=7, phase=view,
+                                    query=M.probe_query(view))
+        msgs = [speak(m) for m in meanings]
+        cov = field_coverage(meanings, msgs, real, rng=random.Random(0))["coverage"]
+        ts = M.topographic_similarity(meanings, msgs, cfg, FARMER, metric="hamming",
+                                      rng=random.Random(0), kinds=kinds, n_null=2)
+        return cov, ts["topsim"] - ts["null_mean"]
+
+    def test_a_flawless_describer_clears_the_bars_it_is_judged_on(self):
+        cfg = self._cfg()
+        c = cfg.curriculum
+        for phase in ladder(cfg):
+            if not (phase.swaps and phase.whole):
+                continue            # only these rungs are judged on structure
+            for n in (100, 200):
+                cov, gap = self._measure(cfg, phase, n)
+                # Both metrics run to 1.0, and this speaker is flawless: it
+                # should be near the top of the scale, not a whisker above the
+                # bar. A real code is always worse than this one, so whatever
+                # margin is missing here is missing from every run.
+                self.assertGreaterEqual(
+                    cov, 0.75,
+                    "%s: a perfect describer covers only %.3f of each field over "
+                    "%d probes (bar %.2f) -- no real code can beat it"
+                    % (phase.name, cov, n, c.min_field_coverage))
+                self.assertGreaterEqual(
+                    gap, 0.75,
+                    "%s: a perfect describer is only %.3f clear of its own null "
+                    "over %d probes (bar %.2f)"
+                    % (phase.name, gap, n, c.min_topsim_over_null))
+
+    def test_the_bars_do_not_move_with_the_probe_count(self):
+        """Coverage is a plug-in estimate; its *ceiling* must not follow the sample.
+
+        Normalised by H(field) it did: the same perfect code read 0.50 over 100
+        probes and 0.93 over 800, so the light promotion check (half the probes)
+        was strictly harder to pass than the checkpoint one.
+        """
+        cfg = self._cfg()
+        phase = phase_named(cfg, "name-all")
+        scores = [self._measure(cfg, phase, n)[0] for n in (100, 200, 400)]
+        self.assertLess(max(scores) - min(scores), 0.1,
+                        "field coverage moved %.3f with the probe count alone: %s"
+                        % (max(scores) - min(scores), scores))
+
+    def test_a_describer_that_says_nothing_useful_still_fails(self):
+        """The debias must not turn the bar into a formality."""
+        from orchard.properties import field_coverage
+        from orchard.world import K_EMPTY, K_FIELD
+        cfg = self._cfg()
+        phase = phase_named(cfg, "name-all")
+        view = phase.views()[0]
+        kinds = M.phase_kinds(cfg, FARMER, view)
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
+        meanings = M.tuple_meanings(cfg, 200, seed=7, phase=view,
+                                    query=M.probe_query(view))
+        rng = random.Random(3)
+        noise = [[rng.randrange(cfg.channel.atomic_vocab) for _ in range(3)]
+                 for _ in meanings]
+        cov = field_coverage(meanings, noise, real, rng=random.Random(0))["coverage"]
+        self.assertLess(cov, cfg.curriculum.min_field_coverage,
+                        "a message unrelated to the meaning covered %.3f of each field"
+                        % cov)
+
+    def test_the_probes_ask_the_kind_the_rung_is_promoted_on(self):
+        from orchard.curriculum import ASK_ALL
+        cfg = self._cfg()
+        for phase in ladder(cfg):
+            view = phase.views()[0]
+            q = M.probe_query(view)
+            if not phase.tuples:
+                self.assertIsNone(q, "%s has no query slot to fix" % phase.name)
+                continue
+            if phase.referential:
+                self.assertEqual(q, phase.primary,
+                                 "%s probes a kind it is not promoted on" % phase.name)
+            asked = {m[3] for m in M.tuple_meanings(cfg, 40, seed=1, phase=view, query=q)}
+            self.assertEqual(asked, {q},
+                             "%s probed a mixture: %s" % (phase.name, sorted(asked)))
+        self.assertEqual(M.probe_query(phase_named(cfg, "name-all").views()[0]), ASK_ALL)
+
+    def test_a_probe_feeds_the_observation_the_rung_feeds(self):
+        """The query slot has its own embedding table, so a probe that writes a
+        value the rung never writes is measuring an off-distribution speaker.
+        ``mutual`` pads that slot; the naming rungs fill it with the query."""
+        from orchard.curriculum import ReferentialWorld
+        cfg = self._cfg()
+        gen = torch.Generator().manual_seed(0)
+        rw = ReferentialWorld(cfg, generator=gen)
+        for phase in ladder(cfg):
+            if not phase.tuples:
+                continue
+            view = phase.views()[0]
+            if phase.mutual:
+                real = rw.sample_mutual(8).obs(cfg, FARMER)
+            else:
+                real = rw.sample(8, informer=view.informer, mix=view.mix).obs(
+                    cfg, view.informer)
+            probe = M.tuple_meanings(cfg, 8, seed=2, phase=view,
+                                     query=M.probe_query(view))
+            played = set(real[:, 3].tolist())
+            self.assertIn(probe[0][3], played,
+                          "%s probes with query slot %d, which the rung never "
+                          "puts there (it plays %s)"
+                          % (phase.name, probe[0][3], sorted(played)))
+
+
+class TestSharedPoolIsNotComparedWithItself(unittest.TestCase):
+    """Below ``split_roles_at`` one pool fills both seats, so "the two roles"
+    are the same agents. Comparing them measured self-agreement: with two
+    founders half of every cross pair was an agent against itself, and the
+    checkpoint line read cross-role coherence 0.56 and overlap 0.87 for a pair
+    that shared no form at all (within-role coherence 0.16)."""
+
+    def test_cross_role_coherence_skips_the_same_agent_in_the_other_seat(self):
+        cfg = cfg_small()
+        tracker = M.StabilityTracker(cfg, M.World(cfg.world, random.Random(0)),
+                                     n_probes=6, seed=1)
+        torch.manual_seed(0)
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared, "the naming rungs are meant to share one pool")
+        self.assertIs(pop.farmers, pop.buyers)
+        phase = phase_named(cfg, "name-all")
+        out = tracker.measure(pop, M.World(cfg.world, random.Random(0)), phase=phase)
+        within = [out["coherence_farmer"], out["coherence_buyer"]]
+        cross = out["coherence_cross"]
+        # With two founders and self-pairs included, cross is pinned at
+        # 1 - d/2 -- always about halfway to 1 however foreign the two codes
+        # are. Excluding them, it can only be the honest between-agent number.
+        self.assertTrue(cross != cross or cross <= max(within) + 0.15,
+                        "cross-role coherence %.3f sits above the within-role "
+                        "numbers %s: self-pairs are still in it" % (cross, within))
+
+    def test_overlap_is_not_answered_while_one_pool_fills_both_seats(self):
+        cfg = cfg_small()
+        batch = _FakeBatch(cfg, [1, 2, 1, 2], [1, 2, 1, 2])
+        shared = cross_role_overlap(cfg, [batch], shared_pool=True)
+        self.assertTrue(shared["weighted_overlap"] != shared["weighted_overlap"],
+                        "a shared pool was scored as if it were two codes")
+        self.assertIn("note", shared)
+        split = cross_role_overlap(cfg, [batch], shared_pool=False)
+        self.assertAlmostEqual(split["weighted_overlap"], 1.0, places=6)
+
+
+class TestConventionsKnowWhatWasAsked(unittest.TestCase):
+    """A convention is a form *for a meaning*, and on a rung that asks different
+    questions about the same thing, the question is part of the meaning. Keyed
+    on the tuple alone, ``name-all``'s conventions blended the answers to "what
+    fruit?" and "what is it?" into one modal form."""
+
+    def test_the_same_tuple_asked_differently_is_a_different_convention(self):
+        cfg = cfg_small()
+        c = cfg.channel
+        u = PopulationUsage(cfg)
+        phase = phase_named(cfg, "name-all")
+        thing = [1, 2, 0]
+        whole = torch.tensor([thing + [3] + [0] * 8])      # ASK_ALL
+        fruit = torch.tensor([thing + [0] + [0] * 8])      # just the fruit
+        keys_whole = u._keys(phase, FARMER, whole)
+        keys_fruit = u._keys(phase, FARMER, fruit)
+        self.assertNotEqual(keys_whole, keys_fruit,
+                            "one key served two questions about the same thing")
+
+    def test_a_rung_with_no_query_slot_is_unchanged(self):
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        market = phase_named(cfg, "market")
+        obs = torch.zeros((2, 40), dtype=torch.long)
+        keys = u._keys(market, BUYER, obs)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])

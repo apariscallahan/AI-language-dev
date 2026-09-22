@@ -400,12 +400,28 @@ class RewardConfig:
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish
     # inventing: a form only counts once it has `convention_min_support` recent
-    # uses behind it. It comes on with the community. The founders now keep a
-    # dialect each through the naming rungs (nobody dies there any more), and
-    # with this folded into the costs, a community of 32 formed at `mutual` with
-    # nothing paying anyone to agree for five more rungs. The rarity cost stays
-    # with the costs: it charges a *new* word, which `ask-qty` and `quote` need.
-    convention_from_rung: str = "mutual"
+    # uses behind it. The rarity cost stays with the costs: it charges a *new*
+    # word, which `ask-qty` and `quote` need.
+    #
+    # It used to wait for the community at `mutual`, on the reasoning that this
+    # is a pressure to agree and two founders are not a community. What that
+    # left was four rungs in which nothing at all paid a speaker for saying the
+    # same thing twice -- not to its partner, and not to itself. Measured on the
+    # run this was changed for, at `name-all`: within-role coherence 0.15-0.17,
+    # so the two founders shared no form; and 686 distinct words over sampled
+    # play for a meaning space of 64 things, which is not a large vocabulary but
+    # a speaker unsure of its own (a flawless 12-word code emitted at 98%
+    # per-symbol accuracy already reads as ~170).
+    #
+    # `name-all` is where it belongs by the same rule the costs follow -- off
+    # while a rung still has to invent a word, on at the first rung that only
+    # reuses them. Fruit, colour and quality were each invented and promoted
+    # below it; its own job is to say three of them at once. And the documented
+    # collapse (everyone on one short form) is not available to this term: it is
+    # contrastive, so a form that fits every meaning scores its similarity to
+    # this meaning's convention minus its similarity to every other meaning's,
+    # which is zero.
+    convention_from_rung: str = "name-all"
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were

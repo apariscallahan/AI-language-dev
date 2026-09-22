@@ -108,7 +108,7 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 
 ```
 [checkpoint 96] rung name-all | success 0.315 (muted 0.345) / 0.375 (muted 0.340) | channel 0.00 of headroom | buyer coverage 0.071 [0.08 0.03 0.11]; farmer coverage 0.081 [0.08 0.06 0.11]
-    coherence farmer 0.278 buyer 0.278 across 0.519 | overlap 0.535 | 107 words, 1.43 atoms/word, 1.73 words/utterance, 0% silent, 0% at buffer end
+    coherence farmer 0.278 buyer 0.278 across 0.278 | overlap n/a | 107 words sampled, 9 said, 1.43 atoms/word, 1.73 words/utterance, 0% silent, 0% at buffer end
 ```
 
   (That one is from a 96-update test run, so it is still at chance.) The two
@@ -117,6 +117,16 @@ pass, so growth never eats a rung's time. The pool stays one pool until
   quality**. `silent` is always 0% — every turn has to open with a word, because
   silence is what the muted control sounds like — and `at buffer end` should be
   near 0; if it climbs, agents are babbling into the cap.
+
+  The two word counts are different questions. **`words sampled`** is every
+  form the speakers' policies emitted in evaluation play, so it counts variants
+  as well as words — a flawless 12-word code emitted at 98% per-symbol accuracy
+  already reads as ~170. **`said`** is the greedy lexicon: what the describers
+  actually say when asked. A wide gap between them is a speaker unsure of its
+  own words, not a large vocabulary. `overlap` reads `n/a` until the roles
+  split, because below that one pool fills both seats and there are not two
+  codes to compare; `across` is cross-role coherence with those self-pairs
+  excluded, so on a shared pool it is simply the honest between-agent number.
 
   On a request rung the same line also names each field of the order and how
   often it arrived, which is the number to watch there:
@@ -232,7 +242,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `population.founders_farmers/_buyers` | how many agents found the community. 0 = start at full size, which does not work above 2 + 2. |
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
 | `reward.costs_from_rung` | the rung from which the speaker pays for length and for new words (`offer`, the first rung that invents no new word). Earlier, the cheapest way to be short is to say the same short nothing. |
-| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`mutual`, when the community arrives). It cannot punish a new word -- a form only counts once it has 12 recent uses. |
+| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, the first rung that invents no word of its own -- it only has to say three that already exist). It cannot punish a new word -- a form only counts once it has 12 recent uses -- and it cannot collapse the language, because it is contrastive. Waiting for `mutual` left four rungs in which nothing paid a speaker for repeating itself: two founders with no form in common (coherence 0.15-0.17) and 686 distinct words over sampled play for a 64-thing world. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
 | `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the request rungs included -- they run in both directions. |
 | `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |
@@ -449,6 +459,9 @@ and no device-specific arithmetic.
 | success at chance past ~1,000 updates in `name-fruit` | a real failure, not slowness. Check the header: speaker costs and hindsight should be off, the pool should be 2 + 2. |
 | `silent` above 0% | it cannot be: every turn has to open with a word (`channel.allow_silence`). Check the header's method line for a change to it. |
 | ~1 word per utterance on a rung that is still inventing words | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
+| a big "words sampled" count next to a small "said" count | not a large vocabulary: the first is over sampled play and counts every variant the policy emits, the second is the greedy lexicon. A wide gap is a speaker unsure of its own words — check that the convention bonus is on (the header's speaker-pressures line). |
+| `name-all` flat at ~0.8 with everything else passing | it was the structure bars, twice over: the probes followed the rung's 70/30 mixture of questions while the metrics ignore which was asked, and field coverage was normalised by `H(field)` rather than by its own headroom. A perfect describer scored 0.33-0.49 coverage against a 0.30 bar. Both are fixed; `tests/test_rungs.py::TestAPerfectSpeakerPasses` holds them. |
+| `coherence across` or `cross-role overlap` looking healthy in a naming rung | below `curriculum.split_roles_at` one pool fills both seats, so those compare agents with themselves. Cross-role coherence now skips self-pairs and overlap reads `n/a`; the number to read is the per-role coherence. |
 | a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
 | a rung stops the run | read the criteria it names in the log and in `promotions.jsonl`. Do not relax them to make it pass — they are the experiment. |
 | out of memory in the first batch | `--set train.grad_checkpoint=true`, then a smaller batch. See §10. |

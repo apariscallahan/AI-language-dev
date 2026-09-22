@@ -119,7 +119,10 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
     elif zs.get("suppressed"):
         ev.append("zero-shot retention not reported (%s)" % zs["suppressed"])
     ov = final.get("cross_role_overlap") or {}
-    if nn(ov.get("weighted_overlap")) == nn(ov.get("weighted_overlap")):
+    if ov.get("shared_pool"):
+        ev.append("cross-role vocabulary overlap not yet askable: one pool of agents "
+                  "fills both seats until `curriculum.split_roles_at`")
+    elif nn(ov.get("weighted_overlap")) == nn(ov.get("weighted_overlap")):
         ev.append("cross-role vocabulary overlap %.2f (histogram intersection of the "
                   "two roles' word use; 1.0 = one shared vocabulary)"
                   % ov["weighted_overlap"])
@@ -346,10 +349,15 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
     rows.append(("coherence", "farmer %s, buyer %s, across roles %s"
                  % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                     f(st.get("coherence_cross")))))
-    rows.append(("cross-role vocabulary overlap", f(ov.get("weighted_overlap"))))
-    rows.append(("vocabulary", "%s distinct words, %s atoms per word, %s words and %s symbols "
-                 "per utterance, %s of utterances at the buffer end"
-                 % (w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
+    rows.append(("cross-role vocabulary overlap",
+                 "not yet askable (one pool fills both seats)" if ov.get("shared_pool")
+                 else f(ov.get("weighted_overlap"))))
+    lex = max([(sp.get("lexicon_size") or 0) for sp in prs.values()] or [0])
+    rows.append(("vocabulary", "%s distinct words over sampled play, %s said when asked "
+                 "(greedy); %s atoms per word, %s words and %s symbols per utterance, "
+                 "%s of utterances at the buffer end"
+                 % (w.get("distinct_words", "n/a"), lex or "n/a",
+                    f(w.get("mean_word_len_atoms"), "%.2f"),
                     f(w.get("mean_words_per_message"), "%.2f"),
                     f(w.get("mean_symbols_per_message"), "%.2f"),
                     f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%"))))
@@ -615,8 +623,20 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     if words:
         A("| property | value | what it means |")
         A("|---|---|---|")
-        A("| distinct words | %d | out of %d possible one-atom words alone |"
-          % (int(g(words, "distinct_words", 0)), cfg.channel.atomic_vocab))
+        A("| distinct words (sampled play) | %d | every form the speakers' policies "
+          "emitted, so it counts variants as well as words: a flawless 12-word code "
+          "emitted at 98%% per-symbol accuracy reads as ~170 |"
+          % int(g(words, "distinct_words", 0)))
+        lex = [(k, sp.get("lexicon_size"), sp.get("distinct_forms"))
+               for k, sp in sorted((final.get("per_role_structure") or {}).items())
+               if sp.get("lexicon_size")]
+        for k, n_words, n_forms in lex:
+            A("| lexicon, %s (greedy) | %d words | what the %s describers actually say "
+              "when asked, over %s distinct whole utterances; the gap to the row above "
+              "is how unsure of its own words the speaker is |"
+              % (k, int(n_words), k,
+                 ("%.0f" % n_forms) if isinstance(n_forms, (int, float)) and n_forms == n_forms
+                 else "?"))
         A("| word entropy | %.2f bits | low means a couple of forms dominate |"
           % g(words, "word_entropy_bits", 0.0))
         A("| atoms per word | %.2f (longest %d) | above 1 means the hyphen is doing work |"
@@ -638,16 +658,21 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
         A("| coherence across roles | %.3f | a farmer and a buyer describing the same "
           "meaning the same way (lineup rungs only) |" % g(stab, "coherence_cross"))
         ov = final.get("cross_role_overlap") or {}
-        A("| cross-role overlap | %.3f | histogram intersection of the two roles' word "
-          "use: 1.0 is one shared vocabulary, 0.0 two foreign codes |"
-          % g(ov, "weighted_overlap"))
-        A("| shared-form share | farmer %.0f%% / buyer %.0f%% | of each role's word "
-          "tokens, the share that are forms the other role also uses |"
-          % (100 * g(ov, "farmer_share_shared"), 100 * g(ov, "buyer_share_shared")))
-        A("| shared forms (types) | %s of %s farmer / %s buyer (Jaccard %.3f) | the "
-          "one-off tail drags this down |"
-          % (ov.get("shared_types", "-"), ov.get("farmer_types", "-"),
-             ov.get("buyer_types", "-"), g(ov, "jaccard_types")))
+        if ov.get("shared_pool"):
+            A("| cross-role overlap | not yet askable | one pool fills both seats "
+              "below `curriculum.split_roles_at`, so the same agents speak in both: "
+              "there are not two codes to compare |")
+        else:
+            A("| cross-role overlap | %.3f | histogram intersection of the two roles' word "
+              "use: 1.0 is one shared vocabulary, 0.0 two foreign codes |"
+              % g(ov, "weighted_overlap"))
+            A("| shared-form share | farmer %.0f%% / buyer %.0f%% | of each role's word "
+              "tokens, the share that are forms the other role also uses |"
+              % (100 * g(ov, "farmer_share_shared"), 100 * g(ov, "buyer_share_shared")))
+            A("| shared forms (types) | %s of %s farmer / %s buyer (Jaccard %.3f) | the "
+              "one-off tail drags this down |"
+              % (ov.get("shared_types", "-"), ov.get("farmer_types", "-"),
+                 ov.get("buyer_types", "-"), g(ov, "jaccard_types")))
         A("")
         if ov.get("farmer_only_top") or ov.get("buyer_only_top"):
             A("Role-specific forms (commonest first): farmer-only %s; buyer-only %s. "

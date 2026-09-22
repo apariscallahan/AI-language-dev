@@ -291,13 +291,24 @@ def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
 
 
 def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
-                   held_out: bool = False) -> list[tuple[int, ...]]:
+                   held_out: bool = False, query: Optional[int] = None
+                   ) -> list[tuple[int, ...]]:
     """(fruit, colour, quality) things to describe, plus the field being asked about.
 
     The describer's observation in a naming rung is the thing *and* the query, so
     a probe that left the query out would be asking about the wrong rung: in
     ``name-color`` every probe has to say "colour" for the answer to mean
     anything.
+
+    ``query`` fixes the question every probe asks.  The structure metrics pass
+    the rung's own ``primary`` kind, because they score a message against the
+    *whole* tuple and have no way to know a probe only asked for one field of
+    it: on a mixed rung like ``name-all`` (70% whole things, 30% single fields)
+    a perfect describer answers 30% of the probes with one word, and those
+    answers are read as two fields randomly dropped.  Left to the mixture, that
+    alone caps a flawless speaker's field coverage at 0.7 of the estimator's own
+    ceiling.  ``None`` keeps the rung's mixture, which is what the report wants
+    when it is describing what the rung actually plays.
     """
     from .curriculum import ASK_ALL, ReferentialWorld
     from .world import n_obs_slots
@@ -306,13 +317,16 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
     rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
-    mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
-    total = float(sum(mix)) or 1.0
-    # The probe asks the fields the rung asks, as often as the rung asks them.
-    asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
-    asks = (asks + [ASK_ALL] * n)[:n]
-    perm = torch.randperm(n, generator=g).tolist()
-    asks = [asks[i] for i in perm]
+    if query is not None:
+        asks = [int(query)] * n
+    else:
+        mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
+        total = float(sum(mix)) or 1.0
+        # The probe asks the fields the rung asks, as often as the rung asks them.
+        asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
+        asks = (asks + [ASK_ALL] * n)[:n]
+        perm = torch.randperm(n, generator=g).tolist()
+        asks = [asks[i] for i in perm]
     out = []
     for i, r in enumerate(rows):
         row = tuple(r) + (asks[i],)
@@ -320,13 +334,38 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     return out
 
 
+def probe_query(phase) -> Optional[int]:
+    """What goes in the query slot of a structure probe on this rung.
+
+    A naming rung is promoted on the kind of round it introduces -- everything
+    else about it is rehearsal -- so its describer's code is measured on that
+    kind too, and the probe asks ``phase.primary``.
+
+    ``mutual`` has the same observation *schema* (a tuple and a query slot) but
+    never fills the query in: :meth:`MutualBatch.obs` pads it with zeros,
+    because both sides simply hold a thing and nobody is asked about a field.
+    The probes were writing ASK_ALL there, which is a value that slot never
+    takes in training, and ``K_FIELD`` has its own embedding table -- so every
+    structure number on ``mutual`` was read off an observation the speaker had
+    never been trained on. The probe feeds what the rung feeds.
+
+    ``None`` outside the tuple rungs, where there is no query slot at all.
+    """
+    if phase is None or not getattr(phase, "tuples", False):
+        return None
+    if getattr(phase, "mutual", False):
+        return 0
+    return int(getattr(phase, "primary", 3))
+
+
 def sample_meanings(cfg: Config, world: World, role: int, n: int,
                     *, held_out: bool | None = False, phase=None,
-                    seed: Optional[int] = None) -> list[tuple[int, ...]]:
+                    seed: Optional[int] = None,
+                    query: Optional[int] = None) -> list[tuple[int, ...]]:
     if phase is not None and phase.tuples:
         return tuple_meanings(cfg, n, seed if seed is not None
                               else random.Random().randrange(1 << 30),
-                              phase=phase, held_out=bool(held_out))
+                              phase=phase, held_out=bool(held_out), query=query)
     from .world import n_obs_slots
     width = n_obs_slots(cfg.world, cfg)
     out = []
@@ -401,6 +440,10 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
 
     A role that does not speak in the phase is reported as NaN with
     ``silent`` set, rather than probed anyway -- a lineup guesser never talks.
+
+    Every probe asks the rung's own kind of round (:func:`probe_query`), so a
+    describer is measured on the job the rung is promoted for rather than on a
+    blend of that and the rehearsal rounds mixed in beneath it.
     """
     rng = rng or random.Random(0)
     out: dict[str, Any] = {}
@@ -415,7 +458,8 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
         kinds = phase_kinds(cfg, role, view)
         ctx = opening_context(cfg, pop, world, view, device)
         meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
-                                   seed=rng.randrange(1 << 30))
+                                   seed=rng.randrange(1 << 30),
+                                   query=probe_query(view))
         per_agent = []
         from .properties import disentanglement
         real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
@@ -423,6 +467,8 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
         cap = max(1, cfg.log.max_agents_probed)
         if len(pool) > cap:
             pool = random.Random(cfg.train.seed + len(pool)).sample(pool, cap)
+        from .env import parse_words
+        lexicon: set = set()
         for agent in pool:
             msgs = utterances_for_meanings(cfg, agent, meanings, context=ctx,
                                            device=device, phase=view, role=role)
@@ -433,11 +479,16 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
             dis = disentanglement(meanings, msgs, real, cfg.channel.max_msg_len)
             from .properties import field_coverage
             cov = field_coverage(meanings, msgs, real, rng=rng)
+            mine = {tuple(w) for m in msgs for w in parse_words(cfg, m)}
+            lexicon |= mine
             per_agent.append({"agent": agent.name, "generation": agent.generation,
                               "topsim": r["topsim"], "null": r["null_mean"],
                               "z": r["z"], "topsim_l1": r_l1["topsim"],
                               "posdis": dis["posdis"], "bosdis": dis["bosdis"],
                               "field_coverage": cov["coverage"],
+                              "distinct_forms": len({tuple(m) for m in msgs}),
+                              "distinct_words": len(mine),
+                              "n_probes": len(msgs),
                               "per_field": cov["per_field"]})
         vals = [a["topsim"] for a in per_agent if a["topsim"] == a["topsim"]]
         l1s = [a["topsim_l1"] for a in per_agent if a["topsim_l1"] == a["topsim_l1"]]
@@ -453,6 +504,15 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
             "posdis": avg("posdis"),
             "bosdis": avg("bosdis"),
             "field_coverage": avg("field_coverage"),
+            # How many different things a speaker says at all, over probes it
+            # answers deterministically. Beside the sampled word count this
+            # separates a large lexicon from a speaker that is merely unsure:
+            # a flawless 12-word code, emitted with 98% per-symbol accuracy,
+            # shows up as ~170 distinct sampled words.
+            "distinct_forms": avg("distinct_forms"),
+            "distinct_words": avg("distinct_words"),
+            "lexicon_size": len(lexicon),
+            "n_probes": per_agent[0]["n_probes"] if per_agent else 0,
             "per_field_coverage": [
                 (sum(a["per_field"][i] for a in per_agent) / len(per_agent))
                 for i in range(len(per_agent[0]["per_field"]))] if per_agent else [],
@@ -594,8 +654,18 @@ class StabilityTracker:
         cross = float("nan")
         if ("farmer" in by_role and "buyer" in by_role
                 and kind_of["farmer"] == kind_of["buyer"]):
+            # Below `split_roles_at` one pool fills both seats, so row i of each
+            # list is the *same agent* in the other seat. Comparing it with
+            # itself asks whether an agent agrees with itself, which it does,
+            # and with two founders that was half of every pair: cross read
+            # 0.56 where the honest number -- the two founders sharing no form
+            # at all -- was 0.16. Training never seats an agent opposite
+            # itself, and neither does this.
+            shared = getattr(pop, "shared", False)
             d = [normalised_levenshtein(a, b)
-                 for fm in by_role["farmer"] for bm in by_role["buyer"]
+                 for i, fm in enumerate(by_role["farmer"])
+                 for j, bm in enumerate(by_role["buyer"])
+                 if not (shared and i == j)
                  for a, b in zip(fm, bm)]
             cross = 1.0 - sum(d) / len(d) if d else float("nan")
         vals = [v for v in coherence.values() if v == v]
@@ -1104,6 +1174,10 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             "bosdis": c.get("bosdis", float("nan")),
             "field_coverage": c.get("field_coverage", float("nan")),
             "per_field_coverage": c.get("per_field_coverage", []),
+            "distinct_forms": c.get("distinct_forms", float("nan")),
+            "distinct_words": c.get("distinct_words", float("nan")),
+            "lexicon_size": c.get("lexicon_size", 0),
+            "n_probes": c.get("n_probes", 0),
             "positional": positional_structure(sem.per_position.get(label, [])),
             "positional_rows": sem.per_position.get(label, []),
         }
@@ -1299,7 +1373,8 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
         real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
         ctx = opening_context(cfg, pop, world, view, device)
         meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
-                                   seed=rng.randrange(1 << 30))
+                                   seed=rng.randrange(1 << 30),
+                                   query=probe_query(view))
         agents = pop.pool(role)
         msgs: list[list[int]] = [[] for _ in meanings]
         # one batched greedy decode per agent over its share of the meanings

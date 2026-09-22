@@ -461,6 +461,12 @@ class Trainer:
     def gather_evidence(self, phase, *, light: bool) -> dict[str, Any]:
         lg = self.cfg.log
         n_eval = lg.ablation_episodes // (2 if light else 1)
+        # The light check halves the episode and topsim budgets, which only adds
+        # noise to the estimates. It used to move the *bar* as well: field
+        # coverage was normalised by H(field), so its ceiling rose with the
+        # probe count and the frequent check was strictly harder to pass than
+        # the checkpoint one. `properties.field_coverage` now divides by the
+        # headroom its own shuffled null leaves, which is steady in the sample.
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
@@ -1010,7 +1016,8 @@ class Trainer:
                                 sampler_for=self.phase_sampler)
         # ---- addendum section 3 ------------------------------------------
         words = word_stats(cfg, batches)
-        overlap = cross_role_overlap(cfg, batches)
+        overlap = cross_role_overlap(cfg, batches,
+                                     shared_pool=getattr(self.pop, "shared", False))
         qty_live = live_encoding(cfg, batches, field=1, given=0)
         lenfreq = length_frequency(cfg, self.pop, self.world, device=self.device,
                                    phase=phase)
@@ -1075,6 +1082,9 @@ class Trainer:
                     "posdis": v.get("posdis"), "bosdis": v.get("bosdis"),
                     "field_coverage": v.get("field_coverage"),
                     "per_field_coverage": v.get("per_field_coverage"),
+                    "distinct_forms": v.get("distinct_forms"),
+                    "lexicon_size": v.get("lexicon_size"),
+                    "n_probes": v.get("n_probes"),
                     "slots": v.get("positional_rows", [])}
                 for k, v in speakers.items()},
             "context_consistency": self._context_consistency(phase),
@@ -1199,13 +1209,25 @@ class Trainer:
                      sp.get("field_coverage", float("nan")) if sp.get("field_coverage")
                      is not None else float("nan"),
                      [round(x, 2) for x in (sp.get("per_field_coverage") or [])]))
+                if sp.get("lexicon_size"):
+                    L("         lexicon: %d words in %s whole utterances over %s probes, "
+                      "greedily decoded -- what the speakers say, as against what their "
+                      "policies emit when sampled"
+                      % (int(sp["lexicon_size"]),
+                         ("%.0f" % sp["distinct_forms"]) if sp.get("distinct_forms") else "?",
+                         sp.get("n_probes", "?")))
             ov = row.get("cross_role_overlap") or {}
-            L("  cross-role overlap: %.3f weighted (farmer %.0f%% / buyer %.0f%% of word "
-              "tokens are shared forms; Jaccard %.3f)"
-              % (ov.get("weighted_overlap", float("nan")),
-                 100 * ov.get("farmer_share_shared", float("nan")),
-                 100 * ov.get("buyer_share_shared", float("nan")),
-                 ov.get("jaccard_types", float("nan"))))
+            if ov.get("shared_pool"):
+                L("  cross-role overlap: not yet askable -- one pool fills both seats "
+                  "until `%s`, so the two roles are the same agents"
+                  % cfg.curriculum.split_roles_at)
+            else:
+                L("  cross-role overlap: %.3f weighted (farmer %.0f%% / buyer %.0f%% of word "
+                  "tokens are shared forms; Jaccard %.3f)"
+                  % (ov.get("weighted_overlap", float("nan")),
+                     100 * ov.get("farmer_share_shared", float("nan")),
+                     100 * ov.get("buyer_share_shared", float("nan")),
+                     ov.get("jaccard_types", float("nan"))))
             q = row.get("quantity_encoding_live") or {}
             if q.get("n", 0) >= 50:
                 L("  quantity in live messages: %.3f bits beyond variety (shuffled-null "
@@ -1474,12 +1496,21 @@ class Trainer:
             % ("{:,}".format(self.episode), row.get("phase"), succ,
                f(ev.get("transfer"), "%.2f"), zs, per_field,
                "; ".join(roles) or "no speakers probed"))
+        # Two word counts, because one of them was being read as the vocabulary
+        # and is not. The first is over *sampled* play, so it counts every
+        # variant the speaker's policy happens to emit: a flawless 12-word code
+        # emitted at 98% per-symbol accuracy shows up there as ~170 words. The
+        # second is what the speakers actually say when asked -- the same greedy
+        # decode every structure metric uses -- and is the lexicon.
+        lex = max([sp.get("lexicon_size", 0) or 0
+                   for sp in (row.get("per_role_structure") or {}).values()] or [0])
         self.log.always(
-            "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "
-            "%s words/utterance, %s silent, %s at buffer end"
+            "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
+            "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end"
             % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
-               w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
+               w.get("distinct_words", "n/a"), lex or "n/a",
+               f(w.get("mean_word_len_atoms"), "%.2f"),
                f(w.get("mean_words_per_message"), "%.2f"),
                f(100 * w.get("silent_frac", float("nan")), "%.0f%%"),
                f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%")))

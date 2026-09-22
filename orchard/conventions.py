@@ -83,6 +83,21 @@ def n_real_fields(cfg: Config, role: int, phase) -> int:
     return sum(1 for k in phase_schema(cfg, role, phase) if k not in (K_EMPTY, K_FIELD))
 
 
+def query_slots(cfg: Config, role: int, phase) -> list[int]:
+    """Observation slots holding *what was asked*, not what is being described.
+
+    A convention is a form for a meaning, and on a rung that asks different
+    questions about the same thing the question is part of the meaning: in
+    ``name-all`` the same (fruit, colour, quality) is asked about as a whole in
+    70% of rounds and one field at a time in the rest, and the right answers are
+    different utterances. Keyed on the tuple alone, one meaning's "convention"
+    was the modal of a blend of answers to different questions, so matching it
+    could not be right more than most of the time.
+    """
+    from .curriculum import phase_schema
+    return [i for i, k in enumerate(phase_schema(cfg, role, phase)) if k == K_FIELD]
+
+
 class PopulationUsage:
     """Decayed counts of recent words, and of recent utterances per meaning.
 
@@ -182,7 +197,12 @@ class PopulationUsage:
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
         n = n_real_fields(self.cfg, role, phase)
         kind = phase.meaning_kind(role)
-        return [(kind,) + tuple(r) for r in obs[:, :n].tolist()]
+        q = query_slots(self.cfg, role, phase)
+        asked = obs[:, q].tolist() if q else None
+        rows = obs[:, :n].tolist()
+        if asked is None:
+            return [(kind,) + tuple(r) for r in rows]
+        return [(kind,) + tuple(a) + tuple(r) for r, a in zip(rows, asked)]
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
