@@ -35,9 +35,9 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
-from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
-                         convention_applies, evaluate_rung, growth_applies,
-                         ladder, rung_budget, turnover_applies)
+from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
+                         costs_apply, evaluate_rung, growth_applies, ladder,
+                         pooled_at, rung_budget, turnover_applies)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -666,8 +666,42 @@ class Trainer:
                 setattr(a, k, rec[k])
             a.updates = int(rec.get("updates", 0))
             return a
+        # One pool fills both seats below `curriculum.split_roles_at`, and the
+        # two lists are then *the same list*. Restoring each of them separately
+        # quietly made two copies of every founder -- same agent_id, same
+        # weights, then their own gradients from the first update on -- so a
+        # resumed run below the split trained twice the population it reported
+        # and broke the one-language invariant the rung exists to build. It
+        # surfaced as a crash one rung later: the first newcomer appended to
+        # `farmers` alone, and `pair` -- which uses the farmer count for both
+        # seats when the pool is shared -- handed out a buyer index the buyer
+        # list did not have. Whether the pool is shared is decided by this
+        # run's config and the rung being resumed into, not by the snapshot,
+        # because a resumed run runs under the configuration it is given.
+        self.pop.shared = pooled_at(self.cfg, cur.phase)
         self.pop.farmers = [restore(r) for r in st["farmers"]]
-        self.pop.buyers = [restore(r) for r in st["buyers"]]
+        if self.pop.shared:
+            saved = [r["agent_id"] for r in st["buyers"]]
+            if saved != [a.agent_id for a in self.pop.farmers]:
+                self.log.always(
+                    "  [resume] this rung pools both seats, but the snapshot holds a "
+                    "separate buyer list (%s against %s). It was written under a "
+                    "different `curriculum.split_roles_at`; keeping the farmers."
+                    % (saved, [a.agent_id for a in self.pop.farmers]))
+            elif self._pool_had_split(st):
+                # Written by a run that had itself resumed under the bug: the
+                # ids still match, because the copies were restored from the
+                # same records, but they have been training apart ever since.
+                self.log.always(
+                    "  [resume] this snapshot's two seats hold the same agent ids but "
+                    "different weights, so it was written by a run that had split its "
+                    "shared pool into copies (the resume bug fixed in `pooled_at`). "
+                    "Keeping the farmer copies and dropping the buyer ones; the pool "
+                    "is one language again, but the two had drifted apart, so expect "
+                    "the rung to need a stretch to re-settle.")
+            self.pop.buyers = self.pop.farmers
+        else:
+            self.pop.buyers = [restore(r) for r in st["buyers"]]
         self.pop._next_id = int(st["next_id"])
         self.pop.deaths = int(st["deaths"])
         self.pop.births = [BirthEvent(**b) for b in st["births"]]
@@ -698,6 +732,25 @@ class Trainer:
                                ("; dropped %d conventions recorded under the older "
                                 "key format, which rebuild within an update"
                                 % self._stale_forms) if self._stale_forms else ""))
+
+    @staticmethod
+    def _pool_had_split(st: dict) -> bool:
+        """Did the run that wrote this snapshot have a pool of duplicates?
+
+        A healthy shared pool saves the same agents twice, so the two lists are
+        identical tensor for tensor. Copies that have been trained apart are
+        not, and that is the signature of a resume taken before `pooled_at`
+        restored the aliasing.
+        """
+        for fa, ba in zip(st.get("farmers") or [], st.get("buyers") or []):
+            fn, bn = fa.get("net") or {}, ba.get("net") or {}
+            if fn.keys() != bn.keys():
+                return True
+            for k, x in fn.items():
+                y = bn[k]
+                if x.shape != y.shape or not torch.equal(x.cpu(), y.cpu()):
+                    return True
+        return False
 
     def maybe_grow(self) -> None:
         """Newcomers join once the founders have a working language."""

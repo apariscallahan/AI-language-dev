@@ -404,8 +404,13 @@ positional structure 0.03 while the buyer's had 0.39, and every farmer newborn's
 token accuracy was 0.000).
 
 Until `haggle` **both seats are filled from one pool of agents**, so there is
-one language rather than two that have to be reconciled afterwards. An agent is
-never seated opposite itself — not in training (`Population.pair`), and not in
+one language rather than two that have to be reconciled afterwards. `farmers`
+and `buyers` are literally the same list, and everything that rebuilds the
+population has to keep it that way (`curriculum.pooled_at`): restoring the two
+saved lists separately, as resuming used to, made two copies of every founder
+that then trained apart -- twice the reported population, two languages, and an
+`IndexError` one rung later when the first newcomer grew only one of the lists.
+An agent is never seated opposite itself — not in training (`Population.pair`), and not in
 any measurement either. The measurements used to draw the two seats
 independently, so with two founders half of every promotion check was an agent
 reading its *own* words, which training never asks for. Two founders who had

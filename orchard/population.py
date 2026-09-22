@@ -187,7 +187,17 @@ class Population:
         i = torch.arange(n, device=device)
         if self.shared:
             # One pool: seat A is agent i % n, seat B is a *different* agent, and
-            # over a batch every ordered pair comes up equally often.
+            # over a batch every ordered pair comes up equally often. That only
+            # works because the two lists are the same list -- said out loud
+            # here, because when a resume quietly rebuilt them as two, this
+            # branch went on handing out buyer indices from the farmer count and
+            # the failure surfaced as an IndexError deep in the rollout.
+            if self.farmers is not self.buyers:
+                raise AssertionError(
+                    "the pool is marked shared but farmers and buyers are "
+                    "different lists (%d and %d agents). Both seats must come "
+                    "from one list below `curriculum.split_roles_at`."
+                    % (nf, nb))
             if nf < 2:
                 return i % nf, i % nf
             a = i % nf
