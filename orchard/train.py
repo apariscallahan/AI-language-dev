@@ -139,6 +139,8 @@ class Trainer:
         self.lineup_log = JsonlLog(out_dir, "lineups.jsonl")
         # every promotion check, passed or not, with the criteria it applied
         self.promotion_log = JsonlLog(out_dir, "promotions.jsonl")
+        # set by load_snapshot; named here so the banner never depends on a resume
+        self._stale_forms = 0
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # Training scenarios are drawn on device, a whole batch at a time. The
@@ -676,6 +678,11 @@ class Trainer:
         u.forms = defaultdict(lambda: defaultdict(float),
                               {k: defaultdict(float, v) for k, v in us["forms"].items()})
         u.form_total = defaultdict(float, us["form_total"])
+        # A snapshot from before the convention key carried *what was asked*
+        # stores keys of a different shape. They cost nothing to keep except a
+        # contrast set full of meanings that are no longer what those keys
+        # denote, and they rebuild within one update, so they go.
+        self._stale_forms = u.drop_stale_forms()
         so = st["store"]
         self.store._buf = list(so["buf"])[:self.store.capacity]
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
@@ -686,8 +693,11 @@ class Trainer:
         self.failure_counts = dict(st["failure_counts"])
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
-        self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s"
-                            % (path, self.updates, self.episode, cur.phase.name))
+        self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
+                            % (path, self.updates, self.episode, cur.phase.name,
+                               ("; dropped %d conventions recorded under the older "
+                                "key format, which rebuild within an update"
+                                % self._stale_forms) if self._stale_forms else ""))
 
     def maybe_grow(self) -> None:
         """Newcomers join once the founders have a working language."""

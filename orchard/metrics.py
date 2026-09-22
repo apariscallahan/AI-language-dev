@@ -229,6 +229,12 @@ def greedy_turn(cfg: Config, agent: Agent, obs: torch.Tensor, tokens: torch.Tens
 
 
 def _strip(cfg: Config, row: Sequence[int]) -> list[int]:
+    """Drop the padding from one already-on-host row of symbols.
+
+    ``row`` must not be a device tensor: iterating one element by element
+    synchronises the device on every symbol. Callers with a batch bring the
+    whole thing across once (see :func:`utterances_for_meanings`).
+    """
     return [int(t) for t in row if int(t) != cfg.channel.pad_id]
 
 
@@ -273,7 +279,12 @@ def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequen
         tokens[:, :turn * L] = context[:turn * L].unsqueeze(0)
     greedy_turn(cfg, agent, obs, tokens, turn, schema=phase_schema(cfg, seat, ph),
                 self_mask=ph.self_mask(cfg, seat, device))
-    return [_strip(cfg, tokens[i, turn * L:(turn + 1) * L]) for i in range(n)]
+    # One transfer for the batch. Per row it was one device synchronisation per
+    # symbol -- 24 of them per probe, times every probe and every agent, at
+    # every promotion check.
+    pad = c.pad_id
+    return [[t for t in row if t != pad]
+            for row in tokens[:, turn * L:(turn + 1) * L].tolist()]
 
 
 def phase_kinds(cfg: Config, role: int, phase=None) -> list[int]:
