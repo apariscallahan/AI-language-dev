@@ -134,9 +134,18 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
 
     from .gumbel import run_and_update_gumbel
 
-    from .curriculum import ReferentialWorld, phase_named
+    from .curriculum import (ReferentialWorld, convention_applies, costs_apply,
+                             phase_named)
+    from .conventions import PopulationUsage
     rw = ReferentialWorld(cfg, device=str(dev),
                           generator=torch.Generator(device=dev).manual_seed(1))
+    # The speaker's own terms are host-side Python (edit distances against the
+    # population's recent forms) and are a real share of an update on the rungs
+    # that have them on, so the benchmark plays each rung with the gates that
+    # rung would actually run under. Timing them off flattered every rung from
+    # `name-all` up. The warm-up step is what gives the record enough support
+    # for the convention bonus to be live by the time anything is timed.
+    usage = PopulationUsage(cfg)
 
     def one_step(phase, n):
         fi, bi = pop.pair(n, device=str(dev))
@@ -147,7 +156,11 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
         else:
             sb = tw.sample(n)
         run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, fi, bi,
-                              update=100, device=str(dev), phase=phase)
+                              update=100, device=str(dev), phase=phase,
+                              usage=usage,
+                              cost_scale=1.0 if costs_apply(cfg, phase) else 0.0,
+                              convention_scale=(1.0 if convention_applies(cfg, phase)
+                                                else 0.0))
 
     # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
     # dialogue in the market. Time a light, a middle and the heaviest rung, at
