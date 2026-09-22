@@ -778,6 +778,117 @@ class TestSnapshots(unittest.TestCase):
             tr2.close()
 
 
+class TestResumeKeepsOnePool(unittest.TestCase):
+    """Below `split_roles_at` the two seats are one list, and that is an
+    identity `Population.pair` relies on: it seats index i opposite a
+    *different* index and calls that "never against itself". Restoring the two
+    saved lists separately made two copies of every founder -- same agent_id,
+    same weights, then their own gradients -- and one rung later the first
+    newcomer appended to `farmers` alone, so `pair` handed out a buyer index
+    the buyer list did not have (IndexError, in the rollout, 4,500 updates in).
+    """
+
+    def _cfg(self):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 2
+        cfg.train.batch_size = 32
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return cfg
+
+    def _round_trip(self, cfg, rung):
+        import tempfile
+        from orchard.train import Trainer
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(rung)
+        tr.maybe_split_roles(tr.curriculum.phase, log=lambda *_: None)
+        path = tr.save_snapshot("t")
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        tr.close()
+        return tr, tr2
+
+    def test_a_pooled_rung_comes_back_as_one_list(self):
+        cfg = self._cfg()
+        _, tr2 = self._round_trip(cfg, "mutual")     # below `haggle`
+        self.assertTrue(tr2.pop.shared, "the resumed pool stopped being shared")
+        self.assertIs(tr2.pop.farmers, tr2.pop.buyers,
+                      "the two seats came back as two lists of copies")
+        tr2.close()
+
+    def test_a_newcomer_after_resuming_grows_both_seats(self):
+        """The crash, in miniature."""
+        cfg = self._cfg()
+        _, tr2 = self._round_trip(cfg, "mutual")
+        tr2.pop.add_newcomer(FARMER, 10)
+        self.assertEqual((len(tr2.pop.farmers), len(tr2.pop.buyers)), (3, 3))
+        f_idx, b_idx = tr2.pop.pair(24)
+        self.assertLess(int(f_idx.max()), len(tr2.pop.farmers))
+        self.assertLess(int(b_idx.max()), len(tr2.pop.buyers))
+        self.assertTrue(all(int(a) != int(b) for a, b in zip(f_idx, b_idx)),
+                        "an agent was seated opposite itself")
+        tr2.close()
+
+    def test_a_split_rung_comes_back_as_two(self):
+        cfg = self._cfg()
+        tr, tr2 = self._round_trip(cfg, "haggle")    # at the split
+        self.assertFalse(tr.pop.shared, "the split never fired")
+        self.assertFalse(tr2.pop.shared)
+        self.assertIsNot(tr2.pop.farmers, tr2.pop.buyers)
+        self.assertEqual([a.agent_id for a in tr2.pop.farmers],
+                         [a.agent_id for a in tr.pop.farmers])
+        self.assertEqual([a.agent_id for a in tr2.pop.buyers],
+                         [a.agent_id for a in tr.pop.buyers])
+        tr2.close()
+
+    def test_pairing_says_so_rather_than_indexing_off_the_end(self):
+        from orchard.population import Population
+        cfg = self._cfg()
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared)
+        pop.buyers = list(pop.farmers)[:1]          # what the resume used to do
+        with self.assertRaises(AssertionError) as caught:
+            pop.pair(8)
+        self.assertIn("shared", str(caught.exception))
+
+    def test_a_snapshot_from_an_affected_run_is_named_as_such(self):
+        """A run that resumed under the bug wrote two lists of drifted copies
+        with matching ids. The loader keeps one and says what it dropped,
+        because the other's training is being discarded."""
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
+        path = tr.save_snapshot("t")
+        healthy = torch.load(path, map_location="cpu", weights_only=False)
+        self.assertFalse(Trainer._pool_had_split(healthy),
+                         "a shared pool was read as duplicated")
+        # what the bug produced: same ids, weights drifted apart
+        split = dict(healthy)
+        split["buyers"] = [dict(r) for r in healthy["buyers"]]
+        first = split["buyers"][0]
+        first["net"] = {k: v.clone() for k, v in first["net"].items()}
+        k0 = next(iter(first["net"]))
+        first["net"][k0] = first["net"][k0] + 1.0
+        self.assertTrue(Trainer._pool_had_split(split),
+                        "drifted copies were read as one pool")
+        tr.close()
+
+    def test_pooled_at_follows_the_split(self):
+        from orchard.curriculum import pooled_at
+        cfg = self._cfg()
+        at = cfg.curriculum.split_roles_at
+        for phase in ladder(cfg):
+            want = phase.index < phase_named(cfg, at).index
+            self.assertEqual(pooled_at(cfg, phase), want, phase.name)
+        cfg.curriculum.split_roles_at = ""
+        self.assertFalse(pooled_at(cfg, phase_named(cfg, "name-all")))
+
+
 class TestCommunityGrowth(unittest.TestCase):
     def test_founders_then_newcomers_in_new_slots(self):
         from orchard.population import Population

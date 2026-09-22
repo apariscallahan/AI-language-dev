@@ -385,6 +385,21 @@ def growth_applies(cfg: Config, phase: Phase) -> bool:
     return phase.index >= phase_named(cfg, cfg.population.grow_from_rung).index
 
 
+def pooled_at(cfg: Config, phase: Phase) -> bool:
+    """Do both seats come from one pool in this rung? (``curriculum.split_roles_at``)
+
+    Below the split this is an *identity*, not a coincidence: index i of
+    ``Population.farmers`` and index i of ``Population.buyers`` are the same
+    object, which is why :meth:`Population.pair` can seat i opposite a
+    different index and know it has not seated an agent against itself.
+    Anything that rebuilds the two lists has to preserve it.
+    """
+    at = cfg.curriculum.split_roles_at
+    if not (cfg.curriculum.enabled and at):
+        return False
+    return phase.index < phase_named(cfg, at).index
+
+
 def turnover_applies(cfg: Config, phase: Phase) -> bool:
     """Do agents die of old age in this rung? (``population.turnover_from_rung``)"""
     if not cfg.population.turnover:

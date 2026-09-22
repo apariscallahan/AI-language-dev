@@ -184,6 +184,18 @@ carry *what was asked* the old keys stopped matching. They are dropped on load
 and the resume line says how many; they rebuild within one update, and the word
 counts (keyed by the word) are untouched.
 
+Below `curriculum.split_roles_at` the two seats are **one list**, and a resume
+has to put it back that way. Restoring the two saved lists separately made two
+copies of every founder -- same id, same weights, then their own gradients from
+the next update on -- so a resumed run below the split trained twice the
+population it reported and had two languages where the rung exists to build one.
+It surfaced a rung later as an `IndexError` in the rollout: the first newcomer
+appended to the farmer list alone, and pairing, which uses the farmer count for
+both seats when the pool is shared, handed out a buyer index the buyer list did
+not have. Fixed; a snapshot written by an affected run is detected on load (the
+two lists hold the same ids but drifted weights), the farmer copies are kept and
+the resume line says so.
+
 Branch an experiment off any rung — the header will list what you changed:
 
 ```bash
@@ -472,5 +484,6 @@ and no device-specific arithmetic.
 | `coherence across` or `cross-role overlap` looking healthy in a naming rung | below `curriculum.split_roles_at` one pool fills both seats, so those compare agents with themselves. Cross-role coherence now skips self-pairs and overlap reads `n/a`; the number to read is the per-role coherence. |
 | a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
 | a rung stops the run | read the criteria it names in the log and in `promotions.jsonl`. Do not relax them to make it pass — they are the experiment. |
+| `community N+M` with N != M below `curriculum.split_roles_at` | the pool should be one list, so the two numbers cannot differ. An older resume broke the aliasing; the next birth then crashes the rollout with `IndexError`. Resume on current code, which restores it and says whether the snapshot came from an affected run. |
 | out of memory in the first batch | `--set train.grad_checkpoint=true`, then a smaller batch. See §10. |
 | every seed disagrees | expected. See §8. |
