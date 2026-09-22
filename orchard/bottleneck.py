@@ -83,6 +83,18 @@ class StoredEpisode:
     meaning: tuple[int, int] = (0, 0)   # (wanted variety, needed quantity)
     phase: Any = None                   # the curriculum phase it was played in
 
+    TENSOR_FIELDS = ("f_obs", "b_obs", "tokens", "active", "f_dec", "b_dec")
+
+    def to_host(self) -> bool:
+        """Move this episode's tensors to the host. True if any had to move."""
+        moved = False
+        for name in self.TENSOR_FIELDS:
+            t = getattr(self, name, None)
+            if isinstance(t, torch.Tensor) and t.device.type != "cpu":
+                setattr(self, name, t.cpu())
+                moved = True
+        return moved
+
     def obs_for(self, role: int) -> torch.Tensor:
         return self.f_obs if role == FARMER else self.b_obs
 
@@ -172,6 +184,21 @@ class TranscriptStore:
             self._pos = (self._pos + 1) % self.capacity
         self.meaning_counts[item.meaning] += 1
         self.total_added += 1
+
+    def to_host(self) -> int:
+        """Bring every stored episode back to the host; returns how many moved.
+
+        The store is host-side by construction -- :meth:`add_batch` copies each
+        batch off the device in one go -- because a newborn's apprenticeship
+        stacks whatever it sampled and moves *that* to the device. Loading a
+        snapshot used to map the whole file onto the training device, store
+        included, which left the buffer holding device tensors from before the
+        resume and host tensors from after. `train_newborn` groups its sample by
+        rung, so it only failed once one rung held both, which is to say at the
+        first birth after a resume taken mid-rung: "Expected all tensors to be
+        on the same device".
+        """
+        return sum(1 for s in self._buf if isinstance(s, StoredEpisode) and s.to_host())
 
     def add_batch(self, batch: BatchRollout, farmers, buyers, episode: int) -> int:
         """File this batch's usable transcripts for the next generation to learn from.

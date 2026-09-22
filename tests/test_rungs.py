@@ -959,6 +959,117 @@ class TestResumeKeepsOnePool(unittest.TestCase):
         self.assertFalse(pooled_at(cfg, phase_named(cfg, "name-all")))
 
 
+class TestTheStoreStaysOnTheHost(unittest.TestCase):
+    """A newborn's apprenticeship stacks what it sampled and moves *that* to the
+    device, so the store is host-side by construction -- `add_batch` copies each
+    batch off the device in one go. Resuming mapped the whole snapshot onto the
+    training device, store included, so the buffer then held device tensors from
+    before the resume and host tensors from after. `train_newborn` groups its
+    sample by rung, so nothing failed until one rung held both: the first birth
+    after a resume taken mid-rung died with "Expected all tensors to be on the
+    same device"."""
+
+    def _cfg(self):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 2
+        cfg.train.batch_size = 32
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return cfg
+
+    def test_a_snapshot_is_read_on_the_host_whatever_the_run_trains_on(self):
+        """The line that was wrong, asserted so that a CPU box can still see it.
+
+        It read the file onto `self.device`, which on a CPU box *is* the host --
+        so the bug was invisible here and only ever appeared on the GPU. The
+        trainer is therefore given a device it is not on, and the file still has
+        to come to the host; each consumer places what it needs from there
+        (`load_state_dict` copies across devices for the nets and their
+        optimisers alike).
+        """
+        import tempfile
+        import orchard.agents as A
+        import orchard.train as T
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = T.Trainer(cfg, d + "/a", quiet=True)
+        path = tr.save_snapshot("t")
+        tr.close()
+        seen = {}
+        real_load, real_make = T.torch.load, A.make_agent
+
+        def spy(p, *a, **kw):
+            seen["map_location"] = kw.get("map_location", "<positional>")
+            return real_load(p, *a, **kw)
+
+        def on_host(*a, **kw):                 # the agents stay where this box can hold them
+            kw["device"] = "cpu"
+            return real_make(*a, **kw)
+
+        T.torch.load, A.make_agent = spy, on_host
+        try:
+            tr2 = T.Trainer(cfg, d + "/b", quiet=True)
+            tr2.device = "cuda:7"              # a device this box does not have
+            tr2.load_snapshot(path)
+            tr2.close()
+        finally:
+            T.torch.load, A.make_agent = real_load, real_make
+        self.assertEqual(seen.get("map_location"), "cpu",
+                         "the snapshot was read onto the training device (%s), which "
+                         "puts the host-side transcript store on the card"
+                         % seen.get("map_location"))
+
+    def test_the_store_comes_back_on_the_host(self):
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        ph = tr.curriculum.phase
+        f_idx, b_idx = tr.pop.pair(32)
+        batch, _ = run_and_update_gumbel(cfg, tr.referential_world.sample(32),
+                                         tr.pop.farmers, tr.pop.buyers,
+                                         f_idx, b_idx, phase=ph, usage=tr.usage)
+        tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        self.assertGreater(len(tr.store), 0, "nothing was stored to check")
+        path = tr.save_snapshot("t")
+        tr.close()
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        for s in tr2.store._buf:
+            for name in s.TENSOR_FIELDS:
+                t = getattr(s, name)
+                self.assertEqual(t.device.type, "cpu",
+                                 "%s came back on %s" % (name, t.device))
+        self.assertEqual(tr2.store.to_host(), 0, "the store was not already host-side")
+        tr2.close()
+
+    def test_a_store_holding_two_rungs_can_still_teach_a_newborn(self):
+        """The grouping that hid the bug: `train_newborn` batches per rung, so a
+        store spanning rungs has to work for every group it makes."""
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        cfg.bottleneck.only_successful = False   # untrained agents succeed at nothing
+        tr = Trainer(cfg, tempfile.mkdtemp(), quiet=True)
+        names = [p.name for p in tr.curriculum.phases]
+        for rung in ("name-all", "mutual"):
+            tr.curriculum.index = names.index(rung)
+            ph = tr.curriculum.phase
+            scen = (tr.referential_world.sample_mutual(32) if ph.mutual
+                    else tr.referential_world.sample(32))
+            f_idx, b_idx = tr.pop.pair(32)
+            batch, _ = run_and_update_gumbel(cfg, scen, tr.pop.farmers, tr.pop.buyers,
+                                            f_idx, b_idx, phase=ph, usage=tr.usage)
+            tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        rungs = {s.phase.name for s in tr.store._buf if s.phase is not None}
+        self.assertGreaterEqual(len(rungs), 2, "only one rung reached the store: %s" % rungs)
+        ev = tr.pop.add_newcomer(FARMER, 1, on_birth=tr.on_birth)   # the crashing call
+        self.assertEqual(ev.kind, "newcomer")
+        tr.close()
+
+
 class TestCommunityGrowth(unittest.TestCase):
     def test_founders_then_newcomers_in_new_slots(self):
         from orchard.population import Population

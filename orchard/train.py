@@ -632,7 +632,16 @@ class Trainer:
 
         from .agents import make_agent
         from .population import BirthEvent
-        st = torch.load(path, map_location=self.device, weights_only=False)
+        # On the host, whatever the run is training on. A snapshot is a file,
+        # and every consumer below places what it needs: `load_state_dict` copies
+        # across devices for both the nets and their optimisers, and the
+        # transcript store is host-side by construction. Mapping the whole file
+        # onto the training device instead put the store on the GPU, so after a
+        # resume it held device tensors from before and host tensors from after
+        # -- which `train_newborn` stacks together at the first birth whose rung
+        # has both. It also loaded every agent's weights and Adam state onto the
+        # card at once, which is the largest allocation a resume makes.
+        st = torch.load(path, map_location="cpu", weights_only=False)
         self.episode = int(st["episode"])
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])
@@ -723,6 +732,12 @@ class Trainer:
         self._stale_forms = u.drop_stale_forms()
         so = st["store"]
         self.store._buf = list(so["buf"])[:self.store.capacity]
+        # Belt and braces, and it repairs a snapshot written by a run that had
+        # already pulled its store onto the device.
+        stray = self.store.to_host()
+        if stray:
+            self.log.always("  [resume] brought %d stored transcripts back to the host"
+                            % stray)
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
         self.store.total_added = int(so["total_added"])
         self.store.meaning_counts = Counter(so["meaning_counts"])
