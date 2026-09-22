@@ -367,6 +367,112 @@ class TestSpeakerPressures(unittest.TestCase):
                         "using another meaning's form was rewarded as agreement")
 
 
+class TestTheConventionBonusCannotPayForACollapse(unittest.TestCase):
+    """The term exists to make a population agree. It must not also decide
+    *what* they agree on, and above all it must not pay for agreeing on less.
+
+    Contrasting against the *average* other meaning's form did exactly that: a
+    compositional code's forms resemble each other -- that is what sharing a
+    morpheme means -- so it read as undistinctive and was taxed, while a
+    collapsed code that named one field and dropped the rest was paid more than
+    the code it replaced. A GPU run at `mutual`, where the task signal starts at
+    zero and nothing else shapes what is said, collapsed onto exactly that: 7
+    words of 1.0 atoms, one word per utterance, coherence 0.92, field coverage
+    [0.83, 0.13, 0.05]. The contrast is now against the closest other form.
+    """
+
+    def _codes(self, cfg):
+        import itertools
+        sp = cfg.channel.space_id
+        combos = [c for c in itertools.product(range(3), repeat=3)]
+        rng = random.Random(0)
+        tags = {m: (rng.randrange(cfg.channel.atomic_vocab),
+                    rng.randrange(cfg.channel.atomic_vocab)) for m in combos}
+        return combos, {
+            "compositional": lambda m: (m[0], sp, 3 + m[1], sp, 6 + m[2]),
+            "arbitrary": lambda m: tags[m],
+            "collapse: one field, one atom": lambda m: (m[0],),
+            "collapse: one form for everything": lambda m: (0,),
+        }
+
+    def _earned(self, cfg, combos, form_of, n_contrast):
+        """The real contrast, over the modal forms of a sample of other meanings."""
+        from orchard.conventions import similarity
+        modal = {m: form_of(m) for m in combos}
+        rng = random.Random(3)
+        out = []
+        for _ in range(20):
+            for m in combos:
+                u = modal[m]
+                pool = [o for o in combos if o != m]
+                others = [similarity(u, modal[o])
+                          for o in rng.sample(pool, min(n_contrast, len(pool)))]
+                base = max(others) if others else 0.0
+                out.append(cfg.reward.convention * (similarity(u, modal[m]) - base))
+        return sum(out) / len(out)
+
+    def test_a_collapsed_code_earns_nothing(self):
+        cfg = cfg_small()
+        combos, codes = self._codes(cfg)
+        n = cfg.reward.convention_contrast_samples
+        earned = {k: self._earned(cfg, combos, f, n) for k, f in codes.items()}
+        for name, v in earned.items():
+            if name.startswith("collapse"):
+                self.assertAlmostEqual(
+                    v, 0.0, places=3,
+                    msg="%s earns %+.4f -- the bonus pays to drop a field" % (name, v))
+        self.assertGreater(
+            earned["compositional"], 0.01,
+            "a compositional code earns nothing either, so the term says nothing")
+        for name, v in earned.items():
+            if name.startswith("collapse"):
+                self.assertGreater(
+                    earned["compositional"], v + 0.01,
+                    "%s is paid as well as a compositional code" % name)
+
+    def test_the_sample_is_big_enough_to_find_a_near_neighbour(self):
+        """The contrast takes the closest of a *sample*, so too small a sample
+        misses the near neighbour that makes a collapsed code worth nothing."""
+        cfg = cfg_small()
+        combos, codes = self._codes(cfg)
+        collapse = codes["collapse: one field, one atom"]
+        configured = self._earned(cfg, combos, collapse,
+                                  cfg.reward.convention_contrast_samples)
+        self.assertLess(configured, 0.01,
+                        "at %d contrast samples a collapsed code still earns %+.4f"
+                        % (cfg.reward.convention_contrast_samples, configured))
+        self.assertGreater(self._earned(cfg, combos, collapse, 1), configured,
+                           "the sample size does not affect the contrast at all, "
+                           "which means it is not taking the closest")
+
+    def test_the_live_term_agrees_with_all_that(self):
+        """Through `speaker_terms`, not a reimplementation of it."""
+        cfg = cfg_small()
+        cfg.reward.convention_min_support = 1
+        c = cfg.channel
+        phase = phase_named(cfg, "name-all")
+        obs = torch.tensor([[i % 3, (i // 3) % 3, 0, 3] + [0] * 8 for i in range(9)])
+
+        def run(form_of):
+            u = PopulationUsage(cfg)
+            toks = torch.full((9, c.dialogue_len), c.pad_id, dtype=torch.long)
+            for i in range(9):
+                f = list(form_of(i)) + [c.end_id]
+                toks[i, :len(f)] = torch.tensor(f)
+            for _ in range(8):
+                u.observe(u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs}), 9)
+            t = u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs})[FARMER]
+            return float(t["convention"].mean())
+
+        varied = run(lambda i: (i, c.hyphen_id, 4 + (i % 3)))   # a form per meaning
+        same = run(lambda i: (4,))                              # one form for all
+        self.assertAlmostEqual(same, 0.0, places=3,
+                               msg="one form for every meaning earned %+.4f" % same)
+        self.assertGreater(varied, same,
+                           "saying something different per meaning earned no more "
+                           "than saying one thing for all of them")
+
+
 class TestZeroShotSuppression(unittest.TestCase):
     def _run(self, seen, unseen, n=600):
         orig = M._play

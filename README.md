@@ -680,8 +680,8 @@ not restrictions: nothing ever stops an agent from saying anything.
 | `reward.atom_cost` | 0.03 | per atom after the first in a word |
 | `reward.word_cost` | 0.005 | per word — a sixth of an atom, so sentences are cheap and words are not |
 | `reward.rarity_cost` | 0.05 | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life_updates` = 80), centred on the batch so it favours established forms without ever favouring silence |
-| `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
-| `reward.convention_contrast_samples` | 4 | how many other meanings that contrast is averaged over. It is the whole cost of the term — host-side edit distances, one per episode for the bonus and this many per distinct utterance for the contrast, and an unsure speaker repeats nothing so nothing caches. At batch 4,096: 0.29 s per update at 4, 0.75 s at 16 (what it was hardcoded to), against a ~2.7 s update |
+| `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus its similarity to the **closest** other meaning's form — so a code that says the same thing for two meanings earns nothing for either |
+| `reward.convention_contrast_samples` | 16 | how many other meanings the contrast looks through for the closest. It is the whole cost of the term — host-side edit distances, one per episode for the bonus and this many per distinct utterance for the contrast, and an unsure speaker repeats nothing so nothing caches. At batch 4,096: 0.29 s per update at 4, 0.75 s at 16, against a ~2.7 s update. Below 8 the sample starts missing the near neighbour and a collapsed code starts earning again, so this is not where to buy speed |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
 One rule decides when each of them starts: **a pressure to reuse a word is off
@@ -728,6 +728,37 @@ A convention is a form *for a meaning*, and on a rung that asks different
 questions about the same thing, the question is part of the meaning: keyed on
 the tuple alone, `name-all`'s conventions blended the answers to "what fruit?"
 and "what is it?" into one modal form. The key now carries what was asked.
+
+**The contrast subtracts the closest other form, not the average one.** Against
+the average it punished exactly what this project is for. A compositional code's
+forms resemble each other — that is what sharing a morpheme means — so the
+average reads it as undistinctive and taxes it, while a collapsed code that
+names one field and drops the rest looks maximally distinctive. Scored over a
+48-meaning space:
+
+| code | contrast = mean | contrast = closest |
+|---|---|---|
+| compositional (fruit + colour + quality) | 0.133 | 0.062 |
+| arbitrary short labels | 0.281 | 0.158 |
+| **collapsed: one field, one atom** | **0.204** | **0.000** |
+| collapsed: one form for everything | 0.000 | 0.000 |
+
+The collapsed code was paid *more than the compositional code it replaces*, and
+a GPU run duly found it. At `mutual` the task signal starts at zero and the
+costs are off, so the convention bonus is the only thing shaping what gets said:
+600 updates in, the population had gone from 27 words to 7, from 1.70 atoms per
+word to 1.01, from 1.39 words per utterance to 1.03, coherence 0.31 → 0.92, and
+field coverage from balanced to [0.83, 0.13, 0.05] — fruit named, colour and
+quality gone, channel 0.00 of headroom. That is the collapse this section
+already warned about, arrived at by a different road.
+
+Against the *closest* other form the question becomes "is this meaning's
+convention the one my form is nearest to", which a collapsed code fails by
+construction: every meaning's modal form is the same, so the closest other is
+identical to its own and the bonus is exactly zero. Choosing between a
+compositional code and an arbitrary one is not this term's job —
+`min_holdout_ratio` and `min_field_coverage` do that — but paying for the
+collapse was.
 
 ### Growing the community
 

@@ -23,11 +23,31 @@ anything:
 
   It is contrastive: similarity (1 - normalised edit distance over the emitted
   symbols -- the measure coherence itself uses) to this meaning's modal form,
-  minus the average similarity to the modal forms of other meanings. Without
-  the second half the cheapest way to "agree" is one form for everything --
-  which is what happened (four spaces, every meaning, within 20k episodes).
-  Silence and bare punctuation are not conventions: an utterance with no atom
-  earns nothing, and modal forms are taken over utterances with at least one.
+  minus the similarity to the *closest* of a sample of other meanings' modal
+  forms. Without a second half the cheapest way to "agree" is one form for
+  everything -- which is what happened (four spaces, every meaning, within 20k
+  episodes). Silence and bare punctuation are not conventions: an utterance
+  with no atom earns nothing, and modal forms are taken over utterances with at
+  least one.
+
+  The contrast subtracts the closest rather than the *average* other form,
+  because the average punishes exactly what this project is trying to build. A
+  compositional code's forms resemble each other -- that is what sharing a
+  morpheme means -- so against the average it reads as undistinctive and is
+  taxed for it. Scored over a 48-meaning space, the average form paid an
+  arbitrary short code 0.281 and a compositional one 0.133, and paid a collapsed
+  fruit-only code 0.204: more than the compositional code it replaces. A GPU run
+  at `mutual`, where the task signal starts at zero and nothing else shapes what
+  is said, duly collapsed onto it -- 7 words of 1.0 atoms, one word per
+  utterance, coherence 0.92, field coverage [0.83, 0.13, 0.05].
+
+  Against the closest other form the question becomes "is this meaning's
+  convention the one my form is nearest to", which a collapsed code fails by
+  construction: every meaning's modal is the same form, so the closest other is
+  identical to its own and the bonus is exactly zero. Compositional 0.062,
+  arbitrary 0.158, both collapses 0.000. Choosing between compositional and
+  arbitrary is not this term's job -- `min_holdout_ratio` and
+  `min_field_coverage` do that -- but paying for the collapse was.
 
   It is measured on symbols, not whole words, because partial agreement has to
   count for a convention to form at all: with ~11k word types in circulation
@@ -288,7 +308,7 @@ class PopulationUsage:
                 other_keys = {ko: mo for ko, mo in other_modal}
                 modal_cache: dict[tuple, Optional[tuple]] = {}
                 sim_cache: dict[tuple, float] = {}
-                base_cache: dict[tuple, tuple[float, int]] = {}
+                base_cache: dict[tuple, list[tuple[tuple, float]]] = {}
 
                 def sim(a, b):
                     key = (a, b)
@@ -306,12 +326,10 @@ class PopulationUsage:
                     if m is None:
                         continue
                     if u not in base_cache:
-                        base_cache[u] = (sum(sim(u, mo) for mo in other_keys.values()),
-                                         len(other_keys))
-                    tot, cnt = base_cache[u]
-                    if k in other_keys:            # never contrast with itself
-                        tot, cnt = tot - sim(u, other_keys[k]), cnt - 1
-                    base = tot / cnt if cnt else 0.0
+                        base_cache[u] = [(ko, sim(u, mo))
+                                         for ko, mo in other_keys.items()]
+                    # The *closest* other convention, not the average one.
+                    base = max((v for ko, v in base_cache[u] if ko != k), default=0.0)
                     conv[i] = R.convention * (sim(u, m) - base)
             out[role] = {
                 "rarity": torch.tensor(rarity, device=dev),
