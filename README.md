@@ -697,11 +697,40 @@ the same direction: charged from episode 0 even a small cost drives the
 describer to silence, and ramping them in with the first rung's success capped
 that success at 0.42 against 0.62 with them off.
 
-**The costs — length and rarity — are off until `offer`**
-(`reward.costs_from_rung`). That is the first rung that invents no word at all:
-the farmer describes a lot with the quantity, quality and price words the rungs
-below it built, and it comes after `ask-qty` and `quote`, which each still have
-a field to name.
+**The costs — length and rarity — apply to any rung that invents no new word**
+(`Phase.invents`), never before `reward.costs_from_rung` as a floor. That comes
+out as on for `mutual`, `order` and everything from `offer` up; off for the four
+naming rungs, and off for `ask-qty` and `quote`, which each still have a field
+to name. No single threshold expresses that: set at `offer` it spares `ask-qty`
+and `quote` but also spares `mutual` and `order`; set at `mutual` it charges the
+two rungs that are still inventing.
+
+`mutual` turned out to need them badly, and the reason is structural. It is the
+first rung with **no lineup** — no candidates, no near misses — so nothing in
+the task forces a message to decompose, and "reconstruct the tuple from 64" is
+solved perfectly by a lookup table. A run settled on exactly that: 48 memorised
+labels, field coverage 0.84, and held-out combinations at 0.01 against 0.36 on
+trained ones — a productivity ratio of 0.03 against a 0.60 bar, flat over 200
+updates while every other number improved. High coverage with near-zero held-out
+*is* the signature of a memorised code, which is why both are measured.
+
+The costs are the pressure it was missing. Among codes with room for the 48
+trained meanings:
+
+| code | capacity | cost |
+|---|---|---|
+| one 1-atom word | 16 — **too few** | 0.0050 |
+| two 1-atom words | 256 | 0.0100 |
+| three 1-atom words (one per field) | 4,096 | 0.0150 |
+| one 2-atom word (fused) | 256 | 0.0350 |
+| one 3-atom word (fused) | 4,096 | 0.0650 |
+
+A fused label costs 3.5–6.5× a multi-word one, because `atom_cost` is six times
+`word_cost` — sentences are cheap, long words are not. And the one-atom collapse
+is cheaper than all of them but holds only 16 codes, so the **task** forbids
+what the cost would otherwise reward. That is the difference from the convention
+bonus above, whose collapse was both cheap *and* well paid: a length cost makes
+collapse marginally cheaper, it does not make it profitable.
 
 **The convention bonus comes on at `name-all`** (`reward.convention_from_rung`),
 by the same rule one rung earlier than it can apply to the costs: fruit, colour

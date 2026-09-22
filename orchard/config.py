@@ -407,18 +407,30 @@ class RewardConfig:
     # chance -- a population that size needs founding small (see
     # population.founders_*), after which the bonus is fully on anyway.
     convention_gated: bool = True
-    # The rung from which the speaker pays for length, rarity and coining, and is
-    # paid for agreeing. Off below it. Measured: with the costs on from the
-    # second rung, the population collapsed onto one one-atom word (coherence
-    # 1.000, 1.0 atoms per word, 17 distinct words among 15 speakers) and colour
-    # never left chance -- the cheapest way to agree, before a word for colour
-    # exists, is for everyone to say the same short nothing.
-    # The rule that follows: the costs stay off while a rung still has to
-    # *invent* a word, and come on at the first rung that only reuses them.
-    # That is `offer` -- the farmer describes a lot with the quantity, quality
-    # and price words the rungs below it built -- and it covers the two fields
-    # no naming rung teaches: quantity (`ask-qty`) and price (`quote`).
-    costs_from_rung: str = "offer"
+    # A floor on where the speaker starts paying for length and novelty; the
+    # rung-by-rung rule is `Phase.invents`, and `curriculum.costs_apply` needs
+    # both. Measured: with the costs on from the second rung, the population
+    # collapsed onto one one-atom word (coherence 1.000, 1.0 atoms per word, 17
+    # distinct words among 15 speakers) and colour never left chance -- the
+    # cheapest way to agree, before a word for colour exists, is for everyone to
+    # say the same short nothing. The rule that follows: the costs stay off
+    # while a rung still has to *invent* a word, and come on where a rung only
+    # reuses them.
+    #
+    # This was `offer`, read as "the first rung above every rung that invents".
+    # That is true but too blunt: it also spared `mutual` and `order`, which
+    # invent nothing, and `mutual` turned out to need the pressure badly. It is
+    # the first rung with no lineup -- no candidates, no near misses -- so
+    # nothing there forces a message to decompose, and a run duly settled on a
+    # lookup table: 48 memorised labels, coverage 0.84, and held-out
+    # combinations at 0.01 against 0.36 on trained ones, a productivity ratio of
+    # 0.03 against a 0.60 bar. Among codes with room for 48 meanings the costs
+    # price a fused label 3.5-6.5x a multi-word one (one 3-atom word 0.065,
+    # three 1-atom words 0.015), which is exactly the pressure `mutual` lacks.
+    # The one-atom collapse is cheaper still at 0.005 but holds only 16 codes,
+    # so the task forbids it -- unlike the convention bonus, whose collapse was
+    # both cheap and well paid.
+    costs_from_rung: str = "mutual"
     # The rung from which the convention bonus pays a speaker for using the
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish

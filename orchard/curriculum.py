@@ -185,6 +185,22 @@ class Phase:
         return tuple(k for k in self.kinds if k != self.primary)
 
     @property
+    def invents(self) -> bool:
+        """Does this rung still have a *word* to invent, rather than reuse?
+
+        The lineup rungs each invent their field's words, and `name-all` has to
+        find the three-word utterance where one used to do. Of the request
+        rungs, only the two that introduce a field nothing below them names --
+        `ask-qty` and `quote` -- invent anything; the rest recombine what
+        exists. This is what decides whether the speaker pays for length and
+        for novelty (:func:`costs_apply`), because a price on a word is a
+        pressure on a word that exists: charged while one is still being
+        invented, the cheapest way to be brief is to say the same short
+        nothing.
+        """
+        return self.referential or (self.order and self.asks_first in ("quantity", "price"))
+
+    @property
     def whole(self) -> bool:
         """Is this rung's own job to name a whole (fruit, colour, quality)?"""
         return self.naming and self.primary >= ASK_ALL
@@ -371,8 +387,20 @@ def hindsight_applies(cfg: Config, phase: Phase) -> bool:
 
 
 def costs_apply(cfg: Config, phase: Phase) -> bool:
-    """Does the speaker pay for what it says in this rung? (``reward.costs_from_rung``)"""
-    return phase.index >= phase_named(cfg, cfg.reward.costs_from_rung).index
+    """Does the speaker pay for what it says in this rung?
+
+    Two conditions, because the rule is per-rung and a threshold cannot say it.
+    Not before ``reward.costs_from_rung`` -- a floor, so a run can hold them off
+    entirely -- and not on a rung that still has a word to invent
+    (:attr:`Phase.invents`). Between those, `ask-qty` and `quote` sit above the
+    floor and are still exempt, which a threshold alone would get wrong in one
+    direction or the other: set at `offer` it spares them but also spares
+    `mutual` and `order`, which invent nothing; set at `mutual` it charges them
+    while they are still naming quantity and price.
+    """
+    if phase.index < phase_named(cfg, cfg.reward.costs_from_rung).index:
+        return False
+    return not phase.invents
 
 
 def convention_applies(cfg: Config, phase: Phase) -> bool:
