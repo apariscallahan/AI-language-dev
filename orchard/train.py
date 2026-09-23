@@ -676,6 +676,14 @@ class Trainer:
                             "architecture; taking these from the file:")
             for key, now, was in changed:
                 self.log.always("    %-26s %s -> %s" % (key, now, was))
+            # The world, the batched sampler and the lineup were all built in
+            # `__init__` from the settings this just changed. `model.*` only
+            # shapes the agents, but a different fruit count or price-bin count
+            # means the objects drawing the scenarios are now describing a world
+            # nobody is training in -- including the holdout, which is derived
+            # from the field sizes and is the productivity test.
+            if any(not k.startswith("model.") for k, _, _ in changed):
+                self._rebuild_world()
         # Everything else is the caller's to decide -- a resume is allowed to
         # shrink the community or change the batch size. It is not allowed to do
         # so *by accident*, which is exactly what adopting the architecture
@@ -692,6 +700,25 @@ class Trainer:
                 self.log.always("    %-26s snapshot %r, here %r" % (key, was, now))
             if len(rest) > 12:
                 self.log.always("    ... and %d more" % (len(rest) - 12))
+
+    def _rebuild_world(self) -> None:
+        """Rebuild everything `__init__` derived from the settings just adopted."""
+        from .batched import TensorWorld
+        cfg, dev = self.cfg, self.device
+        self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
+        g = torch.Generator(device=dev)
+        g.manual_seed(cfg.train.seed + 11)
+        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
+        self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
+                               n_farms=cfg.population.n_farmers)
+        self.stability = StabilityTracker(cfg, self.world, cfg.log.stability_probes,
+                                          seed=cfg.train.seed + 4)
+        self.forms = (FormTracker(cfg, self.world)
+                      if cfg.log.track_form_survival else None)
+        if cfg.curriculum.enabled:
+            g = torch.Generator(device=dev)
+            g.manual_seed(cfg.train.seed + 13)
+            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g)
 
     def _check_shapes(self, st: dict) -> None:
         """Refuse a snapshot whose weights do not fit, naming the setting.
@@ -1160,8 +1187,12 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def on_birth(self, newborn: Agent, ev: BirthEvent) -> None:
+        # Below the split one pool fills both seats, so this newborn will play
+        # every buyer's round as well as every farmer's, whichever seat it was
+        # spawned into. It has to be taught both.
+        seats = ((FARMER, BUYER) if self.pop.shared else (newborn.role,))
         info = train_newborn(self.cfg, newborn, self.store, self.bottleneck_rng,
-                             device=self.device)
+                             device=self.device, roles=seats)
         ev.bottleneck = info
         # Spec 5.5: test the newborn the moment it comes out of the bottleneck,
         # before it has played a single live episode.
@@ -1193,6 +1224,14 @@ class Trainer:
                                   info.get("phases_in_curriculum", {}).items()),
                         info["teacher_generations"], acc(info["token_accuracy"]),
                         info.get("own_token_targets", 0), acc(info["decision_accuracy"])))
+            # The other half of the bottleneck, and the one that selects for a
+            # grammar: a learner shown every meaning can memorise the table as
+            # faithfully as its parents. Whether it fired belongs in the log.
+            if info.get("withheld_meanings"):
+                self.log("          held back %d meanings from this learner "
+                         "(%.0f%% of its curriculum) -- it has to say them anyway"
+                         % (info["withheld_meanings"],
+                            100.0 * float(info.get("withheld_share") or 0.0)))
         else:
             self.log("          bottleneck: %s" % info.get("skipped", "disabled"))
         sr = probe.get("success_rate")
@@ -1725,6 +1764,17 @@ class Trainer:
             zs += " (per field %s vs %s = %s of the headroom)" % (
                 f(hf, "%.2f"), f(ev.get("seen_fields"), "%.2f"),
                 f(ev.get("holdout_field_ratio"), "%.2f"))
+            # Which field, not just how much: the reserved set is a Latin square,
+            # so a held-out round asks for the one quality its (fruit, colour)
+            # pair never showed. One field can sit near zero for that reason
+            # while the other two generalise, and the mean alone cannot say so.
+            acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
+            if acc:
+                names = ("fruit", "colour", "quality")
+                zs += " [" + ", ".join(
+                    "%s %s/%s" % (n, f(a, "%.2f"),
+                                  f(base[i] if base and i < len(base) else None, "%.2f"))
+                    for i, (n, a) in enumerate(zip(names, acc))) + "]"
         per_field = ""
         fields = ev.get("request_fields_intact")
         if fields:

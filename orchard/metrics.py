@@ -1068,6 +1068,25 @@ def _report_fields(res) -> float:
     return sum(vals) / len(vals) if vals else float("nan")
 
 
+def _report_field_vec(res) -> "list[float] | None":
+    """(fruit, colour, quality) report accuracy, averaged over the two roles.
+
+    The mean over all six numbers hides which field is carrying it, and on
+    held-out combinations that is the whole question: the reserved set is a
+    Latin square, so for every (fruit, colour) pair exactly one quality is
+    withheld and the held-out round asks for precisely the value the training
+    distribution says cannot occur there. A listener that has fit that
+    distribution is pushed *away* from the right quality, which can hold one
+    field near zero while the other two generalise perfectly well.
+    """
+    rows = [(res or {}).get(k) for k in ("farmer_report_fields", "buyer_report_fields")]
+    rows = [r for r in rows if r]
+    if not rows:
+        return None
+    n = min(len(r) for r in rows)
+    return [sum(float(r[i]) for r in rows) / len(rows) for i in range(n)]
+
+
 def pool_field_floor(pool) -> float:
     """Per field, the best a listener that hears nothing can do on this pool.
 
@@ -1158,10 +1177,13 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["holdout_ratio"] = float("nan")
     out["holdout_fields"] = float("nan")
     out["seen_fields"] = float("nan")
+    out["holdout_field_acc"] = None
+    out["seen_field_acc"] = None
     out["holdout_field_ratio"] = float("nan")
     if holdout_sampler_for is not None:
         hs, seen = [], []
         hf, sf = [], []
+        hv, sv = [], []
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1191,12 +1213,21 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                     hf.append(a)
                 if b == b:
                     sf.append(b)
+                va, vb = _report_field_vec(h), _report_field_vec(s)
+                if va:
+                    hv.append(va)
+                if vb:
+                    sv.append(vb)
         if hs:
             out["holdout_success"] = sum(hs) / len(hs)
             base = sum(seen) / len(seen) if seen else float("nan")
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
+        for key, rows in (("holdout_field_acc", hv), ("seen_field_acc", sv)):
+            if rows:
+                n = min(len(r) for r in rows)
+                out[key] = [sum(r[i] for r in rows) / len(rows) for i in range(n)]
         if hf and sf:
             out["holdout_fields"] = sum(hf) / len(hf)
             out["seen_fields"] = sum(sf) / len(sf)
@@ -1210,7 +1241,11 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             # Headroom over what a message-blind guesser gets, so a memorised
             # code reads 0 rather than the base rate it would score anyway.
             head = out["seen_fields"] - s_floor
-            if head > 1e-9:
+            # A ratio between two numbers that are both at the floor is noise,
+            # and noise reads 1.00 as often as it reads 0.00. Below a real
+            # margin there is nothing to take a ratio of, so the gate is left
+            # to fall back on the whole-round number and fail.
+            if head > 0.05:
                 out["holdout_field_ratio"] = max(0.0, min(
                     1.0, (out["holdout_fields"] - h_floor) / head))
     # Each kind of round in the rung's mixture, scored on its own. A rung that

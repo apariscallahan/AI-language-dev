@@ -2152,3 +2152,246 @@ class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
             self.assertIn("not trained with", joined)
             self.assertIn("train.batch_size", joined)
             tr2.close()
+
+
+# ==========================================================================
+class TestTheHoldoutAsksForTheOneQualityItRuledOut(unittest.TestCase):
+    """The reserved set is a Latin square: for every (fruit, colour) pair
+    exactly one quality is withheld, and a held-out round asks for precisely
+    that value. A listener that has fit the training distribution has learned
+    that value cannot occur there, so one field can sit near zero for a reason
+    that has nothing to do with whether the code is compositional -- and the
+    mean over three fields cannot say which."""
+
+    def test_every_cell_withholds_exactly_one_quality(self):
+        from collections import defaultdict
+
+        from orchard.world import ComboHoldout
+        w = Config().world
+        h = ComboHoldout(w, w.holdout_combo_frac, w.holdout_seed)
+        cells = defaultdict(list)
+        for (f, c, q) in h.held:
+            cells[(f, c)].append(q)
+        self.assertEqual(len(cells), w.n_varieties * w.n_colors)
+        self.assertTrue(all(len(v) == 1 for v in cells.values()))
+
+    def test_one_dead_field_pulls_the_conjunction_to_zero_not_the_mean(self):
+        """Why the whole-round number cannot be read as a productivity failure:
+        two fields generalising beautifully and one at the floor still scores
+        essentially nothing as a conjunction."""
+        fruit, colour, quality = 0.95, 0.80, 0.02
+        mean = (fruit + colour + quality) / 3
+        joint = (fruit * colour * quality) ** 2      # both sides, three fields
+        self.assertGreater(mean, 0.55)
+        self.assertLess(joint, 0.001)                # prints as 0.000
+
+    def test_the_breakdown_is_carried_out_of_the_evaluation(self):
+        vec = M._report_field_vec({"farmer_report_fields": [0.9, 0.8, 0.0],
+                                   "buyer_report_fields": [1.0, 0.8, 0.1]})
+        self.assertEqual(len(vec), 3)
+        self.assertAlmostEqual(vec[0], 0.95, places=6)
+        self.assertAlmostEqual(vec[1], 0.80, places=6)
+        self.assertAlmostEqual(vec[2], 0.05, places=6)
+
+    def test_a_round_that_reports_no_fields_has_no_breakdown(self):
+        self.assertIsNone(M._report_field_vec({"success_rate": 0.5}))
+        self.assertIsNone(M._report_field_vec(None))
+
+    def test_a_ratio_of_two_numbers_at_the_floor_is_not_a_pass(self):
+        """Both at chance is not "generalises perfectly": it is no signal at
+        all, and noise reads 1.00 as readily as 0.00."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        ev = _mutual_evidence(cfg, holdout_fields=0.262, seen_fields=0.259,
+                              holdout_success=0.0, seen_success=0.0,
+                              holdout_field_ratio=float("nan"))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        self.assertFalse(
+            checks["describes combinations it never trained on"]["met"])
+
+
+# ==========================================================================
+class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
+    """Below the split one pool fills both seats, so an agent spawned to replace
+    a farmer also does every buyer's job. `ask-qty` is the first rung where the
+    farmer speaks nowhere, and a newborn taught only the farmer's side came out
+    of the bottleneck with nothing to say and took the buyer's chair anyway."""
+
+    def _store_at(self, tr, phase, n=64):
+        from orchard.curriculum import ladder as _ladder
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(phase)
+        ph = tr.curriculum.phase
+        f_idx, b_idx = tr.pop.pair(n)
+        scen = tr.tensor_world.sample(n)
+        batch, _ = run_and_update_gumbel(tr.cfg, scen, tr.pop.farmers, tr.pop.buyers,
+                                         f_idx, b_idx, phase=ph, usage=tr.usage)
+        tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        return ph
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        cfg.bottleneck.only_successful = False      # untrained agents rarely score
+        cfg.bottleneck.epochs = 1
+        return Trainer(cfg, d, quiet=True)
+
+    def test_at_ask_qty_the_farmer_speaks_nowhere(self):
+        """The precondition, straight from the curriculum."""
+        cfg = Config()
+        ph = phase_named(cfg, "ask-qty")
+        self.assertEqual(ph.own_positions(cfg, FARMER), [])
+        self.assertTrue(ph.own_positions(cfg, BUYER))
+
+    def test_a_shared_pool_always_spawns_the_replacement_a_farmer(self):
+        """Why every birth line in the run reads `farmer`: `turn_over` walks
+        (FARMER, BUYER) over what is, below the split, one list. The farmer pass
+        installs the newborn; the buyer pass then finds it young and skips."""
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 3
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared)
+        self.assertIs(pop.farmers, pop.buyers)
+        for a in pop.all_agents():
+            a.lifespan = 0
+        events = pop.turn_over(episode=1)
+        self.assertTrue(events)
+        self.assertTrue(all(e.role == FARMER for e in events))
+
+    def test_taught_one_seat_it_learns_no_words_at_ask_qty(self):
+        """The failure as it happened: `token acc n/a over 0 own tokens`."""
+        from orchard.bottleneck import train_newborn
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            born = tr.pop.farmers[0]
+            info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
+                                 roles=(FARMER,))
+            self.assertEqual(info.get("own_token_targets", 0), 0)
+            self.assertIsNone(info.get("token_accuracy"))
+            tr.close()
+
+    def test_taught_both_seats_it_learns_the_buyer_s_words(self):
+        from orchard.bottleneck import train_newborn
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            born = tr.pop.farmers[0]
+            info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
+                                 roles=(FARMER, BUYER))
+            self.assertGreater(info.get("own_token_targets", 0), 0)
+            self.assertIsNotNone(info.get("token_accuracy"))
+            self.assertEqual(info.get("roles"), ["farmer", "buyer"])
+            tr.close()
+
+    def test_the_birth_hook_asks_for_both_while_the_pool_is_shared(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            self.assertTrue(tr.pop.shared)
+            seen = {}
+            import orchard.train as T
+            real = T.train_newborn
+            T.train_newborn = lambda *a, **k: (seen.update(k), real(*a, **k))[1]
+            try:
+                for a in tr.pop.all_agents():
+                    a.lifespan = 0
+                tr.pop.turn_over(episode=1, on_birth=tr.on_birth)
+            finally:
+                T.train_newborn = real
+            self.assertEqual(seen.get("roles"), (FARMER, BUYER))
+            tr.close()
+
+    def test_once_the_roles_split_each_learns_only_its_own(self):
+        """After `haggle` the two pools are genuinely different agents, and a
+        farmer has no business being taught to speak as a buyer."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            tr.pop.split_roles(episode=0)
+            self.assertFalse(tr.pop.shared)
+            seats = ((FARMER, BUYER) if tr.pop.shared else (tr.pop.farmers[0].role,))
+            self.assertEqual(seats, (FARMER,))
+            tr.close()
+
+
+# ==========================================================================
+class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
+    """A hundred updates of `ask-qty` took the store from 22,359 `mutual`
+    transcripts to none. Every later rung names fruit, colour and quality and
+    only adds to them, so a rung with nothing left in the store is a rung whose
+    language can no longer be transmitted to anybody born after it."""
+
+    def _store(self, capacity=100, share=0.4):
+        cfg = cfg_small()
+        cfg.bottleneck.store_capacity = capacity
+        cfg.bottleneck.history_share = share
+        return TranscriptStore(cfg)
+
+    def _fill(self, store, phase, n, episode=0):
+        """Push `n` episodes of one rung through the store's real `_push`."""
+        z = torch.zeros((1, 1), dtype=torch.long)
+        batch = SimpleNamespace(
+            f_obs=z, b_obs=z, tokens=z, active=torch.zeros((1, 1), dtype=torch.bool),
+            f_dec=z, b_dec=z, f_idx=[0], b_idx=[0], phase=phase,
+            sb=SimpleNamespace(want_variety=[0], need_qty=[0]))
+        who = [SimpleNamespace(generation=0)]
+        for i in range(n):
+            store._push(batch, 0, who, who, episode + i)
+
+    def test_the_earlier_rung_keeps_its_share(self):
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100, share=0.4)
+        self._fill(store, first, 100)
+        self.assertEqual(store.phase_counts(), {"mutual": 100})
+        self._fill(store, second, 500, episode=1000)     # five bufferfuls
+        counts = store.phase_counts()
+        self.assertEqual(sum(counts.values()), 100)
+        self.assertEqual(counts["mutual"], 40)           # its 40% floor
+        self.assertEqual(counts["ask-qty"], 60)
+
+    def test_without_the_floor_it_is_flushed_entirely(self):
+        """What the run did: history_share 0 is the old ring buffer."""
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100, share=0.0)
+        self._fill(store, first, 100)
+        self._fill(store, second, 500, episode=1000)
+        self.assertEqual(store.phase_counts(), {"ask-qty": 100})
+
+    def test_three_rungs_split_the_reserve_between_them(self):
+        cfg = cfg_small()
+        a, b, c = (phase_named(cfg, n) for n in ("name-all", "mutual", "ask-qty"))
+        store = self._store(capacity=120, share=0.5)
+        self._fill(store, a, 60)
+        self._fill(store, b, 60, episode=100)
+        self._fill(store, c, 600, episode=1000)
+        counts = store.phase_counts()
+        self.assertEqual(sum(counts.values()), 120)
+        # 50% of 120 reserved, split between the two that are not running
+        self.assertEqual(counts["name-all"], 30)
+        self.assertEqual(counts["mutual"], 30)
+        self.assertEqual(counts["ask-qty"], 60)
+
+    def test_one_rung_alone_still_trims_its_own_oldest(self):
+        cfg = cfg_small()
+        only = phase_named(cfg, "mutual")
+        store = self._store(capacity=50)
+        self._fill(store, only, 130)
+        self.assertEqual(store.phase_counts(), {"mutual": 50})
+        kept = sorted(it.episode for it in store._buf)
+        self.assertEqual(kept, list(range(80, 130)))     # the newest 50
+
+    def test_a_restored_store_rebuilds_its_index(self):
+        """A snapshot carries `buf` and nothing about the per-rung index."""
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100)
+        self._fill(store, first, 50)
+        self._fill(store, second, 50, episode=1000)
+        revived = self._store(capacity=100)
+        revived._buf = list(store._buf)                  # as `load_snapshot` does
+        self.assertEqual(revived._slots, {})
+        self.assertEqual(revived.phase_counts(), {"ask-qty": 50, "mutual": 50})
