@@ -769,11 +769,17 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         f_ratio = _num(ev.get("holdout_field_ratio"))
         if f_ratio == f_ratio:
             hf, sf = _num(ev.get("holdout_fields")), _num(ev.get("seen_fields"))
+            # Per field, named: one field carrying two weak ones is exactly what
+            # this gate must not let through, and an average cannot show it.
+            each = ev.get("holdout_field_ratios") or []
+            names = ("fruit", "colour", "quality")
+            per = (" [" + ", ".join("%s %s" % (n, _fmt(r))
+                                    for n, r in zip(names, each)) + "]") if each else ""
             checks["describes combinations it never trained on"] = (
                 f_ratio >= c.min_holdout_ratio,
-                "held-out %s vs seen %s per field = %s of the headroom, need "
+                "held-out %s vs seen %s per field = %s of the headroom%s, need "
                 "%.2f (the whole round: %s vs %s)"
-                % (_fmt(hf), _fmt(sf), _fmt(f_ratio), c.min_holdout_ratio,
+                % (_fmt(hf), _fmt(sf), _fmt(f_ratio), per, c.min_holdout_ratio,
                    _fmt(hs), _fmt(seen)))
         else:
             checks["describes combinations it never trained on"] = (

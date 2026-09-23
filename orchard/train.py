@@ -691,7 +691,8 @@ class Trainer:
         # stop the run with sixty `size mismatch` lines would instead carry on at
         # the default batch of 256 where the run had been training at 4096, and
         # nothing would say so. So say so.
-        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict()).items()
+        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict(),
+                                             both_only=True).items()
                 if k not in ARCH_KEYS}
         if rest:
             self.log.always("  [resume] running under settings this snapshot was "
