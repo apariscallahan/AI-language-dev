@@ -350,22 +350,37 @@ def holdout_report(cfg: Config, path: str) -> int:
     print("rung %s, %d held-out combinations of %d"
           % (phase.name, len(trainer.referential_world.holdout.held),
              cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
-    print("%-10s %8s %8s   %s" % ("field", "held-out", "trained", "")) 
+    each = ev.get("holdout_field_ratios") or []
+    print("%-11s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
+    prod_h = prod_s = 1.0
     for i, name in enumerate(("fruit", "colour", "quality")):
         if not acc or i >= len(acc):
             break
         b = base[i] if base and i < len(base) else float("nan")
+        prod_h *= acc[i]
+        prod_s *= b
+        r = "%9.3f" % each[i] if i < len(each) else "      n/a"
         note = ""
         if acc[i] < floors[0]:
             note = "  <- below the %.2f a message-blind guesser gets" % floors[0]
-        print("%-10s %8.3f %8.3f%s" % (name, acc[i], b, note))
+        print("%-11s %8.3f %8.3f%s%s" % (name, acc[i], b, r, note))
     print()
-    print("mean       %8.3f %8.3f   = %.3f of the headroom over %.2f/%.2f"
-          % (ev.get("holdout_fields", float("nan")),
+    print("%-11s %8.3f %8.3f %9.3f   each field once, over %.2f/%.2f"
+          % ("mean", ev.get("holdout_fields", float("nan")),
              ev.get("seen_fields", float("nan")),
              ev.get("holdout_field_ratio", float("nan")), floors[0], floors[1]))
-    print("whole round%8.3f %8.3f   (all three fields, both sides)"
-          % (ev.get("holdout_success", float("nan")),
+    print()
+    # Independent fields would multiply. Where they do not, the code is right
+    # about each field on its own and wrong about them together -- which is what
+    # a Latin-square holdout produces: get the fruit and the colour right and
+    # the training distribution has ruled out the one quality that is the answer.
+    print("%-11s %8.3f %8.3f   (one side, all three at once)"
+          % ("conjunction", ev.get("holdout_side", float("nan")),
+             ev.get("seen_side", float("nan"))))
+    print("%-11s %8.3f %8.3f   if the three fields were independent"
+          % ("  expected", prod_h, prod_s))
+    print("%-11s %8.3f %8.3f   (both sides, all three)"
+          % ("whole round", ev.get("holdout_success", float("nan")),
              ev.get("seen_success", float("nan"))))
     trainer.close()
     return 0
@@ -445,6 +460,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="continue from a snapshot (runs/<name>/snapshots/*.pt) under "
                         "the configuration given here; rung, weights, usage and the "
                         "transcript store all carry over")
+    p.add_argument("--resume-at", type=str, default=None, metavar="RUNG",
+                   help="with --resume: put the curriculum back on this rung, "
+                        "keeping the weights, the community and the store. "
+                        "`after-<rung>.pt` holds a curriculum already pointing at "
+                        "the rung after, so this is how a rung is run again once "
+                        "something it depends on has changed")
     p.add_argument("--holdout-report", type=str, default=None, metavar="SNAPSHOT",
                    help="score one snapshot on the held-out combinations, field "
                         "by field, and exit -- which of fruit, colour and quality "
@@ -480,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
                       started_utc=time.strftime("%Y-%m-%d %H:%M:%S UTC", now))
     if args.resume:
         trainer.load_snapshot(args.resume)
+        if args.resume_at:
+            trainer.rewind_to(args.resume_at)
+    elif args.resume_at:
+        print("--resume-at needs --resume: it moves the curriculum of a snapshot")
+        return 2
     try:
         final = trainer.run()
         trainer.log("")

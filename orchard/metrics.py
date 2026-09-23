@@ -1068,6 +1068,18 @@ def _report_fields(res) -> float:
     return sum(vals) / len(vals) if vals else float("nan")
 
 
+def _report_side(res) -> float:
+    """How often ONE side got all three fields at once, averaged over the roles.
+
+    Sits between the per-field numbers and the whole round, and the gap between
+    it and the product of the per-field rates is the whole story on held-out
+    combinations: independent fields would multiply, and these do not.
+    """
+    vals = [(res or {}).get(k) for k in ("farmer_report", "buyer_report")]
+    vals = [float(v) for v in vals if isinstance(v, (int, float)) and v == v]
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
 def _report_field_vec(res) -> "list[float] | None":
     """(fruit, colour, quality) report accuracy, averaged over the two roles.
 
@@ -1179,11 +1191,15 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["seen_fields"] = float("nan")
     out["holdout_field_acc"] = None
     out["seen_field_acc"] = None
+    out["holdout_field_ratios"] = None
+    out["holdout_side"] = float("nan")
+    out["seen_side"] = float("nan")
     out["holdout_field_ratio"] = float("nan")
     if holdout_sampler_for is not None:
         hs, seen = [], []
         hf, sf = [], []
         hv, sv = [], []
+        hd, sd = [], []
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1218,6 +1234,11 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                     hv.append(va)
                 if vb:
                     sv.append(vb)
+                da, db = _report_side(h), _report_side(s)
+                if da == da:
+                    hd.append(da)
+                if db == db:
+                    sd.append(db)
         if hs:
             out["holdout_success"] = sum(hs) / len(hs)
             base = sum(seen) / len(seen) if seen else float("nan")
@@ -1228,6 +1249,10 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             if rows:
                 n = min(len(r) for r in rows)
                 out[key] = [sum(r[i] for r in rows) / len(rows) for i in range(n)]
+        if hd:
+            out["holdout_side"] = sum(hd) / len(hd)
+        if sd:
+            out["seen_side"] = sum(sd) / len(sd)
         if hf and sf:
             out["holdout_fields"] = sum(hf) / len(hf)
             out["seen_fields"] = sum(sf) / len(sf)
@@ -1240,14 +1265,35 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                     s_floor = 0.0 if s_floor != s_floor else s_floor
             # Headroom over what a message-blind guesser gets, so a memorised
             # code reads 0 rather than the base rate it would score anyway.
-            head = out["seen_fields"] - s_floor
-            # A ratio between two numbers that are both at the floor is noise,
-            # and noise reads 1.00 as often as it reads 0.00. Below a real
-            # margin there is nothing to take a ratio of, so the gate is left
-            # to fall back on the whole-round number and fail.
-            if head > 0.05:
+            # Per field, then averaged -- not a ratio of the two means. The
+            # ratio of means weights each field by its headroom, so the field
+            # the language learned best also counts most towards whether the
+            # language generalises, and one strong field can carry two weak
+            # ones over the bar. Measured on the run that promoted out of
+            # `mutual`: fruit transferred 0.887 of its headroom, colour 0.406
+            # and quality 0.411, and the ratio of means read 0.617 against a
+            # 0.60 bar where each field counted once reads 0.568. That is the
+            # same masking the per-role and per-kind gates already refuse --
+            # "a pooled average would let a fluent farmer carry a buyer that
+            # never learned to speak".
+            ha = out.get("holdout_field_acc") or []
+            sa = out.get("seen_field_acc") or []
+            ratios = []
+            for i in range(min(len(ha), len(sa))):
+                # A ratio between two numbers both at the floor is noise, and
+                # noise reads 1.00 as readily as 0.00. A field the language
+                # never learned has nothing to say about generalising, so it is
+                # left out rather than counted as a pass or a failure.
+                if sa[i] - s_floor > 0.05:
+                    ratios.append(max(0.0, min(1.0, (ha[i] - h_floor)
+                                               / (sa[i] - s_floor))))
+            if ratios:
+                out["holdout_field_ratios"] = ratios
+                out["holdout_field_ratio"] = sum(ratios) / len(ratios)
+            elif out["seen_fields"] - s_floor > 0.05:
                 out["holdout_field_ratio"] = max(0.0, min(
-                    1.0, (out["holdout_fields"] - h_floor) / head))
+                    1.0, (out["holdout_fields"] - h_floor)
+                    / (out["seen_fields"] - s_floor)))
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.

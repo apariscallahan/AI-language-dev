@@ -2035,6 +2035,8 @@ def _mutual_evidence(cfg, **over):
             "positional_structure": 0.9, "report": 0.9}
     ev = {
         "success": 0.9, "chance": float("nan"), "transfer": 1.0,
+        "holdout_field_acc": None, "seen_field_acc": None,
+        "holdout_field_ratios": None,
         "holdout_ratio": (over.get("holdout_success", 0.0)
                           / max(1e-9, over.get("seen_success", 1.0))),
         "per_role_structure": {"farmer": dict(role), "buyer": dict(role)},
@@ -2395,3 +2397,213 @@ class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
         revived._buf = list(store._buf)                  # as `load_snapshot` does
         self.assertEqual(revived._slots, {})
         self.assertEqual(revived.phase_counts(), {"ask-qty": 50, "mutual": 50})
+
+
+# ==========================================================================
+class TestOneStrongFieldCannotCarryTwoWeakOnes(unittest.TestCase):
+    """The run's own numbers: fruit transferred 0.887 of its headroom, colour
+    0.406 and quality 0.411. A ratio of the two means reads 0.617 and clears a
+    0.60 bar; each field counted once reads 0.568 and does not. The ratio of
+    means weights every field by its headroom, so the field the language learned
+    best is also the field that most decides whether the language generalises --
+    the same masking the per-role and per-kind gates already refuse."""
+
+    HELD = [0.885, 0.434, 0.447]
+    SEEN = [0.966, 0.703, 0.729]
+
+    def test_the_two_aggregations_straddle_the_bar(self):
+        f = 0.25
+        each = [(h - f) / (s - f) for h, s in zip(self.HELD, self.SEEN)]
+        mean_of_ratios = sum(each) / 3
+        ratio_of_means = ((sum(self.HELD) / 3 - f) / (sum(self.SEEN) / 3 - f))
+        self.assertAlmostEqual(mean_of_ratios, 0.568, places=2)
+        self.assertAlmostEqual(ratio_of_means, 0.617, places=2)
+        self.assertLess(mean_of_ratios, 0.60)
+        self.assertGreater(ratio_of_means, 0.60)
+
+    def _evidence(self, held, seen):
+        cfg = cfg_small()
+        ev = _mutual_evidence(
+            cfg, holdout_fields=sum(held) / 3, seen_fields=sum(seen) / 3,
+            holdout_success=0.0, seen_success=0.32,
+            holdout_field_acc=list(held), seen_field_acc=list(seen))
+        # what phase_evidence now computes
+        rs = [max(0.0, min(1.0, (h - 0.25) / (s - 0.25)))
+              for h, s in zip(held, seen) if s - 0.25 > 0.05]
+        ev["holdout_field_ratios"] = rs
+        ev["holdout_field_ratio"] = sum(rs) / len(rs)
+        return cfg, ev
+
+    def test_the_gate_now_reads_the_mean_of_the_ratios(self):
+        cfg, ev = self._evidence(self.HELD, self.SEEN)
+        _, checks = evaluate_rung(cfg, phase_named(cfg, "mutual"), ev,
+                                  updates_in_phase=10 ** 6)
+        check = checks["describes combinations it never trained on"]
+        self.assertFalse(check["met"])
+        self.assertIn("fruit", check["detail"])      # named, not just averaged
+        self.assertIn("colour", check["detail"])
+
+    def test_three_fields_that_all_transfer_still_pass(self):
+        cfg, ev = self._evidence([0.72, 0.70, 0.71], [0.98, 0.96, 0.97])
+        _, checks = evaluate_rung(cfg, phase_named(cfg, "mutual"), ev,
+                                  updates_in_phase=10 ** 6)
+        self.assertTrue(
+            checks["describes combinations it never trained on"]["met"])
+
+    def test_a_field_the_language_never_learned_is_left_out(self):
+        """A ratio between two numbers both at the floor is noise. A field with
+        no headroom on trained combinations has nothing to say about
+        generalising, so it neither passes nor fails the gate on its own."""
+        held = [0.72, 0.70, 0.26]
+        seen = [0.98, 0.96, 0.27]                    # quality never learned
+        rs = [(h - 0.25) / (s - 0.25) for h, s in zip(held, seen)
+              if s - 0.25 > 0.05]
+        self.assertEqual(len(rs), 2)
+
+
+class TestTheFieldsDoNotMultiplyOnHeldOutCombinations(unittest.TestCase):
+    """Why the whole round reads 0.000 while every field is well clear of
+    chance. Independent fields would multiply; on a Latin-square holdout they
+    anti-correlate, because getting the fruit and the colour right is exactly
+    what makes the training distribution rule out the true quality."""
+
+    def test_independence_would_predict_sixty_odd_successes(self):
+        held = [0.885, 0.434, 0.447]
+        one_side = held[0] * held[1] * held[2]
+        self.assertGreater(one_side * one_side * 2048, 50)   # both sides, 2048 rounds
+        # and the run measured 0.000, i.e. under one
+
+    def test_on_trained_combinations_they_correlate_the_normal_way(self):
+        seen = [0.966, 0.703, 0.729]
+        predicted = (seen[0] * seen[1] * seen[2]) ** 2
+        self.assertLess(predicted, 0.320)     # observed exceeded independence
+
+
+class TestASettingASnapshotPredatesIsNotDrift(unittest.TestCase):
+    def test_a_key_only_one_side_has_is_skipped(self):
+        from orchard.config import config_diff
+        a = {"bottleneck": {"coverage": 1.0}}
+        b = {"bottleneck": {"coverage": 1.0, "history_share": 0.4}}
+        self.assertEqual(config_diff(a, b, both_only=True), {})
+        self.assertIn("bottleneck.history_share", config_diff(a, b))
+
+    def test_a_real_difference_is_still_reported(self):
+        from orchard.config import config_diff
+        a = {"train": {"batch_size": 4096}}
+        b = {"train": {"batch_size": 256}}
+        self.assertEqual(config_diff(a, b, both_only=True),
+                         {"train.batch_size": (4096, 256)})
+
+
+# ==========================================================================
+class TestWindingACurriculumBackToARung(unittest.TestCase):
+    """`after-<rung>.pt` is written after `cur.advance`, so it holds the weights
+    as they were when the rung passed and a curriculum already pointing at the
+    next one. Resuming it restarts the rung *after* -- right for carrying on,
+    wrong for the other reason to reach for that file: running a rung again
+    because a mechanism it depends on has changed."""
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return Trainer(cfg, d, quiet=True)
+
+    def test_the_promotion_snapshot_points_at_the_next_rung(self):
+        """The premise, so the reason for this flag is not folklore."""
+        src = Path(__file__).resolve().parents[1] / "orchard" / "train.py"
+        text = src.read_text()
+        adv = text.index("nxt = cur.advance(")
+        snap = text.index('self.save_snapshot("after-" + phase.name)')
+        self.assertLess(adv, snap)
+
+    def test_resuming_alone_lands_on_the_rung_after(self):
+        with tempfile.TemporaryDirectory() as d:
+            from orchard.train import Trainer
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")     # as after-mutual holds
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertEqual(tr2.curriculum.phase.name, "ask-qty")
+            tr2.close()
+
+    def test_winding_back_puts_it_on_the_rung_asked_for(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.curriculum.phase.name, "mutual")
+            self.assertEqual(tr2.curriculum.updates_in_phase, 0)
+            self.assertEqual(tr2.curriculum.episodes_in_phase, 0)
+            self.assertEqual(tr2.cost_gate, 0.0)
+            tr2.close()
+
+    def test_it_keeps_the_weights_and_the_community(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            before = [a.net.state_dict() for a in tr.pop.all_agents()]
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.episode, 4096)
+            after = [a.net.state_dict() for a in tr2.pop.all_agents()]
+            self.assertEqual(len(before), len(after))
+            for x, y in zip(before, after):
+                for k in x:
+                    self.assertTrue(torch.equal(x[k], y[k].to(x[k].device)), k)
+            tr2.close()
+
+    def test_the_pool_follows_the_rung_it_lands_on(self):
+        """`mutual` is below the split and `market` is above it; winding between
+        them has to move the pool with the curriculum."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            tr.rewind_to("mutual")
+            self.assertTrue(tr.pop.shared)
+            tr.rewind_to("market")
+            self.assertFalse(tr.pop.shared)
+            tr.close()
+
+    def test_a_rung_that_does_not_exist_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            with self.assertRaises(ValueError) as got:
+                tr.rewind_to("name-smell")
+            self.assertIn("name-smell", str(got.exception))
+            self.assertIn("mutual", str(got.exception))     # the ladder, listed
+            tr.close()
+
+    def test_the_header_says_where_the_run_actually_is(self):
+        """`load_snapshot` writes that line before the curriculum moves, and it
+        is the line anyone checks to confirm which rung they restarted on."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertIn("rung ask-qty", tr2.resume_note)
+            tr2.rewind_to("mutual")
+            self.assertIn("rung mutual", tr2.resume_note)
+            self.assertIn("wound back from ask-qty", tr2.resume_note)
+            tr2.close()

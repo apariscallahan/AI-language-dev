@@ -954,14 +954,22 @@ def config_set(cfg: "Config", path: str, value) -> None:
     setattr(obj, parts[-1], value)
 
 
-def config_diff(a: dict, b: dict, prefix: str = "") -> dict:
-    """{dotted path: (a's value, b's value)} for every leaf that differs."""
+def config_diff(a: dict, b: dict, prefix: str = "", *,
+                both_only: bool = False) -> dict:
+    """{dotted path: (a's value, b's value)} for every leaf that differs.
+
+    ``both_only`` skips leaves one side does not have at all. A snapshot written
+    before a setting existed is not running under a different value of it, and
+    reporting `history_share: snapshot None, here 0.4` as drift would make every
+    new setting look like a mistake on every resume that predates it.
+    """
     out: dict[str, tuple] = {}
-    for k in sorted(set(a) | set(b)):
+    keys = (set(a) & set(b)) if both_only else (set(a) | set(b))
+    for k in sorted(keys):
         va, vb = a.get(k), b.get(k)
         path = "%s%s" % (prefix, k)
         if isinstance(va, dict) and isinstance(vb, dict):
-            out.update(config_diff(va, vb, path + "."))
+            out.update(config_diff(va, vb, path + ".", both_only=both_only))
         elif va != vb:
             out[path] = (va, vb)
     return out

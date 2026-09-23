@@ -691,7 +691,8 @@ class Trainer:
         # stop the run with sixty `size mismatch` lines would instead carry on at
         # the default batch of 256 where the run had been training at 4096, and
         # nothing would say so. So say so.
-        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict()).items()
+        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict(),
+                                             both_only=True).items()
                 if k not in ARCH_KEYS}
         if rest:
             self.log.always("  [resume] running under settings this snapshot was "
@@ -754,6 +755,49 @@ class Trainer:
         lines.append("  resume with the settings the run used, e.g. "
                      "--config configs/<the preset it started from>.json")
         raise RuntimeError("\n".join(lines))
+
+    def rewind_to(self, rung: str) -> None:
+        """Put the curriculum back on ``rung``, keeping everything learned.
+
+        `after-<rung>.pt` is written *after* `cur.advance`, so it holds the
+        weights as they were when the rung was passed and a curriculum already
+        pointing at the next one. Resuming it therefore restarts the rung after,
+        which is right for carrying on and wrong for the other reason to reach
+        for that file: running a rung again because the mechanism it depends on
+        has changed. `mutual` spent its 924 updates with the transmission
+        bottleneck barely working -- a store that had begun evicting the only
+        transcripts a newborn could learn the language from, and newborns taught
+        one seat of two -- and it is the last rung that measures productivity at
+        all, so whatever it leaves is what the trading rungs inherit unmeasured.
+
+        The rung's own clocks go back to zero: time in the rung, the rolling
+        success the cost ramp keys off, and the ramp itself. The weights, the
+        community, the usage counts and the transcript store do not.
+        """
+        cur = self.curriculum
+        names = [p.name for p in cur.phases]
+        if rung not in names:
+            raise ValueError("no rung called %r; the ladder is %s"
+                             % (rung, ", ".join(names)))
+        was = cur.phase.name
+        cur.index = names.index(rung)
+        cur.episodes_in_phase = 0
+        cur.updates_in_phase = 0
+        self.rung_success = RollingStat(window=2000)
+        self._costs_ramp_from = None
+        self.cost_gate = 0.0
+        self.update_cost_gate()
+        self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        # Both depend on which rung is running, and the rung just changed.
+        self.pop.shared = pooled_at(self.cfg, cur.phase)
+        self.maybe_split_roles(cur.phase, log=lambda *_: None)
+        self.log.always("  [resume] wound back from `%s` to `%s`; its clocks "
+                        "restart, the weights and the community do not" % (was, rung))
+        # The header is the line that says where the run actually is, and
+        # `load_snapshot` wrote it before this moved the curriculum.
+        if self.resume_note:
+            self.resume_note = self.resume_note.replace(
+                "rung %s" % was, "rung %s (wound back from %s)" % (rung, was), 1)
 
     def load_snapshot(self, path: str) -> None:
         """Continue from a snapshot, under *this* trainer's configuration."""
