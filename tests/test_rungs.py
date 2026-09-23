@@ -2057,11 +2057,13 @@ class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
     turns a forgotten `--config` into sixty `size mismatch` lines that name
     tensors and never name the setting that is wrong."""
 
-    def _snapshot_at(self, d, d_model, d_ff):
+    def _snapshot_at(self, d, d_model, d_ff, batch_size=None):
         from orchard.train import Trainer
         cfg = cfg_small()
         cfg.population.n_farmers = cfg.population.n_buyers = 2
         cfg.model.d_model, cfg.model.d_ff = d_model, d_ff
+        if batch_size is not None:
+            cfg.train.batch_size = batch_size
         cfg.train.device = "cpu"
         cfg.log.plot = False
         tr = Trainer(cfg, d + "/a", quiet=True)
@@ -2127,4 +2129,26 @@ class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
             msg = str(got.exception)
             self.assertIn("model.d_model", msg)
             self.assertIn("--config", msg)
+            tr2.close()
+
+    def test_it_says_when_the_rest_of_the_settings_differ(self):
+        """Adopting the architecture silently would turn a loud crash into a
+        quiet one: the forgotten `--config` that used to stop the run would
+        instead carry on at the default batch of 256 where it had been training
+        at 4096, and nothing would say so."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384, batch_size=4096)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.train.batch_size = 256          # the snapshot was written at 4096
+            cfg.log.plot = False
+            said = []
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.log.always = lambda m, *a: said.append(m % a if a else m)
+            tr2.load_snapshot(path)
+            joined = "\n".join(said)
+            self.assertIn("not trained with", joined)
+            self.assertIn("train.batch_size", joined)
             tr2.close()

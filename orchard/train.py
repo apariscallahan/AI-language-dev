@@ -676,6 +676,22 @@ class Trainer:
                             "architecture; taking these from the file:")
             for key, now, was in changed:
                 self.log.always("    %-26s %s -> %s" % (key, now, was))
+        # Everything else is the caller's to decide -- a resume is allowed to
+        # shrink the community or change the batch size. It is not allowed to do
+        # so *by accident*, which is exactly what adopting the architecture
+        # silently would otherwise permit: the forgotten `--config` that used to
+        # stop the run with sixty `size mismatch` lines would instead carry on at
+        # the default batch of 256 where the run had been training at 4096, and
+        # nothing would say so. So say so.
+        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict()).items()
+                if k not in ARCH_KEYS}
+        if rest:
+            self.log.always("  [resume] running under settings this snapshot was "
+                            "not trained with (%d):" % len(rest))
+            for key, (was, now) in sorted(rest.items())[:12]:
+                self.log.always("    %-26s snapshot %r, here %r" % (key, was, now))
+            if len(rest) > 12:
+                self.log.always("    ... and %d more" % (len(rest) - 12))
 
     def _check_shapes(self, st: dict) -> None:
         """Refuse a snapshot whose weights do not fit, naming the setting.
