@@ -25,7 +25,8 @@ import torch
 
 from .agents import Agent, count_parameters
 from .bottleneck import TranscriptStore, train_newborn
-from .config import Config
+from .config import (ARCH_KEYS, Config, config_diff, config_get,
+                     config_set)
 from .economy import Economy
 from .gumbel import run_and_update_gumbel
 from .env import BUYER, FARMER, ROLE_NAMES
@@ -35,10 +36,16 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
+<<<<<<< HEAD
 from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
                          convention_applies, evaluate_rung, growth_applies,
                          ladder, phase_named, promotion_for, rung_budget,
                          turnover_applies)
+=======
+from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
+                         costs_apply, evaluate_rung, growth_applies, ladder,
+                         pooled_at, promotion_for, rung_budget, turnover_applies)
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -140,6 +147,8 @@ class Trainer:
         self.lineup_log = JsonlLog(out_dir, "lineups.jsonl")
         # every promotion check, passed or not, with the criteria it applied
         self.promotion_log = JsonlLog(out_dir, "promotions.jsonl")
+        # set by load_snapshot; named here so the banner never depends on a resume
+        self._stale_forms = 0
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # Training scenarios are drawn on device, a whole batch at a time. The
@@ -178,6 +187,9 @@ class Trainer:
         # rung that charges them (`reward.costs_ramp_trigger`); None until then.
         self._costs_ramp_start: Optional[int] = None
         self.rung_success = RollingStat(window=2000)
+        # The update at which this rung's costs began ramping in; None until its
+        # channel has shown it works. Reset with the rung.
+        self._costs_ramp_from: "int | None" = None
         # Training updates so far: one per batch. Budgets, promotion checks,
         # checkpoints, anneals, growth and lifespans all count these.
         self.updates = 0
@@ -221,6 +233,10 @@ class Trainer:
         from .transcripts import TranscriptWriter
         self.transcripts = TranscriptWriter(cfg, out_dir)
         self._beat = (time.time(), 0)
+        # Episodes already played before this process started; 0 unless resumed.
+        # Throughput and ETA are about what this process is doing, not about a
+        # count it inherited.
+        self._episode_at_start = 0
         self._last_checkpoint_episode = -1
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
@@ -456,6 +472,23 @@ class Trainer:
         # _play calls sampler(n, held_out); this one is held-out whatever it asks
         return (lambda n, _ho=False, _s=s: _s(n, held_out=True)) if s is not None else None
 
+    def holdout_floor(self, phase):
+        """(reserved, trained) per-field floors for a message-blind guesser.
+
+        The two pools have different field marginals -- the reserved quarter is
+        16 rows and need not be balanced -- so each per-field number is read
+        against its own pool's floor.
+        """
+        rw = self.referential_world
+        if rw is None:
+            return None
+        held = getattr(rw, "held_combos", None)
+        train = getattr(rw, "train_combos", None)
+        if held is None or train is None:
+            return None
+        from .metrics import pool_field_floor
+        return pool_field_floor(held), pool_field_floor(train)
+
     def chance_for(self, phase) -> float:
         """The floor this phase has to clear (NaN: measured, not analytic)."""
         if phase.referential:
@@ -469,9 +502,16 @@ class Trainer:
     def gather_evidence(self, phase, *, light: bool) -> dict[str, Any]:
         lg = self.cfg.log
         n_eval = lg.ablation_episodes // (2 if light else 1)
+        # The light check halves the episode and topsim budgets, which only adds
+        # noise to the estimates. It used to move the *bar* as well: field
+        # coverage was normalised by H(field), so its ceiling rose with the
+        # probe count and the frequent check was strictly harder to pass than
+        # the checkpoint one. `properties.field_coverage` now divides by the
+        # headroom its own shuffled null leaves, which is steady in the sample.
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
+            holdout_floor_for=self.holdout_floor,
             kind_sampler_for=(None if light else self.kind_sampler),
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
@@ -513,6 +553,7 @@ class Trainer:
             done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
             self.rung_success = RollingStat(window=2000)
+            self._costs_ramp_from = None
             self.update_cost_gate()
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
             cur.transitions[-1]["updates_in_previous_phase"] = done_updates
@@ -627,13 +668,175 @@ class Trainer:
         os.replace(tmp, path)
         return path
 
+    def _adopt_architecture(self, st: dict) -> None:
+        """Take the shape-deciding settings from the snapshot, not from the CLI.
+
+        A resume has exactly one valid reading of these: the one the weights in
+        the file were trained under. Leaving them to the command line means a
+        forgotten `--config` builds the default 48-wide model, tries to pour a
+        96-wide one into it, and prints sixty `size mismatch` lines naming
+        tensors -- none of which names the setting that is wrong. The snapshot
+        has carried the whole config since version 1; it was simply never read.
+        """
+        old = st.get("config") or {}
+        if not old:
+            return
+        changed = []
+        for key in sorted(ARCH_KEYS):
+            try:
+                was, now = config_get(old, key), config_get(self.cfg, key)
+            except (KeyError, AttributeError, TypeError):
+                continue            # a setting this snapshot predates
+            if was != now:
+                config_set(self.cfg, key, was)
+                changed.append((key, now, was))
+        if changed:
+            self.log.always("  [resume] the snapshot was trained with a different "
+                            "architecture; taking these from the file:")
+            for key, now, was in changed:
+                self.log.always("    %-26s %s -> %s" % (key, now, was))
+            # The world, the batched sampler and the lineup were all built in
+            # `__init__` from the settings this just changed. `model.*` only
+            # shapes the agents, but a different fruit count or price-bin count
+            # means the objects drawing the scenarios are now describing a world
+            # nobody is training in -- including the holdout, which is derived
+            # from the field sizes and is the productivity test.
+            if any(not k.startswith("model.") for k, _, _ in changed):
+                self._rebuild_world()
+        # Everything else is the caller's to decide -- a resume is allowed to
+        # shrink the community or change the batch size. It is not allowed to do
+        # so *by accident*, which is exactly what adopting the architecture
+        # silently would otherwise permit: the forgotten `--config` that used to
+        # stop the run with sixty `size mismatch` lines would instead carry on at
+        # the default batch of 256 where the run had been training at 4096, and
+        # nothing would say so. So say so.
+        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict(),
+                                             both_only=True).items()
+                if k not in ARCH_KEYS}
+        if rest:
+            self.log.always("  [resume] running under settings this snapshot was "
+                            "not trained with (%d):" % len(rest))
+            for key, (was, now) in sorted(rest.items())[:12]:
+                self.log.always("    %-26s snapshot %r, here %r" % (key, was, now))
+            if len(rest) > 12:
+                self.log.always("    ... and %d more" % (len(rest) - 12))
+
+    def _rebuild_world(self) -> None:
+        """Rebuild everything `__init__` derived from the settings just adopted."""
+        from .batched import TensorWorld
+        cfg, dev = self.cfg, self.device
+        self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
+        g = torch.Generator(device=dev)
+        g.manual_seed(cfg.train.seed + 11)
+        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
+        self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
+                               n_farms=cfg.population.n_farmers)
+        self.stability = StabilityTracker(cfg, self.world, cfg.log.stability_probes,
+                                          seed=cfg.train.seed + 4)
+        self.forms = (FormTracker(cfg, self.world)
+                      if cfg.log.track_form_survival else None)
+        if cfg.curriculum.enabled:
+            g = torch.Generator(device=dev)
+            g.manual_seed(cfg.train.seed + 13)
+            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g)
+
+    def _check_shapes(self, st: dict) -> None:
+        """Refuse a snapshot whose weights do not fit, naming the setting.
+
+        `_adopt_architecture` fixes every difference it knows about, so anything
+        left is a field nobody listed in `ARCH_KEYS`. Printing the configuration
+        difference puts the culprit in front of whoever is resuming instead of
+        leaving them to infer it from tensor widths.
+        """
+        from .agents import make_agent
+        recs = (st.get("farmers") or []) + (st.get("buyers") or [])
+        if not recs:
+            return
+        probe = make_agent(self.cfg, agent_id=-1, role=recs[0]["role"], slot=0,
+                           generation=0, birth_episode=0, lifespan=1, device="cpu")
+        live = {k: tuple(v.shape) for k, v in probe.net.state_dict().items()}
+        saved = {k: tuple(getattr(v, "shape", ())) for k, v in recs[0]["net"].items()}
+        bad = sorted(k for k in set(live) | set(saved) if live.get(k) != saved.get(k))
+        if not bad:
+            return
+        lines = ["this snapshot's weights do not fit the configuration given.",
+                 "  %d of %d parameters differ, e.g. %s" % (
+                     len(bad), len(live),
+                     "; ".join("%s is %s in the file, %s here"
+                               % (k, saved.get(k), live.get(k)) for k in bad[:3]))]
+        diff = config_diff(st.get("config") or {}, self.cfg.to_dict())
+        if diff:
+            lines.append("  the two configurations differ in:")
+            for key, (was, now) in sorted(diff.items())[:20]:
+                lines.append("    %-32s snapshot %r, here %r" % (key, was, now))
+            if len(diff) > 20:
+                lines.append("    ... and %d more" % (len(diff) - 20))
+        lines.append("  resume with the settings the run used, e.g. "
+                     "--config configs/<the preset it started from>.json")
+        raise RuntimeError("\n".join(lines))
+
+    def rewind_to(self, rung: str) -> None:
+        """Put the curriculum back on ``rung``, keeping everything learned.
+
+        `after-<rung>.pt` is written *after* `cur.advance`, so it holds the
+        weights as they were when the rung was passed and a curriculum already
+        pointing at the next one. Resuming it therefore restarts the rung after,
+        which is right for carrying on and wrong for the other reason to reach
+        for that file: running a rung again because the mechanism it depends on
+        has changed. `mutual` spent its 924 updates with the transmission
+        bottleneck barely working -- a store that had begun evicting the only
+        transcripts a newborn could learn the language from, and newborns taught
+        one seat of two -- and it is the last rung that measures productivity at
+        all, so whatever it leaves is what the trading rungs inherit unmeasured.
+
+        The rung's own clocks go back to zero: time in the rung, the rolling
+        success the cost ramp keys off, and the ramp itself. The weights, the
+        community, the usage counts and the transcript store do not.
+        """
+        cur = self.curriculum
+        names = [p.name for p in cur.phases]
+        if rung not in names:
+            raise ValueError("no rung called %r; the ladder is %s"
+                             % (rung, ", ".join(names)))
+        was = cur.phase.name
+        cur.index = names.index(rung)
+        cur.episodes_in_phase = 0
+        cur.updates_in_phase = 0
+        self.rung_success = RollingStat(window=2000)
+        self._costs_ramp_from = None
+        self.cost_gate = 0.0
+        self.update_cost_gate()
+        self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        # Both depend on which rung is running, and the rung just changed.
+        self.pop.shared = pooled_at(self.cfg, cur.phase)
+        self.maybe_split_roles(cur.phase, log=lambda *_: None)
+        self.log.always("  [resume] wound back from `%s` to `%s`; its clocks "
+                        "restart, the weights and the community do not" % (was, rung))
+        # The header is the line that says where the run actually is, and
+        # `load_snapshot` wrote it before this moved the curriculum.
+        if self.resume_note:
+            self.resume_note = self.resume_note.replace(
+                "rung %s" % was, "rung %s (wound back from %s)" % (rung, was), 1)
+
     def load_snapshot(self, path: str) -> None:
         """Continue from a snapshot, under *this* trainer's configuration."""
         from collections import Counter, defaultdict
 
         from .agents import make_agent
         from .population import BirthEvent
-        st = torch.load(path, map_location=self.device, weights_only=False)
+        # On the host, whatever the run is training on. A snapshot is a file,
+        # and every consumer below places what it needs: `load_state_dict` copies
+        # across devices for both the nets and their optimisers, and the
+        # transcript store is host-side by construction. Mapping the whole file
+        # onto the training device instead put the store on the GPU, so after a
+        # resume it held device tensors from before and host tensors from after
+        # -- which `train_newborn` stacks together at the first birth whose rung
+        # has both. It also loaded every agent's weights and Adam state onto the
+        # card at once, which is the largest allocation a resume makes.
+        st = torch.load(path, map_location="cpu", weights_only=False)
+        # Before anything reads the config: the file decides the architecture.
+        self._adopt_architecture(st)
+        self._check_shapes(st)
         self.episode = int(st["episode"])
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])
@@ -678,6 +881,7 @@ class Trainer:
                 setattr(a, k, rec[k])
             a.updates = int(rec.get("updates", 0))
             return a
+<<<<<<< HEAD
         f_ids = [r["agent_id"] for r in st["farmers"]]
         b_ids = [r["agent_id"] for r in st["buyers"]]
         if self.pop.shared and f_ids == b_ids:
@@ -696,6 +900,44 @@ class Trainer:
             self.pop.farmers = [restore(r) for r in st["farmers"]]
             self.pop.buyers = [restore(r) for r in st["buyers"]]
             self.pop.shared = False
+=======
+        # One pool fills both seats below `curriculum.split_roles_at`, and the
+        # two lists are then *the same list*. Restoring each of them separately
+        # quietly made two copies of every founder -- same agent_id, same
+        # weights, then their own gradients from the first update on -- so a
+        # resumed run below the split trained twice the population it reported
+        # and broke the one-language invariant the rung exists to build. It
+        # surfaced as a crash one rung later: the first newcomer appended to
+        # `farmers` alone, and `pair` -- which uses the farmer count for both
+        # seats when the pool is shared -- handed out a buyer index the buyer
+        # list did not have. Whether the pool is shared is decided by this
+        # run's config and the rung being resumed into, not by the snapshot,
+        # because a resumed run runs under the configuration it is given.
+        self.pop.shared = pooled_at(self.cfg, cur.phase)
+        self.pop.farmers = [restore(r) for r in st["farmers"]]
+        if self.pop.shared:
+            saved = [r["agent_id"] for r in st["buyers"]]
+            if saved != [a.agent_id for a in self.pop.farmers]:
+                self.log.always(
+                    "  [resume] this rung pools both seats, but the snapshot holds a "
+                    "separate buyer list (%s against %s). It was written under a "
+                    "different `curriculum.split_roles_at`; keeping the farmers."
+                    % (saved, [a.agent_id for a in self.pop.farmers]))
+            elif self._pool_had_split(st):
+                # Written by a run that had itself resumed under the bug: the
+                # ids still match, because the copies were restored from the
+                # same records, but they have been training apart ever since.
+                self.log.always(
+                    "  [resume] this snapshot's two seats hold the same agent ids but "
+                    "different weights, so it was written by a run that had split its "
+                    "shared pool into copies (the resume bug fixed in `pooled_at`). "
+                    "Keeping the farmer copies and dropping the buyer ones; the pool "
+                    "is one language again, but the two had drifted apart, so expect "
+                    "the rung to need a stretch to re-settle.")
+            self.pop.buyers = self.pop.farmers
+        else:
+            self.pop.buyers = [restore(r) for r in st["buyers"]]
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         self.pop._next_id = int(st["next_id"])
         self.pop.deaths = int(st["deaths"])
         self.pop.births = [BirthEvent(**b) for b in st["births"]]
@@ -706,7 +948,13 @@ class Trainer:
         u.forms = defaultdict(lambda: defaultdict(float),
                               {k: defaultdict(float, v) for k, v in us["forms"].items()})
         u.form_total = defaultdict(float, us["form_total"])
+        # A snapshot from before the convention key carried *what was asked*
+        # stores keys of a different shape. They cost nothing to keep except a
+        # contrast set full of meanings that are no longer what those keys
+        # denote, and they rebuild within one update, so they go.
+        self._stale_forms = u.drop_stale_forms()
         so = st["store"]
+<<<<<<< HEAD
         # Stored transcripts remember the rung they were played in as a Phase
         # object; re-bind each to this ladder's rung of the same name, and drop
         # any from a rung this ladder does not have.
@@ -721,6 +969,15 @@ class Trainer:
                     getattr(ph, "informer", FARMER))
             kept.append(it)
         self.store._buf = kept[:self.store.capacity]
+=======
+        self.store._buf = list(so["buf"])[:self.store.capacity]
+        # Belt and braces, and it repairs a snapshot written by a run that had
+        # already pulled its store onto the device.
+        stray = self.store.to_host()
+        if stray:
+            self.log.always("  [resume] brought %d stored transcripts back to the host"
+                            % stray)
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
         self.store.total_added = int(so["total_added"])
         self.store.meaning_counts = Counter(so["meaning_counts"])
@@ -728,9 +985,36 @@ class Trainer:
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
+        self._episode_at_start = self.episode
+        self._beat = (time.time(), self.episode)
+        # The ramp is a property of how far *this* rung has got, and the rolling
+        # success it keys off starts empty, so it re-earns its trigger.
+        self._costs_ramp_from = None
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
-        self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s"
-                            % (path, self.updates, self.episode, cur.phase.name))
+        self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
+                            % (path, self.updates, self.episode, cur.phase.name,
+                               ("; dropped %d conventions recorded under the older "
+                                "key format, which rebuild within an update"
+                                % self._stale_forms) if self._stale_forms else ""))
+
+    @staticmethod
+    def _pool_had_split(st: dict) -> bool:
+        """Did the run that wrote this snapshot have a pool of duplicates?
+
+        A healthy shared pool saves the same agents twice, so the two lists are
+        identical tensor for tensor. Copies that have been trained apart are
+        not, and that is the signature of a resume taken before `pooled_at`
+        restored the aliasing.
+        """
+        for fa, ba in zip(st.get("farmers") or [], st.get("buyers") or []):
+            fn, bn = fa.get("net") or {}, ba.get("net") or {}
+            if fn.keys() != bn.keys():
+                return True
+            for k, x in fn.items():
+                y = bn[k]
+                if x.shape != y.shape or not torch.equal(x.cpu(), y.cpu()):
+                    return True
+        return False
 
     def maybe_grow(self) -> None:
         """Newcomers join once the founders have a working language."""
@@ -791,6 +1075,7 @@ class Trainer:
                 and growth_applies(self.cfg, self.curriculum.phase))
 
     def update_cost_gate(self, succ: torch.Tensor = None) -> None:
+<<<<<<< HEAD
         """Speaker costs: off until ``reward.costs_from_rung``, ramped in there.
 
         Nothing is charged for while the words are still being invented. Making
@@ -800,11 +1085,30 @@ class Trainer:
         rung that charges them, the costs wait until the rung's rolling success
         has reached ``costs_ramp_trigger`` times its promotion floor, then rise
         from 0 to full over ``costs_ramp_updates``; every later rung has them on.
+=======
+        """Speaker costs: which rung, and how far into it the channel has got.
+
+        Nothing is charged for while the words are still being invented, which
+        `curriculum.costs_apply` decides per rung. But a rung that invents no
+        new *word* can still need its messages to grow -- `mutual` went from
+        ~2.4 atoms to ~3.6 unaided -- and a per-atom charge from its first
+        update throttles exactly that. Measured: the hyphen fell out of use
+        entirely (1.00 atoms per word), which caps a word at one of 16 atoms,
+        leaving ~51 possible messages for 48 meanings; success at the same
+        episode count was 0.023 against 0.142 with the costs off.
+
+        So within a rung the gate waits for that rung's own success to reach
+        `reward.costs_ramp_trigger` x its promotion floor, then ramps to full
+        over `reward.costs_ramp_updates`. A language has to exist before it can
+        be economised; this is that rule applied inside a rung rather than
+        across them.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         """
         if not self.cfg.curriculum.enabled:
             self.cost_gate = self.convention_gate = 1.0
             return
         phase = self.curriculum.phase
+<<<<<<< HEAD
         R = self.cfg.reward
         self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
         if not costs_apply(self.cfg, phase):
@@ -829,6 +1133,37 @@ class Trainer:
                 return
         n = max(1, int(R.costs_ramp_updates))
         self.cost_gate = min(1.0, max(0.0, (self.updates - self._costs_ramp_start) / n))
+=======
+        self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
+        if not costs_apply(self.cfg, phase):
+            self.cost_gate = 0.0
+            self._costs_ramp_from = None
+            return
+        if succ is not None:
+            self.rung_success.extend(succ.float().tolist())
+        r = self.cfg.reward
+        if r.costs_ramp_trigger <= 0:
+            self.cost_gate = 1.0
+            return
+        if self._costs_ramp_from is None:
+            floor = promotion_for(self.cfg, phase).min_success
+            # Enough of the rung seen to trust the number, then the bar itself.
+            if len(self.rung_success) < 1000:
+                self.cost_gate = 0.0
+                return
+            if self.rung_success.mean < r.costs_ramp_trigger * floor:
+                self.cost_gate = 0.0
+                return
+            self._costs_ramp_from = self.updates
+            self.log.always(
+                "  [costs] %s reached %.3f (%.1fx its %.2f floor): the speaker starts "
+                "paying for length and novelty, ramped in over %s updates"
+                % (phase.name, self.rung_success.mean, r.costs_ramp_trigger, floor,
+                   "{:,}".format(max(0, r.costs_ramp_updates))))
+        over = max(0, int(r.costs_ramp_updates))
+        done = self.updates - self._costs_ramp_from
+        self.cost_gate = 1.0 if over <= 0 else min(1.0, max(0.0, done / over))
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
     def maybe_check_promotion(self) -> None:
         """The light, frequent check -- so a rung that has worked is left promptly."""
@@ -857,7 +1192,13 @@ class Trainer:
         self._last_progress = now
         elapsed = self.log.elapsed()
         total = max(1, self.cfg.train.episodes)
-        rate = self.episode / elapsed if elapsed > 0 else 0.0
+        # Episodes *this process* has played over the time it has been up. A
+        # resumed run carries its predecessor's episode count but not its wall
+        # clock, so dividing the whole count by this process's elapsed time
+        # reported a rate it had never reached and an ETA to match -- and,
+        # unlike the heartbeat's, it stayed wrong for the rest of the run.
+        done = max(0, self.episode - self._episode_at_start)
+        rate = done / elapsed if elapsed > 0 and done else 0.0
         remaining = (total - self.episode) / rate if rate > 0 else float("nan")
         payload = {
             "state": state,
@@ -996,8 +1337,12 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def on_birth(self, newborn: Agent, ev: BirthEvent) -> None:
+        # Below the split one pool fills both seats, so this newborn will play
+        # every buyer's round as well as every farmer's, whichever seat it was
+        # spawned into. It has to be taught both.
+        seats = ((FARMER, BUYER) if self.pop.shared else (newborn.role,))
         info = train_newborn(self.cfg, newborn, self.store, self.bottleneck_rng,
-                             device=self.device)
+                             device=self.device, roles=seats)
         ev.bottleneck = info
         # Spec 5.5: test the newborn the moment it comes out of the bottleneck,
         # before it has played a single live episode.
@@ -1031,6 +1376,14 @@ class Trainer:
                         info["teacher_generations"], info.get("withheld_meanings", 0),
                         acc(info["token_accuracy"]),
                         info.get("own_token_targets", 0), acc(info["decision_accuracy"])))
+            # The other half of the bottleneck, and the one that selects for a
+            # grammar: a learner shown every meaning can memorise the table as
+            # faithfully as its parents. Whether it fired belongs in the log.
+            if info.get("withheld_meanings"):
+                self.log("          held back %d meanings from this learner "
+                         "(%.0f%% of its curriculum) -- it has to say them anyway"
+                         % (info["withheld_meanings"],
+                            100.0 * float(info.get("withheld_share") or 0.0)))
         else:
             self.log("          bottleneck: %s" % info.get("skipped", "disabled"))
         sr = probe.get("success_rate")
@@ -1089,8 +1442,14 @@ class Trainer:
                                 sampler_for=self.phase_sampler)
         # ---- addendum section 3 ------------------------------------------
         words = word_stats(cfg, batches)
+<<<<<<< HEAD
         overlap = cross_role_overlap(cfg, batches)
         qty_live = live_encoding(cfg, batches, field=3, given=0)
+=======
+        overlap = cross_role_overlap(cfg, batches,
+                                     shared_pool=getattr(self.pop, "shared", False))
+        qty_live = live_encoding(cfg, batches, field=1, given=0)
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         lenfreq = length_frequency(cfg, self.pop, self.world, device=self.device,
                                    phase=phase)
         buckets = bucketed_analysis(cfg, self.pop, self.world, device=self.device,
@@ -1154,6 +1513,9 @@ class Trainer:
                     "posdis": v.get("posdis"), "bosdis": v.get("bosdis"),
                     "field_coverage": v.get("field_coverage"),
                     "per_field_coverage": v.get("per_field_coverage"),
+                    "distinct_forms": v.get("distinct_forms"),
+                    "lexicon_size": v.get("lexicon_size"),
+                    "n_probes": v.get("n_probes"),
                     "slots": v.get("positional_rows", [])}
                 for k, v in speakers.items()},
             "context_consistency": self._context_consistency(phase),
@@ -1283,13 +1645,25 @@ class Trainer:
                      sp.get("field_coverage", float("nan")) if sp.get("field_coverage")
                      is not None else float("nan"),
                      [round(x, 2) for x in (sp.get("per_field_coverage") or [])]))
+                if sp.get("lexicon_size"):
+                    L("         lexicon: %d words in %s whole utterances over %s probes, "
+                      "greedily decoded -- what the speakers say, as against what their "
+                      "policies emit when sampled"
+                      % (int(sp["lexicon_size"]),
+                         ("%.0f" % sp["distinct_forms"]) if sp.get("distinct_forms") else "?",
+                         sp.get("n_probes", "?")))
             ov = row.get("cross_role_overlap") or {}
-            L("  cross-role overlap: %.3f weighted (farmer %.0f%% / buyer %.0f%% of word "
-              "tokens are shared forms; Jaccard %.3f)"
-              % (ov.get("weighted_overlap", float("nan")),
-                 100 * ov.get("farmer_share_shared", float("nan")),
-                 100 * ov.get("buyer_share_shared", float("nan")),
-                 ov.get("jaccard_types", float("nan"))))
+            if ov.get("shared_pool"):
+                L("  cross-role overlap: not yet askable -- one pool fills both seats "
+                  "until `%s`, so the two roles are the same agents"
+                  % cfg.curriculum.split_roles_at)
+            else:
+                L("  cross-role overlap: %.3f weighted (farmer %.0f%% / buyer %.0f%% of word "
+                  "tokens are shared forms; Jaccard %.3f)"
+                  % (ov.get("weighted_overlap", float("nan")),
+                     100 * ov.get("farmer_share_shared", float("nan")),
+                     100 * ov.get("buyer_share_shared", float("nan")),
+                     ov.get("jaccard_types", float("nan"))))
             q = row.get("quantity_encoding_live") or {}
             if q.get("n", 0) >= 50:
                 L("  quantity in live messages: %.3f bits beyond variety (shuffled-null "
@@ -1545,6 +1919,24 @@ class Trainer:
         if isinstance(held, (int, float)) and held == held:
             zs = " | held-out %s vs trained %s" % (f(held, "%.2f"),
                                                    f(ev.get("seen_success"), "%.2f"))
+        hf = ev.get("holdout_fields")
+        if isinstance(hf, (int, float)) and hf == hf:
+            # The conjunction goes to zero on any per-field shortfall, so on its
+            # own it cannot tell "memorised" from "most of the way there".
+            zs += " (per field %s vs %s = %s of the headroom)" % (
+                f(hf, "%.2f"), f(ev.get("seen_fields"), "%.2f"),
+                f(ev.get("holdout_field_ratio"), "%.2f"))
+            # Which field, not just how much: the reserved set is a Latin square,
+            # so a held-out round asks for the one quality its (fruit, colour)
+            # pair never showed. One field can sit near zero for that reason
+            # while the other two generalise, and the mean alone cannot say so.
+            acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
+            if acc:
+                names = ("fruit", "colour", "quality")
+                zs += " [" + ", ".join(
+                    "%s %s/%s" % (n, f(a, "%.2f"),
+                                  f(base[i] if base and i < len(base) else None, "%.2f"))
+                    for i, (n, a) in enumerate(zip(names, acc))) + "]"
         per_field = ""
         parts = []
         for lbl in ("farmer", "buyer"):
@@ -1562,12 +1954,21 @@ class Trainer:
             % ("{:,}".format(self.episode), row.get("phase"), succ,
                f(ev.get("transfer"), "%.2f"), zs, per_field,
                "; ".join(roles) or "no speakers probed"))
+        # Two word counts, because one of them was being read as the vocabulary
+        # and is not. The first is over *sampled* play, so it counts every
+        # variant the speaker's policy happens to emit: a flawless 12-word code
+        # emitted at 98% per-symbol accuracy shows up there as ~170 words. The
+        # second is what the speakers actually say when asked -- the same greedy
+        # decode every structure metric uses -- and is the lexicon.
+        lex = max([sp.get("lexicon_size", 0) or 0
+                   for sp in (row.get("per_role_structure") or {}).values()] or [0])
         self.log.always(
-            "    coherence farmer %s buyer %s across %s | overlap %s | %s words, %s atoms/word, "
-            "%s words/utterance, %s silent, %s at buffer end"
+            "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
+            "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end"
             % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
-               w.get("distinct_words", "n/a"), f(w.get("mean_word_len_atoms"), "%.2f"),
+               w.get("distinct_words", "n/a"), lex or "n/a",
+               f(w.get("mean_word_len_atoms"), "%.2f"),
                f(w.get("mean_words_per_message"), "%.2f"),
                f(100 * w.get("silent_frac", float("nan")), "%.0f%%"),
                f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%")))

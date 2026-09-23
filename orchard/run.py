@@ -11,6 +11,7 @@ point of the whole exercise: same code, same seed, one mechanism removed.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -134,9 +135,18 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
 
     from .gumbel import run_and_update_gumbel
 
-    from .curriculum import ReferentialWorld, phase_named
+    from .curriculum import (ReferentialWorld, convention_applies, costs_apply,
+                             phase_named)
+    from .conventions import PopulationUsage
     rw = ReferentialWorld(cfg, device=str(dev),
                           generator=torch.Generator(device=dev).manual_seed(1))
+    # The speaker's own terms are host-side Python (edit distances against the
+    # population's recent forms) and are a real share of an update on the rungs
+    # that have them on, so the benchmark plays each rung with the gates that
+    # rung would actually run under. Timing them off flattered every rung from
+    # `name-all` up. The warm-up step is what gives the record enough support
+    # for the convention bonus to be live by the time anything is timed.
+    usage = PopulationUsage(cfg)
 
     def one_step(phase, n):
         fi, bi = pop.pair(n, device=str(dev))
@@ -147,7 +157,11 @@ def benchmark(cfg: Config, n_batches: int = 12) -> int:
         else:
             sb = tw.sample(n)
         run_and_update_gumbel(cfg, sb, pop.farmers, pop.buyers, fi, bi,
-                              update=100, device=str(dev), phase=phase)
+                              update=100, device=str(dev), phase=phase,
+                              usage=usage,
+                              cost_scale=1.0 if costs_apply(cfg, phase) else 0.0,
+                              convention_scale=(1.0 if convention_applies(cfg, phase)
+                                                else 0.0))
 
     # Rungs differ a lot in cost: one speaking turn in the lineup, the whole
     # dialogue in the market. Time a light, a middle and the heaviest rung, at
@@ -281,6 +295,151 @@ def compare(paths: list[str], out: str) -> int:
 
 
 # --------------------------------------------------------------------------
+def holdout_report(cfg: Config, path: str) -> int:
+    """Which field generalises to combinations nobody trained on, field by field.
+
+    The promotion gate reports one number -- the mean over (fruit, colour,
+    quality) -- and at `mutual` that mean is systematically pessimistic. The
+    reserved set is a Latin square: exactly one quality is withheld from every
+    (fruit, colour) pair, so a held-out round asks for precisely the quality
+    that pair never showed, and a listener that has fit the training
+    distribution is pushed away from it. That field cannot be got right, and it
+    is averaged in with two that can.
+
+    So this prints the breakdown from a finished snapshot, for a run that has
+    already promoted past the only rungs where the gate is evaluated.
+    """
+    import random as _random
+
+    from .metrics import phase_evidence
+    from .train import Trainer
+
+    # Score it under the settings it was trained with, not under this command
+    # line: the report is about the snapshot, and the holdout is derived from
+    # the world's field sizes.
+    saved = (torch.load(path, map_location="cpu", weights_only=False)
+             .get("config"))
+    if saved:
+        keep = cfg.train.device
+        cfg = Config.from_dict(saved, allow_legacy=True)
+        if keep and keep != "auto":
+            cfg.train.device = keep
+    out = os.path.join(os.path.dirname(os.path.abspath(path)), "_holdout_report")
+    trainer = Trainer(cfg, out, quiet=True)
+    trainer.load_snapshot(path)
+    phase = trainer.curriculum.phase
+    if not getattr(phase, "whole", False):
+        # The gate runs at `name-all` and `mutual` only; a later snapshot has to
+        # be scored on the last rung that measured this.
+        cand = [p for p in trainer.curriculum.phases if getattr(p, "whole", False)]
+        if not cand:
+            print("no rung in this ladder measures held-out combinations")
+            return 1
+        phase = cand[-1]
+        print("this snapshot stopped on a rung that does not measure held-out "
+              "combinations; scoring it on `%s`, the last one that does\n" % phase.name)
+    ev = phase_evidence(
+        cfg, trainer.pop, trainer.world, phase,
+        sampler_for=trainer.phase_sampler, n_eval=cfg.log.zeroshot_episodes,
+        n_topsim=cfg.log.topsim_samples, n_semantics=cfg.log.topsim_samples,
+        chance=trainer.chance_for(phase), device=cfg.train.device,
+        rng=_random.Random(0), holdout_sampler_for=trainer.holdout_sampler,
+        holdout_floor_for=trainer.holdout_floor)
+    acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
+    floors = trainer.holdout_floor(phase) or (float("nan"), float("nan"))
+    print("rung %s, %d held-out combinations of %d"
+          % (phase.name, len(trainer.referential_world.holdout.held),
+             cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
+    each = ev.get("holdout_field_ratios") or []
+    print("%-11s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
+    prod_h = prod_s = 1.0
+    for i, name in enumerate(("fruit", "colour", "quality")):
+        if not acc or i >= len(acc):
+            break
+        b = base[i] if base and i < len(base) else float("nan")
+        prod_h *= acc[i]
+        prod_s *= b
+        r = "%9.3f" % each[i] if i < len(each) else "      n/a"
+        note = ""
+        if acc[i] < floors[0]:
+            note = "  <- below the %.2f a message-blind guesser gets" % floors[0]
+        print("%-11s %8.3f %8.3f%s%s" % (name, acc[i], b, r, note))
+    print()
+    print("%-11s %8.3f %8.3f %9.3f   each field once, over %.2f/%.2f"
+          % ("mean", ev.get("holdout_fields", float("nan")),
+             ev.get("seen_fields", float("nan")),
+             ev.get("holdout_field_ratio", float("nan")), floors[0], floors[1]))
+    print()
+    # Independent fields would multiply. Where they do not, the code is right
+    # about each field on its own and wrong about them together -- which is what
+    # a Latin-square holdout produces: get the fruit and the colour right and
+    # the training distribution has ruled out the one quality that is the answer.
+    print("%-11s %8.3f %8.3f   (one side, all three at once)"
+          % ("conjunction", ev.get("holdout_side", float("nan")),
+             ev.get("seen_side", float("nan"))))
+    print("%-11s %8.3f %8.3f   if the three fields were independent"
+          % ("  expected", prod_h, prod_s))
+    print("%-11s %8.3f %8.3f   (both sides, all three)"
+          % ("whole round", ev.get("holdout_success", float("nan")),
+             ev.get("seen_success", float("nan"))))
+    trainer.close()
+    return 0
+
+
+def list_snapshots(where: str) -> int:
+    """What is in each snapshot, and is it safe to resume from?
+
+    Printed before choosing one to carry on from: which rung it stopped on, how
+    far in, how big the community was, and -- the one that is not obvious --
+    whether its two seats are still one pool. Below
+    ``curriculum.split_roles_at`` they have to be, and a snapshot written by a
+    run that resumed before that was guaranteed holds two sets of copies that
+    have been training apart.
+    """
+    import torch
+
+    from .curriculum import ladder
+    from .train import Trainer
+
+    names = [ph.name for ph in ladder(Config())]
+    if os.path.isfile(where):
+        paths = [where]
+    else:
+        paths = sorted(p for p in glob.glob(os.path.join(where, "**", "*.pt"),
+                                            recursive=True))
+    if not paths:
+        print("no snapshots under %s" % os.path.abspath(where))
+        print("(runs keep them in <run>/snapshots/; pass a run folder, that "
+              "folder, or a single .pt)")
+        return 1
+    print("%-34s %-12s %-9s %-9s %s"
+          % ("snapshot", "rung", "update", "pool", "state"))
+    affected = 0
+    for path in paths:
+        try:
+            st = torch.load(path, map_location="cpu", weights_only=False)
+            i = int(st["curriculum"]["index"])
+            split = Trainer._pool_had_split(st)
+            affected += int(split)
+            print("%-34s %-12s %-9s %-9s %s"
+                  % (os.path.relpath(path, where if os.path.isdir(where) else "."),
+                     names[i] if i < len(names) else i,
+                     "{:,}".format(int(st.get("updates", 0))),
+                     "%d+%d" % (len(st["farmers"]), len(st["buyers"])),
+                     "two sets of copies, drifted apart" if split else "one pool"))
+        except Exception as exc:               # a half-written .pt must not stop the list
+            print("%-34s %s" % (os.path.relpath(path), "unreadable: %s" % exc))
+    if affected:
+        print("")
+        print("%d of these were written by a run that had resumed before the pool "
+              "aliasing was fixed." % affected)
+        print("Resuming one is allowed: the farmer copies are kept, the buyer ones "
+              "dropped, and the run says so.")
+        print("A snapshot marked `one pool` is the cleaner place to carry on from "
+              "if you have one at a rung you are happy to redo from.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchard", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -290,12 +449,27 @@ def main(argv: list[str] | None = None) -> int:
                    help="environment-only check with scripted agents (spec step 1)")
     p.add_argument("--compare", nargs="+", default=None,
                    help="finished run directories to overlay")
+    p.add_argument("--snapshots", nargs="?", type=str, const="runs", default=None,
+                   metavar="PATH",
+                   help="list the snapshots under PATH (a run folder, a snapshots "
+                        "folder, or one .pt; default runs/) with the rung, update and "
+                        "community each holds and whether its pool is intact, then exit")
     p.add_argument("--compare-out", type=str, default="runs/comparison")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--resume", type=str, default=None,
                    help="continue from a snapshot (runs/<name>/snapshots/*.pt) under "
                         "the configuration given here; rung, weights, usage and the "
                         "transcript store all carry over")
+    p.add_argument("--resume-at", type=str, default=None, metavar="RUNG",
+                   help="with --resume: put the curriculum back on this rung, "
+                        "keeping the weights, the community and the store. "
+                        "`after-<rung>.pt` holds a curriculum already pointing at "
+                        "the rung after, so this is how a rung is run again once "
+                        "something it depends on has changed")
+    p.add_argument("--holdout-report", type=str, default=None, metavar="SNAPSHOT",
+                   help="score one snapshot on the held-out combinations, field "
+                        "by field, and exit -- which of fruit, colour and quality "
+                        "generalises to combinations nobody trained on")
     p.add_argument("--benchmark", nargs="?", type=int, const=12, default=None,
                    metavar="N",
                    help="time N batches on this machine and print what the "
@@ -304,8 +478,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.compare:
         return compare(args.compare, args.compare_out)
+    if args.snapshots:
+        return list_snapshots(args.snapshots)
 
     cfg = config_from_args(args)
+    if args.holdout_report:
+        return holdout_report(cfg, args.holdout_report)
     if args.smoke:
         return smoke(cfg)
     if args.benchmark:
@@ -323,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
                       started_utc=time.strftime("%Y-%m-%d %H:%M:%S UTC", now))
     if args.resume:
         trainer.load_snapshot(args.resume)
+        if args.resume_at:
+            trainer.rewind_to(args.resume_at)
+    elif args.resume_at:
+        print("--resume-at needs --resume: it moves the curriculum of a snapshot")
+        return 2
     try:
         final = trainer.run()
         trainer.log("")

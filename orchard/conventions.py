@@ -23,11 +23,31 @@ anything:
 
   It is contrastive: similarity (1 - normalised edit distance over the emitted
   symbols -- the measure coherence itself uses) to this meaning's modal form,
-  minus the average similarity to the modal forms of other meanings. Without
-  the second half the cheapest way to "agree" is one form for everything --
-  which is what happened (four spaces, every meaning, within 20k episodes).
-  Silence and bare punctuation are not conventions: an utterance with no atom
-  earns nothing, and modal forms are taken over utterances with at least one.
+  minus the similarity to the *closest* of a sample of other meanings' modal
+  forms. Without a second half the cheapest way to "agree" is one form for
+  everything -- which is what happened (four spaces, every meaning, within 20k
+  episodes). Silence and bare punctuation are not conventions: an utterance
+  with no atom earns nothing, and modal forms are taken over utterances with at
+  least one.
+
+  The contrast subtracts the closest rather than the *average* other form,
+  because the average punishes exactly what this project is trying to build. A
+  compositional code's forms resemble each other -- that is what sharing a
+  morpheme means -- so against the average it reads as undistinctive and is
+  taxed for it. Scored over a 48-meaning space, the average form paid an
+  arbitrary short code 0.281 and a compositional one 0.133, and paid a collapsed
+  fruit-only code 0.204: more than the compositional code it replaces. A GPU run
+  at `mutual`, where the task signal starts at zero and nothing else shapes what
+  is said, duly collapsed onto it -- 7 words of 1.0 atoms, one word per
+  utterance, coherence 0.92, field coverage [0.83, 0.13, 0.05].
+
+  Against the closest other form the question becomes "is this meaning's
+  convention the one my form is nearest to", which a collapsed code fails by
+  construction: every meaning's modal is the same form, so the closest other is
+  identical to its own and the bonus is exactly zero. Compositional 0.062,
+  arbitrary 0.158, both collapses 0.000. Choosing between compositional and
+  arbitrary is not this term's job -- `min_holdout_ratio` and
+  `min_field_coverage` do that -- but paying for the collapse was.
 
   It is measured on symbols, not whole words, because partial agreement has to
   count for a convention to form at all: with ~11k word types in circulation
@@ -61,15 +81,34 @@ from .world import K_EMPTY, K_FIELD
 
 
 def _edit(a: Sequence[int], b: Sequence[int]) -> int:
+    """Levenshtein distance, written for the call count rather than for looks.
+
+    This is 97% of what the convention bonus costs, and the bonus is charged per
+    episode against a sample of other meanings' forms, so it runs tens of
+    thousands of times per training update. The row is carried in a rolling
+    variable and written in place instead of being rebuilt, and the three-way
+    minimum is unrolled: `min(x, y, z)` is a function call per cell.
+    """
     if len(a) < len(b):
         a, b = b, a
-    prev = list(range(len(b) + 1))
+    nb = len(b)
+    if nb == 0:
+        return len(a)
+    prev = list(range(nb + 1))
     for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
+        left = i                       # cur[j-1], carried rather than indexed
+        diag = prev[0]                 # prev[j-1]
+        prev[0] = i
+        for j in range(1, nb + 1):
+            up = prev[j]                           # delete
+            v = diag if ca == b[j - 1] else diag + 1   # substitute
+            if left + 1 < v:                       # insert
+                v = left + 1
+            if up + 1 < v:
+                v = up + 1
+            diag = up
+            prev[j] = left = v
+    return prev[nb]
 
 
 def similarity(a: Sequence[int], b: Sequence[int]) -> float:
@@ -82,6 +121,21 @@ def n_real_fields(cfg: Config, role: int, phase) -> int:
     """How many leading observation slots hold the speaker's actual meaning."""
     from .curriculum import phase_schema
     return sum(1 for k in phase_schema(cfg, role, phase) if k not in (K_EMPTY, K_FIELD))
+
+
+def query_slots(cfg: Config, role: int, phase) -> list[int]:
+    """Observation slots holding *what was asked*, not what is being described.
+
+    A convention is a form for a meaning, and on a rung that asks different
+    questions about the same thing the question is part of the meaning: in
+    ``name-all`` the same (fruit, colour, quality) is asked about as a whole in
+    70% of rounds and one field at a time in the rest, and the right answers are
+    different utterances. Keyed on the tuple alone, one meaning's "convention"
+    was the modal of a blend of answers to different questions, so matching it
+    could not be right more than most of the time.
+    """
+    from .curriculum import phase_schema
+    return [i for i, k in enumerate(phase_schema(cfg, role, phase)) if k == K_FIELD]
 
 
 class PopulationUsage:
@@ -181,6 +235,7 @@ class PopulationUsage:
         return firsts, words
 
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
+<<<<<<< HEAD
         """One convention per (kind of meaning, the meaning, what was asked about).
 
         A lot asked about for its colour alone is not the same meaning as the
@@ -199,6 +254,21 @@ class PopulationUsage:
             return [(kind,) + tuple(r) for r in rows]
         qs = obs[:, q_at].tolist()
         return [(kind,) + tuple(r) + (int(q),) for r, q in zip(rows, qs)]
+=======
+        """(meaning kind, what was asked, what it is about) per episode.
+
+        One gather and one transfer: ``obs`` is on the training device, and
+        bringing the query slots across separately would be a second
+        synchronisation per role per update.
+        """
+        kind = phase.meaning_kind(role)
+        n = n_real_fields(self.cfg, role, phase)
+        q = query_slots(self.cfg, role, phase)
+        # A slice is a view; gathering columns copies. The trading rungs have no
+        # query slot, so they keep the slice and stay exactly as they were.
+        sel = obs[:, :n] if not q else obs[:, q + list(range(n))]
+        return [(kind,) + tuple(r) for r in sel.tolist()]
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
@@ -253,13 +323,18 @@ class PopulationUsage:
                 kind = phase.meaning_kind(role)
                 need = R.convention_min_support / max(self.scale, 1e-12)
                 est = [k for k, v in self.form_total.items() if k[0] == kind and v >= need]
+<<<<<<< HEAD
                 others = self._rng.sample(est, min(R.convention_contrast_samples, len(est)))
+=======
+                n_contrast = max(1, int(R.convention_contrast_samples))
+                others = self._rng.sample(est, min(n_contrast, len(est)))
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
                 other_modal = [(k, self.modal(k)) for k in others]
                 other_modal = [(k, m) for k, m in other_modal if m]
                 other_keys = {ko: mo for ko, mo in other_modal}
                 modal_cache: dict[tuple, Optional[tuple]] = {}
                 sim_cache: dict[tuple, float] = {}
-                base_cache: dict[tuple, tuple[float, int]] = {}
+                base_cache: dict[tuple, list[tuple[tuple, float]]] = {}
 
                 def sim(a, b):
                     key = (a, b)
@@ -277,12 +352,10 @@ class PopulationUsage:
                     if m is None:
                         continue
                     if u not in base_cache:
-                        base_cache[u] = (sum(sim(u, mo) for mo in other_keys.values()),
-                                         len(other_keys))
-                    tot, cnt = base_cache[u]
-                    if k in other_keys:            # never contrast with itself
-                        tot, cnt = tot - sim(u, other_keys[k]), cnt - 1
-                    base = tot / cnt if cnt else 0.0
+                        base_cache[u] = [(ko, sim(u, mo))
+                                         for ko, mo in other_keys.items()]
+                    # The *closest* other convention, not the average one.
+                    base = max((v for ko, v in base_cache[u] if ko != k), default=0.0)
                     conv[i] = R.convention * (sim(u, m) - base)
             out[role] = {
                 "rarity": torch.tensor(rarity, device=dev),
@@ -309,6 +382,43 @@ class PopulationUsage:
                 self.forms[k][tuple(u)] += inc
                 self.form_total[k] += inc
         self.episodes += n_episodes
+
+    def key_arities(self) -> dict[str, int]:
+        """How long a key is, per meaning kind, under the current code.
+
+        Constant within a kind -- the schema decides it -- and it changed when
+        the key started carrying what was asked.
+        """
+        from .curriculum import ladder
+        out: dict[str, int] = {}
+        for ph in ladder(self.cfg):
+            for v in ph.views():
+                for role in (FARMER, BUYER):
+                    if not v.speaks(self.cfg, role):
+                        continue
+                    out[v.meaning_kind(role)] = (
+                        1 + len(query_slots(self.cfg, role, v))
+                        + n_real_fields(self.cfg, role, v))
+        return out
+
+    def drop_stale_forms(self) -> int:
+        """Forget conventions recorded under a key format this code no longer writes.
+
+        A snapshot from before the key carried *what was asked* stores keys of a
+        different arity. Nothing crashes if they are kept -- the new keys simply
+        start without support -- but the stale ones stay in the contrast set for
+        a couple of half-lives, so a speaker is scored against the modal forms
+        of meanings that are not what those keys now denote. They rebuild within
+        an update at any real batch size, so dropping them is cheap and honest.
+        The word counts are untouched: a word is keyed by its atoms.
+        """
+        want = self.key_arities()
+        stale = [k for k in self.forms
+                 if k and k[0] in want and len(k) != want[k[0]]]
+        for k in stale:
+            self.forms.pop(k, None)
+            self.form_total.pop(k, None)
+        return len(stale)
 
     def summary(self) -> dict[str, Any]:
         s = self.scale

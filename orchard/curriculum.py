@@ -215,6 +215,22 @@ class Phase:
         return tuple(k for k in self.kinds if k != self.primary)
 
     @property
+    def invents(self) -> bool:
+        """Does this rung still have a *word* to invent, rather than reuse?
+
+        The lineup rungs each invent their field's words, and `name-all` has to
+        find the three-word utterance where one used to do. Of the request
+        rungs, only the two that introduce a field nothing below them names --
+        `ask-qty` and `quote` -- invent anything; the rest recombine what
+        exists. This is what decides whether the speaker pays for length and
+        for novelty (:func:`costs_apply`), because a price on a word is a
+        pressure on a word that exists: charged while one is still being
+        invented, the cheapest way to be brief is to say the same short
+        nothing.
+        """
+        return self.referential or (self.order and self.asks_first in ("quantity", "price"))
+
+    @property
     def whole(self) -> bool:
         """Is this rung's own job to name a whole lot?"""
         return self.naming and self.primary >= ASK_ALL
@@ -431,8 +447,20 @@ def hindsight_applies(cfg: Config, phase: Phase) -> bool:
 
 
 def costs_apply(cfg: Config, phase: Phase) -> bool:
-    """Does the speaker pay for what it says in this rung? (``reward.costs_from_rung``)"""
-    return phase.index >= phase_named(cfg, cfg.reward.costs_from_rung).index
+    """Does the speaker pay for what it says in this rung?
+
+    Two conditions, because the rule is per-rung and a threshold cannot say it.
+    Not before ``reward.costs_from_rung`` -- a floor, so a run can hold them off
+    entirely -- and not on a rung that still has a word to invent
+    (:attr:`Phase.invents`). Between those, `ask-qty` and `quote` sit above the
+    floor and are still exempt, which a threshold alone would get wrong in one
+    direction or the other: set at `offer` it spares them but also spares
+    `mutual` and `order`, which invent nothing; set at `mutual` it charges them
+    while they are still naming quantity and price.
+    """
+    if phase.index < phase_named(cfg, cfg.reward.costs_from_rung).index:
+        return False
+    return not phase.invents
 
 
 def convention_applies(cfg: Config, phase: Phase) -> bool:
@@ -443,6 +471,21 @@ def convention_applies(cfg: Config, phase: Phase) -> bool:
 def growth_applies(cfg: Config, phase: Phase) -> bool:
     """May newcomers join in this rung? (``population.grow_from_rung``)"""
     return phase.index >= phase_named(cfg, cfg.population.grow_from_rung).index
+
+
+def pooled_at(cfg: Config, phase: Phase) -> bool:
+    """Do both seats come from one pool in this rung? (``curriculum.split_roles_at``)
+
+    Below the split this is an *identity*, not a coincidence: index i of
+    ``Population.farmers`` and index i of ``Population.buyers`` are the same
+    object, which is why :meth:`Population.pair` can seat i opposite a
+    different index and know it has not seated an agent against itself.
+    Anything that rebuilds the two lists has to preserve it.
+    """
+    at = cfg.curriculum.split_roles_at
+    if not (cfg.curriculum.enabled and at):
+        return False
+    return phase.index < phase_named(cfg, at).index
 
 
 def turnover_applies(cfg: Config, phase: Phase) -> bool:
@@ -784,11 +827,38 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         ratio = _num(ev.get("holdout_ratio"))
         chance = _num(ev.get("chance"))
         above_chance = chance != chance or (hs == hs and hs >= k * chance)
-        checks["describes combinations it never trained on"] = (
-            ratio == ratio and ratio >= c.min_holdout_ratio and above_chance,
-            "held-out %s vs seen %s = %s of it, need %.2f%s"
-            % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
-               "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance))))
+        # Where the rung scores a round as a conjunction, judge the ratio on the
+        # fields, not on the conjunction. `mutual` needs three fields right on
+        # each of two novel meanings, so per-field accuracy enters this number
+        # to the sixth power: a code generalising at 0.73 per field against 0.80
+        # trained -- a per-field ratio of 0.91, plainly productive -- scores
+        # 0.15 against 0.26 as a whole round, a joint ratio of 0.58 that fails
+        # a bar it should clear; and 0.60 per field reads 0.05/0.26 = 0.18,
+        # which is not distinguishable from a code that generalises not at all.
+        # The per-field ratio is the same question with the exponent removed,
+        # normalised by the headroom over a message-blind guesser so a memorised
+        # code reads 0.00 rather than the base rate it scores anyway.
+        f_ratio = _num(ev.get("holdout_field_ratio"))
+        if f_ratio == f_ratio:
+            hf, sf = _num(ev.get("holdout_fields")), _num(ev.get("seen_fields"))
+            # Per field, named: one field carrying two weak ones is exactly what
+            # this gate must not let through, and an average cannot show it.
+            each = ev.get("holdout_field_ratios") or []
+            names = ("fruit", "colour", "quality")
+            per = (" [" + ", ".join("%s %s" % (n, _fmt(r))
+                                    for n, r in zip(names, each)) + "]") if each else ""
+            checks["describes combinations it never trained on"] = (
+                f_ratio >= c.min_holdout_ratio,
+                "held-out %s vs seen %s per field = %s of the headroom%s, need "
+                "%.2f (the whole round: %s vs %s)"
+                % (_fmt(hf), _fmt(sf), _fmt(f_ratio), per, c.min_holdout_ratio,
+                   _fmt(hs), _fmt(seen)))
+        else:
+            checks["describes combinations it never trained on"] = (
+                ratio == ratio and ratio >= c.min_holdout_ratio and above_chance,
+                "held-out %s vs seen %s = %s of it, need %.2f%s"
+                % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
+                   "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance))))
     passed = all(v[0] for v in checks.values())
     return passed, {name: {"met": v[0], "detail": v[1]} for name, v in checks.items()}
 

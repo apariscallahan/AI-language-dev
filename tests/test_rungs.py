@@ -399,6 +399,112 @@ class TestSpeakerPressures(unittest.TestCase):
                         "using another meaning's form was rewarded as agreement")
 
 
+class TestTheConventionBonusCannotPayForACollapse(unittest.TestCase):
+    """The term exists to make a population agree. It must not also decide
+    *what* they agree on, and above all it must not pay for agreeing on less.
+
+    Contrasting against the *average* other meaning's form did exactly that: a
+    compositional code's forms resemble each other -- that is what sharing a
+    morpheme means -- so it read as undistinctive and was taxed, while a
+    collapsed code that named one field and dropped the rest was paid more than
+    the code it replaced. A GPU run at `mutual`, where the task signal starts at
+    zero and nothing else shapes what is said, collapsed onto exactly that: 7
+    words of 1.0 atoms, one word per utterance, coherence 0.92, field coverage
+    [0.83, 0.13, 0.05]. The contrast is now against the closest other form.
+    """
+
+    def _codes(self, cfg):
+        import itertools
+        sp = cfg.channel.space_id
+        combos = [c for c in itertools.product(range(3), repeat=3)]
+        rng = random.Random(0)
+        tags = {m: (rng.randrange(cfg.channel.atomic_vocab),
+                    rng.randrange(cfg.channel.atomic_vocab)) for m in combos}
+        return combos, {
+            "compositional": lambda m: (m[0], sp, 3 + m[1], sp, 6 + m[2]),
+            "arbitrary": lambda m: tags[m],
+            "collapse: one field, one atom": lambda m: (m[0],),
+            "collapse: one form for everything": lambda m: (0,),
+        }
+
+    def _earned(self, cfg, combos, form_of, n_contrast):
+        """The real contrast, over the modal forms of a sample of other meanings."""
+        from orchard.conventions import similarity
+        modal = {m: form_of(m) for m in combos}
+        rng = random.Random(3)
+        out = []
+        for _ in range(20):
+            for m in combos:
+                u = modal[m]
+                pool = [o for o in combos if o != m]
+                others = [similarity(u, modal[o])
+                          for o in rng.sample(pool, min(n_contrast, len(pool)))]
+                base = max(others) if others else 0.0
+                out.append(cfg.reward.convention * (similarity(u, modal[m]) - base))
+        return sum(out) / len(out)
+
+    def test_a_collapsed_code_earns_nothing(self):
+        cfg = cfg_small()
+        combos, codes = self._codes(cfg)
+        n = cfg.reward.convention_contrast_samples
+        earned = {k: self._earned(cfg, combos, f, n) for k, f in codes.items()}
+        for name, v in earned.items():
+            if name.startswith("collapse"):
+                self.assertAlmostEqual(
+                    v, 0.0, places=3,
+                    msg="%s earns %+.4f -- the bonus pays to drop a field" % (name, v))
+        self.assertGreater(
+            earned["compositional"], 0.01,
+            "a compositional code earns nothing either, so the term says nothing")
+        for name, v in earned.items():
+            if name.startswith("collapse"):
+                self.assertGreater(
+                    earned["compositional"], v + 0.01,
+                    "%s is paid as well as a compositional code" % name)
+
+    def test_the_sample_is_big_enough_to_find_a_near_neighbour(self):
+        """The contrast takes the closest of a *sample*, so too small a sample
+        misses the near neighbour that makes a collapsed code worth nothing."""
+        cfg = cfg_small()
+        combos, codes = self._codes(cfg)
+        collapse = codes["collapse: one field, one atom"]
+        configured = self._earned(cfg, combos, collapse,
+                                  cfg.reward.convention_contrast_samples)
+        self.assertLess(configured, 0.01,
+                        "at %d contrast samples a collapsed code still earns %+.4f"
+                        % (cfg.reward.convention_contrast_samples, configured))
+        self.assertGreater(self._earned(cfg, combos, collapse, 1), configured,
+                           "the sample size does not affect the contrast at all, "
+                           "which means it is not taking the closest")
+
+    def test_the_live_term_agrees_with_all_that(self):
+        """Through `speaker_terms`, not a reimplementation of it."""
+        cfg = cfg_small()
+        cfg.reward.convention_min_support = 1
+        c = cfg.channel
+        phase = phase_named(cfg, "name-all")
+        obs = torch.tensor([[i % 3, (i // 3) % 3, 0, 3] + [0] * 8 for i in range(9)])
+
+        def run(form_of):
+            u = PopulationUsage(cfg)
+            toks = torch.full((9, c.dialogue_len), c.pad_id, dtype=torch.long)
+            for i in range(9):
+                f = list(form_of(i)) + [c.end_id]
+                toks[i, :len(f)] = torch.tensor(f)
+            for _ in range(8):
+                u.observe(u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs}), 9)
+            t = u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs})[FARMER]
+            return float(t["convention"].mean())
+
+        varied = run(lambda i: (i, c.hyphen_id, 4 + (i % 3)))   # a form per meaning
+        same = run(lambda i: (4,))                              # one form for all
+        self.assertAlmostEqual(same, 0.0, places=3,
+                               msg="one form for every meaning earned %+.4f" % same)
+        self.assertGreater(varied, same,
+                           "saying something different per meaning earned no more "
+                           "than saying one thing for all of them")
+
+
 class TestZeroShotSuppression(unittest.TestCase):
     def _run(self, seen, unseen, n=600):
         orig = M._play
@@ -856,6 +962,298 @@ class TestSnapshots(unittest.TestCase):
             tr2.close()
 
 
+class TestResumeKeepsOnePool(unittest.TestCase):
+    """Below `split_roles_at` the two seats are one list, and that is an
+    identity `Population.pair` relies on: it seats index i opposite a
+    *different* index and calls that "never against itself". Restoring the two
+    saved lists separately made two copies of every founder -- same agent_id,
+    same weights, then their own gradients -- and one rung later the first
+    newcomer appended to `farmers` alone, so `pair` handed out a buyer index
+    the buyer list did not have (IndexError, in the rollout, 4,500 updates in).
+    """
+
+    def _cfg(self):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 2
+        cfg.train.batch_size = 32
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return cfg
+
+    def _round_trip(self, cfg, rung):
+        import tempfile
+        from orchard.train import Trainer
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(rung)
+        tr.maybe_split_roles(tr.curriculum.phase, log=lambda *_: None)
+        path = tr.save_snapshot("t")
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        tr.close()
+        return tr, tr2
+
+    def test_a_pooled_rung_comes_back_as_one_list(self):
+        cfg = self._cfg()
+        _, tr2 = self._round_trip(cfg, "mutual")     # below `haggle`
+        self.assertTrue(tr2.pop.shared, "the resumed pool stopped being shared")
+        self.assertIs(tr2.pop.farmers, tr2.pop.buyers,
+                      "the two seats came back as two lists of copies")
+        tr2.close()
+
+    def test_a_newcomer_after_resuming_grows_both_seats(self):
+        """The crash, in miniature."""
+        cfg = self._cfg()
+        _, tr2 = self._round_trip(cfg, "mutual")
+        tr2.pop.add_newcomer(FARMER, 10)
+        self.assertEqual((len(tr2.pop.farmers), len(tr2.pop.buyers)), (3, 3))
+        f_idx, b_idx = tr2.pop.pair(24)
+        self.assertLess(int(f_idx.max()), len(tr2.pop.farmers))
+        self.assertLess(int(b_idx.max()), len(tr2.pop.buyers))
+        self.assertTrue(all(int(a) != int(b) for a, b in zip(f_idx, b_idx)),
+                        "an agent was seated opposite itself")
+        tr2.close()
+
+    def test_a_split_rung_comes_back_as_two(self):
+        cfg = self._cfg()
+        tr, tr2 = self._round_trip(cfg, "haggle")    # at the split
+        self.assertFalse(tr.pop.shared, "the split never fired")
+        self.assertFalse(tr2.pop.shared)
+        self.assertIsNot(tr2.pop.farmers, tr2.pop.buyers)
+        self.assertEqual([a.agent_id for a in tr2.pop.farmers],
+                         [a.agent_id for a in tr.pop.farmers])
+        self.assertEqual([a.agent_id for a in tr2.pop.buyers],
+                         [a.agent_id for a in tr.pop.buyers])
+        tr2.close()
+
+    def test_pairing_says_so_rather_than_indexing_off_the_end(self):
+        from orchard.population import Population
+        cfg = self._cfg()
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared)
+        pop.buyers = list(pop.farmers)[:1]          # what the resume used to do
+        with self.assertRaises(AssertionError) as caught:
+            pop.pair(8)
+        self.assertIn("shared", str(caught.exception))
+
+    def test_a_snapshot_from_an_affected_run_is_named_as_such(self):
+        """A run that resumed under the bug wrote two lists of drifted copies
+        with matching ids. The loader keeps one and says what it dropped,
+        because the other's training is being discarded."""
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
+        path = tr.save_snapshot("t")
+        healthy = torch.load(path, map_location="cpu", weights_only=False)
+        self.assertFalse(Trainer._pool_had_split(healthy),
+                         "a shared pool was read as duplicated")
+        # what the bug produced: same ids, weights drifted apart
+        split = dict(healthy)
+        split["buyers"] = [dict(r) for r in healthy["buyers"]]
+        first = split["buyers"][0]
+        first["net"] = {k: v.clone() for k, v in first["net"].items()}
+        k0 = next(iter(first["net"]))
+        first["net"][k0] = first["net"][k0] + 1.0
+        self.assertTrue(Trainer._pool_had_split(split),
+                        "drifted copies were read as one pool")
+        tr.close()
+
+    def test_the_snapshot_listing_says_which_are_safe(self):
+        """`--snapshots` is how you choose one to resume from, so it has to tell
+        a healthy pool from two sets of copies."""
+        import io, tempfile
+        from contextlib import redirect_stdout
+        from orchard.run import list_snapshots
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/run", quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
+        path = tr.save_snapshot("latest")
+        tr.close()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(d), 0)
+        out = buf.getvalue()
+        self.assertIn("mutual", out)
+        self.assertIn("one pool", out)
+        self.assertNotIn("drifted", out)
+        # a single file, and a directory with nothing in it
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(path), 0)
+        self.assertIn("one pool", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(list_snapshots(tempfile.mkdtemp()), 1)
+        self.assertIn("no snapshots", buf.getvalue())
+
+    def test_throughput_is_measured_from_where_this_process_started(self):
+        """A resumed run inherits an episode count but not a wall clock.
+
+        Dividing the whole count by this process's elapsed time reported a rate
+        it had never reached: the first heartbeat after resuming an 18.4M-episode
+        run read 137,215 eps/s against a real 700, and `progress.json` -- which
+        a progress bar reads -- kept a version of that error all run.
+        """
+        import json, os, tempfile, time
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.episode = 18_436_096
+        path = tr.save_snapshot("t")
+        tr.close()
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        self.assertEqual(tr2._beat[1], tr2.episode,
+                         "the heartbeat window still starts at episode 0")
+        self.assertEqual(tr2._episode_at_start, tr2.episode)
+        time.sleep(0.05)
+        played = 4096
+        tr2.episode += played
+        tr2.write_progress()
+        with open(os.path.join(d, "b", "progress.json")) as fh:
+            rate = json.load(fh)["episodes_per_second"]
+        self.assertLess(rate, 10 * played,
+                        "throughput still counts the episodes it inherited: %.0f" % rate)
+        tr2.close()
+
+    def test_a_fresh_run_measures_everything_it_played(self):
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        tr = Trainer(cfg, tempfile.mkdtemp(), quiet=True)
+        self.assertEqual(tr._episode_at_start, 0)
+        self.assertEqual(tr._beat[1], 0)
+        tr.close()
+
+    def test_pooled_at_follows_the_split(self):
+        from orchard.curriculum import pooled_at
+        cfg = self._cfg()
+        at = cfg.curriculum.split_roles_at
+        for phase in ladder(cfg):
+            want = phase.index < phase_named(cfg, at).index
+            self.assertEqual(pooled_at(cfg, phase), want, phase.name)
+        cfg.curriculum.split_roles_at = ""
+        self.assertFalse(pooled_at(cfg, phase_named(cfg, "name-all")))
+
+
+class TestTheStoreStaysOnTheHost(unittest.TestCase):
+    """A newborn's apprenticeship stacks what it sampled and moves *that* to the
+    device, so the store is host-side by construction -- `add_batch` copies each
+    batch off the device in one go. Resuming mapped the whole snapshot onto the
+    training device, store included, so the buffer then held device tensors from
+    before the resume and host tensors from after. `train_newborn` groups its
+    sample by rung, so nothing failed until one rung held both: the first birth
+    after a resume taken mid-rung died with "Expected all tensors to be on the
+    same device"."""
+
+    def _cfg(self):
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 2
+        cfg.train.batch_size = 32
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return cfg
+
+    def test_a_snapshot_is_read_on_the_host_whatever_the_run_trains_on(self):
+        """The line that was wrong, asserted so that a CPU box can still see it.
+
+        It read the file onto `self.device`, which on a CPU box *is* the host --
+        so the bug was invisible here and only ever appeared on the GPU. The
+        trainer is therefore given a device it is not on, and the file still has
+        to come to the host; each consumer places what it needs from there
+        (`load_state_dict` copies across devices for the nets and their
+        optimisers alike).
+        """
+        import tempfile
+        import orchard.agents as A
+        import orchard.train as T
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = T.Trainer(cfg, d + "/a", quiet=True)
+        path = tr.save_snapshot("t")
+        tr.close()
+        seen = {}
+        real_load, real_make = T.torch.load, A.make_agent
+
+        def spy(p, *a, **kw):
+            seen["map_location"] = kw.get("map_location", "<positional>")
+            return real_load(p, *a, **kw)
+
+        def on_host(*a, **kw):                 # the agents stay where this box can hold them
+            kw["device"] = "cpu"
+            return real_make(*a, **kw)
+
+        T.torch.load, A.make_agent = spy, on_host
+        try:
+            tr2 = T.Trainer(cfg, d + "/b", quiet=True)
+            tr2.device = "cuda:7"              # a device this box does not have
+            tr2.load_snapshot(path)
+            tr2.close()
+        finally:
+            T.torch.load, A.make_agent = real_load, real_make
+        self.assertEqual(seen.get("map_location"), "cpu",
+                         "the snapshot was read onto the training device (%s), which "
+                         "puts the host-side transcript store on the card"
+                         % seen.get("map_location"))
+
+    def test_the_store_comes_back_on_the_host(self):
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        d = tempfile.mkdtemp()
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        ph = tr.curriculum.phase
+        f_idx, b_idx = tr.pop.pair(32)
+        batch, _ = run_and_update_gumbel(cfg, tr.referential_world.sample(32),
+                                         tr.pop.farmers, tr.pop.buyers,
+                                         f_idx, b_idx, phase=ph, usage=tr.usage)
+        tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        self.assertGreater(len(tr.store), 0, "nothing was stored to check")
+        path = tr.save_snapshot("t")
+        tr.close()
+        tr2 = Trainer(cfg, d + "/b", quiet=True)
+        tr2.load_snapshot(path)
+        for s in tr2.store._buf:
+            for name in s.TENSOR_FIELDS:
+                t = getattr(s, name)
+                self.assertEqual(t.device.type, "cpu",
+                                 "%s came back on %s" % (name, t.device))
+        self.assertEqual(tr2.store.to_host(), 0, "the store was not already host-side")
+        tr2.close()
+
+    def test_a_store_holding_two_rungs_can_still_teach_a_newborn(self):
+        """The grouping that hid the bug: `train_newborn` batches per rung, so a
+        store spanning rungs has to work for every group it makes."""
+        import tempfile
+        from orchard.train import Trainer
+        cfg = self._cfg()
+        cfg.bottleneck.only_successful = False   # untrained agents succeed at nothing
+        tr = Trainer(cfg, tempfile.mkdtemp(), quiet=True)
+        names = [p.name for p in tr.curriculum.phases]
+        for rung in ("name-all", "mutual"):
+            tr.curriculum.index = names.index(rung)
+            ph = tr.curriculum.phase
+            scen = (tr.referential_world.sample_mutual(32) if ph.mutual
+                    else tr.referential_world.sample(32))
+            f_idx, b_idx = tr.pop.pair(32)
+            batch, _ = run_and_update_gumbel(cfg, scen, tr.pop.farmers, tr.pop.buyers,
+                                            f_idx, b_idx, phase=ph, usage=tr.usage)
+            tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        rungs = {s.phase.name for s in tr.store._buf if s.phase is not None}
+        self.assertGreaterEqual(len(rungs), 2, "only one rung reached the store: %s" % rungs)
+        ev = tr.pop.add_newcomer(FARMER, 1, on_birth=tr.on_birth)   # the crashing call
+        self.assertEqual(ev.kind, "newcomer")
+        tr.close()
+
+
 class TestCommunityGrowth(unittest.TestCase):
     def test_founders_then_newcomers_in_new_slots(self):
         from orchard.population import Population
@@ -1306,3 +1704,986 @@ class TestVerdictUsesTheRungsChance(unittest.TestCase):
         v = assess(cfg_small(), final, 0.0)       # 0.0: the trading task's chance
         self.assertEqual(v["verdict"], "NO EMERGENCE")
         self.assertFalse(v["checks"]["learned_to_trade"])
+
+
+class TestAPerfectSpeakerPasses(unittest.TestCase):
+    """The bars are measured, so a flawless describer has to clear them.
+
+    ``TestEveryRungIsReachable`` hands ``evaluate_rung`` an evidence dict of
+    ones, which proves the *rule* can pass but never asks whether the
+    *measurements* can produce those numbers. They could not. ``name-all`` is
+    the only rung judged on message structure, and it is also the rung that
+    mixes queries most -- 70% whole things, 30% single fields -- so 30% of its
+    probes asked a perfect describer for one field and then scored its one-word
+    answer against all three. A flawless, fully compositional, noise-free
+    speaker measured that way reached field coverage 0.33-0.49 against a 0.30
+    bar and topsim 0.32 against its own shuffled null. A real run cannot beat
+    a perfect one, so the rung could not be left.
+    """
+
+    def _cfg(self):
+        cfg = Config()
+        cfg.model.d_model, cfg.model.d_ff = 48, 96
+        return cfg
+
+    def _perfect_speaker(self, cfg):
+        """Name exactly the field(s) asked for, one short word each."""
+        from orchard.curriculum import ASK_ALL
+        sp = cfg.channel.space_id
+        block = [0, cfg.world.n_varieties,
+                 cfg.world.n_varieties + cfg.world.n_colors]
+
+        def speak(m):
+            query = m[3]
+            if query != ASK_ALL:
+                return [block[query] + m[query]]
+            return [block[0] + m[0], sp, block[1] + m[1], sp, block[2] + m[2]]
+        return speak
+
+    def _measure(self, cfg, phase, n):
+        from orchard.properties import field_coverage
+        from orchard.world import K_EMPTY, K_FIELD
+        view = phase.views()[0]
+        kinds = M.phase_kinds(cfg, FARMER, view)
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
+        speak = self._perfect_speaker(cfg)
+        meanings = M.tuple_meanings(cfg, n, seed=7, phase=view,
+                                    query=M.probe_query(view))
+        msgs = [speak(m) for m in meanings]
+        cov = field_coverage(meanings, msgs, real, rng=random.Random(0))["coverage"]
+        ts = M.topographic_similarity(meanings, msgs, cfg, FARMER, metric="hamming",
+                                      rng=random.Random(0), kinds=kinds, n_null=2)
+        return cov, ts["topsim"] - ts["null_mean"]
+
+    def test_a_flawless_describer_clears_the_bars_it_is_judged_on(self):
+        cfg = self._cfg()
+        c = cfg.curriculum
+        for phase in ladder(cfg):
+            if not (phase.swaps and phase.whole):
+                continue            # only these rungs are judged on structure
+            for n in (100, 200):
+                cov, gap = self._measure(cfg, phase, n)
+                # Both metrics run to 1.0, and this speaker is flawless: it
+                # should be near the top of the scale, not a whisker above the
+                # bar. A real code is always worse than this one, so whatever
+                # margin is missing here is missing from every run.
+                self.assertGreaterEqual(
+                    cov, 0.75,
+                    "%s: a perfect describer covers only %.3f of each field over "
+                    "%d probes (bar %.2f) -- no real code can beat it"
+                    % (phase.name, cov, n, c.min_field_coverage))
+                self.assertGreaterEqual(
+                    gap, 0.75,
+                    "%s: a perfect describer is only %.3f clear of its own null "
+                    "over %d probes (bar %.2f)"
+                    % (phase.name, gap, n, c.min_topsim_over_null))
+
+    def test_the_bars_do_not_move_with_the_probe_count(self):
+        """Coverage is a plug-in estimate; its *ceiling* must not follow the sample.
+
+        Normalised by H(field) it did: the same perfect code read 0.50 over 100
+        probes and 0.93 over 800, so the light promotion check (half the probes)
+        was strictly harder to pass than the checkpoint one.
+        """
+        cfg = self._cfg()
+        phase = phase_named(cfg, "name-all")
+        scores = [self._measure(cfg, phase, n)[0] for n in (100, 200, 400)]
+        self.assertLess(max(scores) - min(scores), 0.1,
+                        "field coverage moved %.3f with the probe count alone: %s"
+                        % (max(scores) - min(scores), scores))
+
+    def test_a_describer_that_says_nothing_useful_still_fails(self):
+        """The debias must not turn the bar into a formality."""
+        from orchard.properties import field_coverage
+        from orchard.world import K_EMPTY, K_FIELD
+        cfg = self._cfg()
+        phase = phase_named(cfg, "name-all")
+        view = phase.views()[0]
+        kinds = M.phase_kinds(cfg, FARMER, view)
+        real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
+        meanings = M.tuple_meanings(cfg, 200, seed=7, phase=view,
+                                    query=M.probe_query(view))
+        rng = random.Random(3)
+        noise = [[rng.randrange(cfg.channel.atomic_vocab) for _ in range(3)]
+                 for _ in meanings]
+        cov = field_coverage(meanings, noise, real, rng=random.Random(0))["coverage"]
+        self.assertLess(cov, cfg.curriculum.min_field_coverage,
+                        "a message unrelated to the meaning covered %.3f of each field"
+                        % cov)
+
+    def test_the_probes_ask_the_kind_the_rung_is_promoted_on(self):
+        from orchard.curriculum import ASK_ALL
+        cfg = self._cfg()
+        for phase in ladder(cfg):
+            view = phase.views()[0]
+            q = M.probe_query(view)
+            if not phase.tuples:
+                self.assertIsNone(q, "%s has no query slot to fix" % phase.name)
+                continue
+            if phase.referential:
+                self.assertEqual(q, phase.primary,
+                                 "%s probes a kind it is not promoted on" % phase.name)
+            asked = {m[3] for m in M.tuple_meanings(cfg, 40, seed=1, phase=view, query=q)}
+            self.assertEqual(asked, {q},
+                             "%s probed a mixture: %s" % (phase.name, sorted(asked)))
+        self.assertEqual(M.probe_query(phase_named(cfg, "name-all").views()[0]), ASK_ALL)
+
+    def test_a_probe_feeds_the_observation_the_rung_feeds(self):
+        """The query slot has its own embedding table, so a probe that writes a
+        value the rung never writes is measuring an off-distribution speaker.
+        ``mutual`` pads that slot; the naming rungs fill it with the query."""
+        from orchard.curriculum import ReferentialWorld
+        cfg = self._cfg()
+        gen = torch.Generator().manual_seed(0)
+        rw = ReferentialWorld(cfg, generator=gen)
+        for phase in ladder(cfg):
+            if not phase.tuples:
+                continue
+            view = phase.views()[0]
+            if phase.mutual:
+                real = rw.sample_mutual(8).obs(cfg, FARMER)
+            else:
+                real = rw.sample(8, informer=view.informer, mix=view.mix).obs(
+                    cfg, view.informer)
+            probe = M.tuple_meanings(cfg, 8, seed=2, phase=view,
+                                     query=M.probe_query(view))
+            played = set(real[:, 3].tolist())
+            self.assertIn(probe[0][3], played,
+                          "%s probes with query slot %d, which the rung never "
+                          "puts there (it plays %s)"
+                          % (phase.name, probe[0][3], sorted(played)))
+
+
+class TestTheConventionTermCanAffordToRun(unittest.TestCase):
+    """It is charged per episode against a sample of other meanings' forms, so
+    at a GPU batch it runs tens of thousands of edit distances per update --
+    the whole cost of the term, and pure host-side Python while the device
+    waits. Both the distance and the sample size were tuned for that; neither
+    may change what is computed."""
+
+    def _ref_edit(self, a, b):
+        """The textbook version the tightened one replaced."""
+        if len(a) < len(b):
+            a, b = b, a
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
+
+    def test_the_tightened_edit_distance_is_the_same_distance(self):
+        from orchard.conventions import _edit
+        rng = random.Random(7)
+        for _ in range(4000):
+            a = [rng.randrange(6) for _ in range(rng.randrange(0, 10))]
+            b = [rng.randrange(6) for _ in range(rng.randrange(0, 10))]
+            self.assertEqual(_edit(a, b), self._ref_edit(a, b),
+                             "edit(%s, %s) changed" % (a, b))
+        # the cases the rolling row is easiest to get wrong on
+        self.assertEqual(_edit([], []), 0)
+        self.assertEqual(_edit([1, 2, 3], []), 3)
+        self.assertEqual(_edit([], [1, 2]), 2)
+        self.assertEqual(_edit([1, 2, 3], [1, 2, 3]), 0)
+        self.assertEqual(_edit([1, 2, 3], [1, 9, 3]), 1)
+        self.assertEqual(_edit([1, 2, 3], [1, 3]), 1)
+
+    def test_the_contrast_sample_is_a_knob_and_is_honoured(self):
+        cfg = cfg_small()
+        cfg.reward.convention_min_support = 1
+        c = cfg.channel
+        phase = phase_named(cfg, "name-all")
+        seen = {}
+        for n in (1, 8):
+            cfg.reward.convention_contrast_samples = n
+            u = PopulationUsage(cfg)
+            obs = torch.tensor([[i % 3, (i // 3) % 3, i % 2, 3] + [0] * 8
+                                for i in range(12)])
+            toks = torch.full((12, c.dialogue_len), c.pad_id, dtype=torch.long)
+            for i in range(12):
+                toks[i, :2] = torch.tensor([4 + i % 5, c.end_id])
+            for _ in range(6):
+                u.observe(u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs}), 12)
+            calls = []
+            import orchard.conventions as C
+            real = C.similarity
+            C.similarity = lambda a, b: (calls.append(1), real(a, b))[1]
+            try:
+                u.speaker_terms(phase, toks, {FARMER: obs, BUYER: obs})
+            finally:
+                C.similarity = real
+            seen[n] = len(calls)
+        self.assertLess(seen[1], seen[8],
+                        "the contrast sample size did nothing: %s" % seen)
+
+
+class TestSharedPoolIsNotComparedWithItself(unittest.TestCase):
+    """Below ``split_roles_at`` one pool fills both seats, so "the two roles"
+    are the same agents. Comparing them measured self-agreement: with two
+    founders half of every cross pair was an agent against itself, and the
+    checkpoint line read cross-role coherence 0.56 and overlap 0.87 for a pair
+    that shared no form at all (within-role coherence 0.16)."""
+
+    def test_cross_role_coherence_skips_the_same_agent_in_the_other_seat(self):
+        cfg = cfg_small()
+        tracker = M.StabilityTracker(cfg, M.World(cfg.world, random.Random(0)),
+                                     n_probes=6, seed=1)
+        torch.manual_seed(0)
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared, "the naming rungs are meant to share one pool")
+        self.assertIs(pop.farmers, pop.buyers)
+        phase = phase_named(cfg, "name-all")
+        out = tracker.measure(pop, M.World(cfg.world, random.Random(0)), phase=phase)
+        within = [out["coherence_farmer"], out["coherence_buyer"]]
+        cross = out["coherence_cross"]
+        # With two founders and self-pairs included, cross is pinned at
+        # 1 - d/2 -- always about halfway to 1 however foreign the two codes
+        # are. Excluding them, it can only be the honest between-agent number.
+        self.assertTrue(cross != cross or cross <= max(within) + 0.15,
+                        "cross-role coherence %.3f sits above the within-role "
+                        "numbers %s: self-pairs are still in it" % (cross, within))
+
+    def test_overlap_is_not_answered_while_one_pool_fills_both_seats(self):
+        cfg = cfg_small()
+        batch = _FakeBatch(cfg, [1, 2, 1, 2], [1, 2, 1, 2])
+        shared = cross_role_overlap(cfg, [batch], shared_pool=True)
+        self.assertTrue(shared["weighted_overlap"] != shared["weighted_overlap"],
+                        "a shared pool was scored as if it were two codes")
+        self.assertIn("note", shared)
+        split = cross_role_overlap(cfg, [batch], shared_pool=False)
+        self.assertAlmostEqual(split["weighted_overlap"], 1.0, places=6)
+
+
+class TestConventionsKnowWhatWasAsked(unittest.TestCase):
+    """A convention is a form *for a meaning*, and on a rung that asks different
+    questions about the same thing, the question is part of the meaning. Keyed
+    on the tuple alone, ``name-all``'s conventions blended the answers to "what
+    fruit?" and "what is it?" into one modal form."""
+
+    def test_the_same_tuple_asked_differently_is_a_different_convention(self):
+        cfg = cfg_small()
+        c = cfg.channel
+        u = PopulationUsage(cfg)
+        phase = phase_named(cfg, "name-all")
+        thing = [1, 2, 0]
+        whole = torch.tensor([thing + [3] + [0] * 8])      # ASK_ALL
+        fruit = torch.tensor([thing + [0] + [0] * 8])      # just the fruit
+        keys_whole = u._keys(phase, FARMER, whole)
+        keys_fruit = u._keys(phase, FARMER, fruit)
+        self.assertNotEqual(keys_whole, keys_fruit,
+                            "one key served two questions about the same thing")
+
+    def test_a_rung_with_no_query_slot_is_unchanged(self):
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        market = phase_named(cfg, "market")
+        obs = torch.zeros((2, 40), dtype=torch.long)
+        keys = u._keys(market, BUYER, obs)
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1])
+
+    def test_the_key_reads_kind_then_question_then_meaning(self):
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        phase = phase_named(cfg, "name-all")
+        obs = torch.tensor([[1, 2, 0, 3] + [0] * 8])
+        self.assertEqual(u._keys(phase, FARMER, obs)[0], ("tuple", 3, 1, 2, 0))
+
+    def test_a_resumed_run_forgets_conventions_in_the_older_key_format(self):
+        """Snapshots written before the key carried the question are shorter.
+
+        Kept, they sit in the contrast set for a couple of half-lives, scoring
+        speakers against the modal forms of meanings those keys no longer
+        denote. Word counts are keyed by the word and are untouched.
+        """
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        old_key = ("tuple", 1, 2, 0)            # no question in it
+        new_key = ("tuple", 3, 1, 2, 0)
+        for k in (old_key, new_key):
+            u.forms[k][(4,)] = 20.0
+            u.form_total[k] = 20.0
+        u.words[(4,)] = 40.0
+        u.word_total = 40.0
+        self.assertEqual(u.drop_stale_forms(), 1)
+        self.assertIn(new_key, u.form_total)
+        self.assertNotIn(old_key, u.form_total)
+        self.assertNotIn(old_key, u.forms)
+        self.assertEqual(u.word_total, 40.0, "the word counts were disturbed")
+        self.assertEqual(u.drop_stale_forms(), 0, "it is not idempotent")
+
+    def test_every_kind_of_meaning_has_one_key_length(self):
+        """`drop_stale_forms` is only safe if arity is fixed per meaning kind."""
+        cfg = cfg_small()
+        u = PopulationUsage(cfg)
+        want = u.key_arities()
+        for phase in ladder(cfg):
+            for view in phase.views():
+                for role in (FARMER, BUYER):
+                    if not view.speaks(cfg, role):
+                        continue
+                    obs = torch.zeros((1, 40), dtype=torch.long)
+                    key = u._keys(view, role, obs)[0]
+                    self.assertEqual(len(key), want[key[0]],
+                                     "%s/%s writes a %r key of length %d, not %d"
+                                     % (phase.name, role, key[0], len(key),
+                                        want[key[0]]))
+
+
+# ==========================================================================
+class TestProductivityIsJudgedOnFieldsNotTheConjunction(unittest.TestCase):
+    """`mutual` scores a round only when three fields land on each of two novel
+    meanings. Per-field accuracy therefore enters the held-out number to the
+    sixth power, and the ratio the gate reads is no longer a measure of whether
+    the code generalises -- it is that measure raised to a power that crushes
+    every partial result into the noise around zero."""
+
+    def test_the_conjunction_hides_a_plainly_productive_code(self):
+        # What the exponent does to a code that generalises at 0.73 per field
+        # when it manages 0.80 on what it trained on.
+        per_field_ratio = 0.73 / 0.80
+        joint_ratio = (0.73 ** 6) / (0.80 ** 6)
+        self.assertGreater(per_field_ratio, 0.90)
+        self.assertLess(joint_ratio, 0.60)      # fails the bar it should clear
+
+    def test_the_gate_reads_the_fields_when_they_are_there(self):
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        self.assertTrue(phase.whole)
+        ev = _mutual_evidence(cfg, holdout_fields=0.73, seen_fields=0.80,
+                              holdout_success=0.73 ** 6, seen_success=0.80 ** 6,
+                              holdout_field_ratio=(0.73 - 0.28) / (0.80 - 0.25))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        check = checks["describes combinations it never trained on"]
+        self.assertTrue(check["met"], check["detail"])
+        self.assertIn("per field", check["detail"])
+
+    def test_a_memorised_code_still_fails(self):
+        """The fix must not be a lower bar: a code sitting at the floor for
+        meanings it never saw reads 0.00, not the base rate it scores anyway."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        ev = _mutual_evidence(cfg, holdout_fields=0.28, seen_fields=0.80,
+                              holdout_success=0.0, seen_success=0.80 ** 6,
+                              holdout_field_ratio=0.0)
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        self.assertFalse(
+            checks["describes combinations it never trained on"]["met"])
+
+    def test_a_rung_without_field_reports_keeps_the_old_check(self):
+        """Lineup rungs score one K-way choice, so there is no exponent to
+        remove and the joint ratio is still the right number."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "name-all")
+        ev = _mutual_evidence(cfg, holdout_fields=float("nan"),
+                              seen_fields=float("nan"), holdout_success=0.80,
+                              seen_success=0.85, holdout_field_ratio=float("nan"))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        detail = checks["describes combinations it never trained on"]["detail"]
+        self.assertNotIn("per field", detail)
+
+
+class TestTheFloorComesFromThePoolBeingScored(unittest.TestCase):
+    """A quarter of 64 combinations is 16 rows, and 16 rows need not be balanced.
+    Scoring a per-field number against 1/4 would credit a message-blind guesser
+    with whatever skew the reserved pool happens to have."""
+
+    def test_a_skewed_pool_has_a_higher_floor(self):
+        # fruit is 0 in six of eight rows; colour and quality are balanced.
+        pool = torch.tensor([[0, 0, 0], [0, 1, 1], [0, 2, 2], [0, 3, 3],
+                             [0, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, 0]])
+        floor = M.pool_field_floor(pool)
+        # fruit 6/8, colour 2/8, quality 2/8
+        self.assertAlmostEqual(floor, (0.75 + 0.25 + 0.25) / 3, places=6)
+        self.assertGreater(floor, 0.25)
+
+    def test_a_balanced_pool_sits_at_one_over_the_span(self):
+        pool = torch.tensor([[f, c, q] for f in range(4)
+                             for c in range(4) for q in range(4)])
+        self.assertAlmostEqual(M.pool_field_floor(pool), 0.25, places=6)
+
+    def test_an_empty_pool_is_not_a_crash(self):
+        self.assertNotEqual(M.pool_field_floor(torch.zeros((0, 3), dtype=torch.long)),
+                            M.pool_field_floor(torch.zeros((0, 3), dtype=torch.long)))
+
+
+def _mutual_evidence(cfg, **over):
+    """A `phase_evidence` row that passes every check but the productivity one."""
+    role = {"field_coverage": 1.0, "per_field_coverage": [1.0, 1.0, 1.0],
+            "topsim": 0.9, "topsim_null": 0.1, "topsim_over_null": 0.9,
+            "positional_structure": 0.9, "report": 0.9}
+    ev = {
+        "success": 0.9, "chance": float("nan"), "transfer": 1.0,
+        "holdout_field_acc": None, "seen_field_acc": None,
+        "holdout_field_ratios": None,
+        "holdout_ratio": (over.get("holdout_success", 0.0)
+                          / max(1e-9, over.get("seen_success", 1.0))),
+        "per_role_structure": {"farmer": dict(role), "buyer": dict(role)},
+        "speakers": {"farmer": dict(role), "buyer": dict(role)},
+        "views": [{"success": 0.9, "transfer": 1.0}],
+        "mutual_report": 0.9, "farmer_report": 0.9, "buyer_report": 0.9,
+        "muted_success": 0.05, "by_kind": {},
+    }
+    ev.update(over)
+    return ev
+
+
+import tempfile
+
+
+# ==========================================================================
+class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
+    """The shape-deciding settings have exactly one valid reading on a resume:
+    the one the weights were trained under. Leaving them to the command line
+    turns a forgotten `--config` into sixty `size mismatch` lines that name
+    tensors and never name the setting that is wrong."""
+
+    def _snapshot_at(self, d, d_model, d_ff, batch_size=None):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.model.d_model, cfg.model.d_ff = d_model, d_ff
+        if batch_size is not None:
+            cfg.train.batch_size = batch_size
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.episode = 128
+        path = tr.save_snapshot("t")
+        tr.close()
+        return path
+
+    def test_a_wider_snapshot_loads_under_the_narrow_default(self):
+        """The exact failure a resume without its preset produced: a 96-wide
+        run, resumed under the 48-wide default."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()                      # d_model 48, d_ff 96
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.log.plot = False
+            self.assertEqual(cfg.model.d_model, 48)
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.load_snapshot(path)                # must not raise
+            self.assertEqual(tr2.cfg.model.d_model, 96)
+            self.assertEqual(tr2.cfg.model.d_ff, 384)
+            for a in tr2.pop.all_agents():
+                self.assertEqual(a.net.d_model, 96)
+            tr2.close()
+
+    def test_it_leaves_alone_what_a_resume_may_change(self):
+        """Community size and batch size are not architecture: a resume is
+        allowed to shrink a 32-agent run to 8, which is how this one is run."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.train.batch_size = 77
+            cfg.log.plot = False
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.load_snapshot(path)
+            self.assertEqual(tr2.cfg.train.batch_size, 77)
+            tr2.close()
+
+    def test_a_shape_nobody_listed_still_fails_legibly(self):
+        """`_check_shapes` is the backstop for a field missing from ARCH_KEYS:
+        the message has to name the configuration difference, not the tensors."""
+        import orchard.train as T
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.log.plot = False
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            was = T.ARCH_KEYS
+            T.ARCH_KEYS = frozenset()        # as if nobody had listed d_model
+            try:
+                with self.assertRaises(RuntimeError) as got:
+                    tr2.load_snapshot(path)
+            finally:
+                T.ARCH_KEYS = was
+            msg = str(got.exception)
+            self.assertIn("model.d_model", msg)
+            self.assertIn("--config", msg)
+            tr2.close()
+
+    def test_it_says_when_the_rest_of_the_settings_differ(self):
+        """Adopting the architecture silently would turn a loud crash into a
+        quiet one: the forgotten `--config` that used to stop the run would
+        instead carry on at the default batch of 256 where it had been training
+        at 4096, and nothing would say so."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384, batch_size=4096)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.train.batch_size = 256          # the snapshot was written at 4096
+            cfg.log.plot = False
+            said = []
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.log.always = lambda m, *a: said.append(m % a if a else m)
+            tr2.load_snapshot(path)
+            joined = "\n".join(said)
+            self.assertIn("not trained with", joined)
+            self.assertIn("train.batch_size", joined)
+            tr2.close()
+
+
+# ==========================================================================
+class TestTheHoldoutAsksForTheOneQualityItRuledOut(unittest.TestCase):
+    """The reserved set is a Latin square: for every (fruit, colour) pair
+    exactly one quality is withheld, and a held-out round asks for precisely
+    that value. A listener that has fit the training distribution has learned
+    that value cannot occur there, so one field can sit near zero for a reason
+    that has nothing to do with whether the code is compositional -- and the
+    mean over three fields cannot say which."""
+
+    def test_every_cell_withholds_exactly_one_quality(self):
+        from collections import defaultdict
+
+        from orchard.world import ComboHoldout
+        w = Config().world
+        h = ComboHoldout(w, w.holdout_combo_frac, w.holdout_seed)
+        cells = defaultdict(list)
+        for (f, c, q) in h.held:
+            cells[(f, c)].append(q)
+        self.assertEqual(len(cells), w.n_varieties * w.n_colors)
+        self.assertTrue(all(len(v) == 1 for v in cells.values()))
+
+    def test_one_dead_field_pulls_the_conjunction_to_zero_not_the_mean(self):
+        """Why the whole-round number cannot be read as a productivity failure:
+        two fields generalising beautifully and one at the floor still scores
+        essentially nothing as a conjunction."""
+        fruit, colour, quality = 0.95, 0.80, 0.02
+        mean = (fruit + colour + quality) / 3
+        joint = (fruit * colour * quality) ** 2      # both sides, three fields
+        self.assertGreater(mean, 0.55)
+        self.assertLess(joint, 0.001)                # prints as 0.000
+
+    def test_the_breakdown_is_carried_out_of_the_evaluation(self):
+        vec = M._report_field_vec({"farmer_report_fields": [0.9, 0.8, 0.0],
+                                   "buyer_report_fields": [1.0, 0.8, 0.1]})
+        self.assertEqual(len(vec), 3)
+        self.assertAlmostEqual(vec[0], 0.95, places=6)
+        self.assertAlmostEqual(vec[1], 0.80, places=6)
+        self.assertAlmostEqual(vec[2], 0.05, places=6)
+
+    def test_a_round_that_reports_no_fields_has_no_breakdown(self):
+        self.assertIsNone(M._report_field_vec({"success_rate": 0.5}))
+        self.assertIsNone(M._report_field_vec(None))
+
+    def test_a_ratio_of_two_numbers_at_the_floor_is_not_a_pass(self):
+        """Both at chance is not "generalises perfectly": it is no signal at
+        all, and noise reads 1.00 as readily as 0.00."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        ev = _mutual_evidence(cfg, holdout_fields=0.262, seen_fields=0.259,
+                              holdout_success=0.0, seen_success=0.0,
+                              holdout_field_ratio=float("nan"))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        self.assertFalse(
+            checks["describes combinations it never trained on"]["met"])
+
+
+# ==========================================================================
+class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
+    """Below the split one pool fills both seats, so an agent spawned to replace
+    a farmer also does every buyer's job. `ask-qty` is the first rung where the
+    farmer speaks nowhere, and a newborn taught only the farmer's side came out
+    of the bottleneck with nothing to say and took the buyer's chair anyway."""
+
+    def _store_at(self, tr, phase, n=64):
+        from orchard.curriculum import ladder as _ladder
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(phase)
+        ph = tr.curriculum.phase
+        f_idx, b_idx = tr.pop.pair(n)
+        scen = tr.tensor_world.sample(n)
+        batch, _ = run_and_update_gumbel(tr.cfg, scen, tr.pop.farmers, tr.pop.buyers,
+                                         f_idx, b_idx, phase=ph, usage=tr.usage)
+        tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
+        return ph
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 4
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        cfg.bottleneck.only_successful = False      # untrained agents rarely score
+        cfg.bottleneck.epochs = 1
+        return Trainer(cfg, d, quiet=True)
+
+    def test_at_ask_qty_the_farmer_speaks_nowhere(self):
+        """The precondition, straight from the curriculum."""
+        cfg = Config()
+        ph = phase_named(cfg, "ask-qty")
+        self.assertEqual(ph.own_positions(cfg, FARMER), [])
+        self.assertTrue(ph.own_positions(cfg, BUYER))
+
+    def test_a_shared_pool_always_spawns_the_replacement_a_farmer(self):
+        """Why every birth line in the run reads `farmer`: `turn_over` walks
+        (FARMER, BUYER) over what is, below the split, one list. The farmer pass
+        installs the newborn; the buyer pass then finds it young and skips."""
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 3
+        pop = Population(cfg, random.Random(0))
+        self.assertTrue(pop.shared)
+        self.assertIs(pop.farmers, pop.buyers)
+        for a in pop.all_agents():
+            a.lifespan = 0
+        events = pop.turn_over(episode=1)
+        self.assertTrue(events)
+        self.assertTrue(all(e.role == FARMER for e in events))
+
+    def test_taught_one_seat_it_learns_no_words_at_ask_qty(self):
+        """The failure as it happened: `token acc n/a over 0 own tokens`."""
+        from orchard.bottleneck import train_newborn
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            born = tr.pop.farmers[0]
+            info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
+                                 roles=(FARMER,))
+            self.assertEqual(info.get("own_token_targets", 0), 0)
+            self.assertIsNone(info.get("token_accuracy"))
+            tr.close()
+
+    def test_taught_both_seats_it_learns_the_buyer_s_words(self):
+        from orchard.bottleneck import train_newborn
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            born = tr.pop.farmers[0]
+            info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
+                                 roles=(FARMER, BUYER))
+            self.assertGreater(info.get("own_token_targets", 0), 0)
+            self.assertIsNotNone(info.get("token_accuracy"))
+            self.assertEqual(info.get("roles"), ["farmer", "buyer"])
+            tr.close()
+
+    def test_the_birth_hook_asks_for_both_while_the_pool_is_shared(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            self._store_at(tr, "ask-qty")
+            self.assertTrue(tr.pop.shared)
+            seen = {}
+            import orchard.train as T
+            real = T.train_newborn
+            T.train_newborn = lambda *a, **k: (seen.update(k), real(*a, **k))[1]
+            try:
+                for a in tr.pop.all_agents():
+                    a.lifespan = 0
+                tr.pop.turn_over(episode=1, on_birth=tr.on_birth)
+            finally:
+                T.train_newborn = real
+            self.assertEqual(seen.get("roles"), (FARMER, BUYER))
+            tr.close()
+
+    def test_once_the_roles_split_each_learns_only_its_own(self):
+        """After `haggle` the two pools are genuinely different agents, and a
+        farmer has no business being taught to speak as a buyer."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            tr.pop.split_roles(episode=0)
+            self.assertFalse(tr.pop.shared)
+            seats = ((FARMER, BUYER) if tr.pop.shared else (tr.pop.farmers[0].role,))
+            self.assertEqual(seats, (FARMER,))
+            tr.close()
+
+
+# ==========================================================================
+class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
+    """A hundred updates of `ask-qty` took the store from 22,359 `mutual`
+    transcripts to none. Every later rung names fruit, colour and quality and
+    only adds to them, so a rung with nothing left in the store is a rung whose
+    language can no longer be transmitted to anybody born after it."""
+
+    def _store(self, capacity=100, share=0.4):
+        cfg = cfg_small()
+        cfg.bottleneck.store_capacity = capacity
+        cfg.bottleneck.history_share = share
+        return TranscriptStore(cfg)
+
+    def _fill(self, store, phase, n, episode=0):
+        """Push `n` episodes of one rung through the store's real `_push`."""
+        z = torch.zeros((1, 1), dtype=torch.long)
+        batch = SimpleNamespace(
+            f_obs=z, b_obs=z, tokens=z, active=torch.zeros((1, 1), dtype=torch.bool),
+            f_dec=z, b_dec=z, f_idx=[0], b_idx=[0], phase=phase,
+            sb=SimpleNamespace(want_variety=[0], need_qty=[0]))
+        who = [SimpleNamespace(generation=0)]
+        for i in range(n):
+            store._push(batch, 0, who, who, episode + i)
+
+    def test_the_earlier_rung_keeps_its_share(self):
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100, share=0.4)
+        self._fill(store, first, 100)
+        self.assertEqual(store.phase_counts(), {"mutual": 100})
+        self._fill(store, second, 500, episode=1000)     # five bufferfuls
+        counts = store.phase_counts()
+        self.assertEqual(sum(counts.values()), 100)
+        self.assertEqual(counts["mutual"], 40)           # its 40% floor
+        self.assertEqual(counts["ask-qty"], 60)
+
+    def test_without_the_floor_it_is_flushed_entirely(self):
+        """What the run did: history_share 0 is the old ring buffer."""
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100, share=0.0)
+        self._fill(store, first, 100)
+        self._fill(store, second, 500, episode=1000)
+        self.assertEqual(store.phase_counts(), {"ask-qty": 100})
+
+    def test_three_rungs_split_the_reserve_between_them(self):
+        cfg = cfg_small()
+        a, b, c = (phase_named(cfg, n) for n in ("name-all", "mutual", "ask-qty"))
+        store = self._store(capacity=120, share=0.5)
+        self._fill(store, a, 60)
+        self._fill(store, b, 60, episode=100)
+        self._fill(store, c, 600, episode=1000)
+        counts = store.phase_counts()
+        self.assertEqual(sum(counts.values()), 120)
+        # 50% of 120 reserved, split between the two that are not running
+        self.assertEqual(counts["name-all"], 30)
+        self.assertEqual(counts["mutual"], 30)
+        self.assertEqual(counts["ask-qty"], 60)
+
+    def test_one_rung_alone_still_trims_its_own_oldest(self):
+        cfg = cfg_small()
+        only = phase_named(cfg, "mutual")
+        store = self._store(capacity=50)
+        self._fill(store, only, 130)
+        self.assertEqual(store.phase_counts(), {"mutual": 50})
+        kept = sorted(it.episode for it in store._buf)
+        self.assertEqual(kept, list(range(80, 130)))     # the newest 50
+
+    def test_a_restored_store_rebuilds_its_index(self):
+        """A snapshot carries `buf` and nothing about the per-rung index."""
+        cfg = cfg_small()
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        store = self._store(capacity=100)
+        self._fill(store, first, 50)
+        self._fill(store, second, 50, episode=1000)
+        revived = self._store(capacity=100)
+        revived._buf = list(store._buf)                  # as `load_snapshot` does
+        self.assertEqual(revived._slots, {})
+        self.assertEqual(revived.phase_counts(), {"ask-qty": 50, "mutual": 50})
+
+
+# ==========================================================================
+class TestOneStrongFieldCannotCarryTwoWeakOnes(unittest.TestCase):
+    """The run's own numbers: fruit transferred 0.887 of its headroom, colour
+    0.406 and quality 0.411. A ratio of the two means reads 0.617 and clears a
+    0.60 bar; each field counted once reads 0.568 and does not. The ratio of
+    means weights every field by its headroom, so the field the language learned
+    best is also the field that most decides whether the language generalises --
+    the same masking the per-role and per-kind gates already refuse."""
+
+    HELD = [0.885, 0.434, 0.447]
+    SEEN = [0.966, 0.703, 0.729]
+
+    def test_the_two_aggregations_straddle_the_bar(self):
+        f = 0.25
+        each = [(h - f) / (s - f) for h, s in zip(self.HELD, self.SEEN)]
+        mean_of_ratios = sum(each) / 3
+        ratio_of_means = ((sum(self.HELD) / 3 - f) / (sum(self.SEEN) / 3 - f))
+        self.assertAlmostEqual(mean_of_ratios, 0.568, places=2)
+        self.assertAlmostEqual(ratio_of_means, 0.617, places=2)
+        self.assertLess(mean_of_ratios, 0.60)
+        self.assertGreater(ratio_of_means, 0.60)
+
+    def _evidence(self, held, seen):
+        cfg = cfg_small()
+        ev = _mutual_evidence(
+            cfg, holdout_fields=sum(held) / 3, seen_fields=sum(seen) / 3,
+            holdout_success=0.0, seen_success=0.32,
+            holdout_field_acc=list(held), seen_field_acc=list(seen))
+        # what phase_evidence now computes
+        rs = [max(0.0, min(1.0, (h - 0.25) / (s - 0.25)))
+              for h, s in zip(held, seen) if s - 0.25 > 0.05]
+        ev["holdout_field_ratios"] = rs
+        ev["holdout_field_ratio"] = sum(rs) / len(rs)
+        return cfg, ev
+
+    def test_the_gate_now_reads_the_mean_of_the_ratios(self):
+        cfg, ev = self._evidence(self.HELD, self.SEEN)
+        _, checks = evaluate_rung(cfg, phase_named(cfg, "mutual"), ev,
+                                  updates_in_phase=10 ** 6)
+        check = checks["describes combinations it never trained on"]
+        self.assertFalse(check["met"])
+        self.assertIn("fruit", check["detail"])      # named, not just averaged
+        self.assertIn("colour", check["detail"])
+
+    def test_three_fields_that_all_transfer_still_pass(self):
+        cfg, ev = self._evidence([0.72, 0.70, 0.71], [0.98, 0.96, 0.97])
+        _, checks = evaluate_rung(cfg, phase_named(cfg, "mutual"), ev,
+                                  updates_in_phase=10 ** 6)
+        self.assertTrue(
+            checks["describes combinations it never trained on"]["met"])
+
+    def test_a_field_the_language_never_learned_is_left_out(self):
+        """A ratio between two numbers both at the floor is noise. A field with
+        no headroom on trained combinations has nothing to say about
+        generalising, so it neither passes nor fails the gate on its own."""
+        held = [0.72, 0.70, 0.26]
+        seen = [0.98, 0.96, 0.27]                    # quality never learned
+        rs = [(h - 0.25) / (s - 0.25) for h, s in zip(held, seen)
+              if s - 0.25 > 0.05]
+        self.assertEqual(len(rs), 2)
+
+
+class TestTheFieldsDoNotMultiplyOnHeldOutCombinations(unittest.TestCase):
+    """Why the whole round reads 0.000 while every field is well clear of
+    chance. Independent fields would multiply; on a Latin-square holdout they
+    anti-correlate, because getting the fruit and the colour right is exactly
+    what makes the training distribution rule out the true quality."""
+
+    def test_independence_would_predict_sixty_odd_successes(self):
+        held = [0.885, 0.434, 0.447]
+        one_side = held[0] * held[1] * held[2]
+        self.assertGreater(one_side * one_side * 2048, 50)   # both sides, 2048 rounds
+        # and the run measured 0.000, i.e. under one
+
+    def test_on_trained_combinations_they_correlate_the_normal_way(self):
+        seen = [0.966, 0.703, 0.729]
+        predicted = (seen[0] * seen[1] * seen[2]) ** 2
+        self.assertLess(predicted, 0.320)     # observed exceeded independence
+
+
+class TestASettingASnapshotPredatesIsNotDrift(unittest.TestCase):
+    def test_a_key_only_one_side_has_is_skipped(self):
+        from orchard.config import config_diff
+        a = {"bottleneck": {"coverage": 1.0}}
+        b = {"bottleneck": {"coverage": 1.0, "history_share": 0.4}}
+        self.assertEqual(config_diff(a, b, both_only=True), {})
+        self.assertIn("bottleneck.history_share", config_diff(a, b))
+
+    def test_a_real_difference_is_still_reported(self):
+        from orchard.config import config_diff
+        a = {"train": {"batch_size": 4096}}
+        b = {"train": {"batch_size": 256}}
+        self.assertEqual(config_diff(a, b, both_only=True),
+                         {"train.batch_size": (4096, 256)})
+
+
+# ==========================================================================
+class TestWindingACurriculumBackToARung(unittest.TestCase):
+    """`after-<rung>.pt` is written after `cur.advance`, so it holds the weights
+    as they were when the rung passed and a curriculum already pointing at the
+    next one. Resuming it restarts the rung *after* -- right for carrying on,
+    wrong for the other reason to reach for that file: running a rung again
+    because a mechanism it depends on has changed."""
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return Trainer(cfg, d, quiet=True)
+
+    def test_the_promotion_snapshot_points_at_the_next_rung(self):
+        """The premise, so the reason for this flag is not folklore."""
+        src = Path(__file__).resolve().parents[1] / "orchard" / "train.py"
+        text = src.read_text()
+        adv = text.index("nxt = cur.advance(")
+        snap = text.index('self.save_snapshot("after-" + phase.name)')
+        self.assertLess(adv, snap)
+
+    def test_resuming_alone_lands_on_the_rung_after(self):
+        with tempfile.TemporaryDirectory() as d:
+            from orchard.train import Trainer
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")     # as after-mutual holds
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertEqual(tr2.curriculum.phase.name, "ask-qty")
+            tr2.close()
+
+    def test_winding_back_puts_it_on_the_rung_asked_for(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.curriculum.phase.name, "mutual")
+            self.assertEqual(tr2.curriculum.updates_in_phase, 0)
+            self.assertEqual(tr2.curriculum.episodes_in_phase, 0)
+            self.assertEqual(tr2.cost_gate, 0.0)
+            tr2.close()
+
+    def test_it_keeps_the_weights_and_the_community(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            before = [a.net.state_dict() for a in tr.pop.all_agents()]
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.episode, 4096)
+            after = [a.net.state_dict() for a in tr2.pop.all_agents()]
+            self.assertEqual(len(before), len(after))
+            for x, y in zip(before, after):
+                for k in x:
+                    self.assertTrue(torch.equal(x[k], y[k].to(x[k].device)), k)
+            tr2.close()
+
+    def test_the_pool_follows_the_rung_it_lands_on(self):
+        """`mutual` is below the split and `market` is above it; winding between
+        them has to move the pool with the curriculum."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            tr.rewind_to("mutual")
+            self.assertTrue(tr.pop.shared)
+            tr.rewind_to("market")
+            self.assertFalse(tr.pop.shared)
+            tr.close()
+
+    def test_a_rung_that_does_not_exist_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            with self.assertRaises(ValueError) as got:
+                tr.rewind_to("name-smell")
+            self.assertIn("name-smell", str(got.exception))
+            self.assertIn("mutual", str(got.exception))     # the ladder, listed
+            tr.close()
+
+    def test_the_header_says_where_the_run_actually_is(self):
+        """`load_snapshot` writes that line before the curriculum moves, and it
+        is the line anyone checks to confirm which rung they restarted on."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertIn("rung ask-qty", tr2.resume_note)
+            tr2.rewind_to("mutual")
+            self.assertIn("rung mutual", tr2.resume_note)
+            self.assertIn("wound back from ask-qty", tr2.resume_note)
+            tr2.close()

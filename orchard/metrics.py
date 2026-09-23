@@ -229,6 +229,12 @@ def greedy_turn(cfg: Config, agent: Agent, obs: torch.Tensor, tokens: torch.Tens
 
 
 def _strip(cfg: Config, row: Sequence[int]) -> list[int]:
+    """Drop the padding from one already-on-host row of symbols.
+
+    ``row`` must not be a device tensor: iterating one element by element
+    synchronises the device on every symbol. Callers with a batch bring the
+    whole thing across once (see :func:`utterances_for_meanings`).
+    """
     return [int(t) for t in row if int(t) != cfg.channel.pad_id]
 
 
@@ -273,7 +279,12 @@ def utterances_for_meanings(cfg: Config, agent: Agent, meanings: Sequence[Sequen
         tokens[:, :turn * L] = context[:turn * L].unsqueeze(0)
     greedy_turn(cfg, agent, obs, tokens, turn, schema=phase_schema(cfg, seat, ph),
                 self_mask=ph.self_mask(cfg, seat, device))
-    return [_strip(cfg, tokens[i, turn * L:(turn + 1) * L]) for i in range(n)]
+    # One transfer for the batch. Per row it was one device synchronisation per
+    # symbol -- 24 of them per probe, times every probe and every agent, at
+    # every promotion check.
+    pad = c.pad_id
+    return [[t for t in row if t != pad]
+            for row in tokens[:, turn * L:(turn + 1) * L].tolist()]
 
 
 def phase_kinds(cfg: Config, role: int, phase=None) -> list[int]:
@@ -291,14 +302,30 @@ def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
 
 
 def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
+<<<<<<< HEAD
                    held_out: bool = False) -> list[tuple[int, ...]]:
     """Lots to describe -- (fruit, colour, quality, quantity, price) -- plus the
     field being asked about.
+=======
+                   held_out: bool = False, query: Optional[int] = None
+                   ) -> list[tuple[int, ...]]:
+    """(fruit, colour, quality) things to describe, plus the field being asked about.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
     The describer's observation in a naming rung is the lot *and* the query, so
     a probe that left the query out would be asking about the wrong rung: in
     ``name-color`` every probe has to say "colour" for the answer to mean
     anything.
+
+    ``query`` fixes the question every probe asks.  The structure metrics pass
+    the rung's own ``primary`` kind, because they score a message against the
+    *whole* tuple and have no way to know a probe only asked for one field of
+    it: on a mixed rung like ``name-all`` (70% whole things, 30% single fields)
+    a perfect describer answers 30% of the probes with one word, and those
+    answers are read as two fields randomly dropped.  Left to the mixture, that
+    alone caps a flawless speaker's field coverage at 0.7 of the estimator's own
+    ceiling.  ``None`` keeps the rung's mixture, which is what the report wants
+    when it is describing what the rung actually plays.
     """
     from .curriculum import ASK_ALL, N_KINDS, ReferentialWorld
     from .world import n_obs_slots
@@ -307,6 +334,7 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
     rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
+<<<<<<< HEAD
     mix = getattr(phase, "mix", None) or ((0.0,) * (N_KINDS - 1) + (1.0,))
     total = float(sum(mix)) or 1.0
     # The probe asks the fields the rung asks, as often as the rung asks them.
@@ -314,6 +342,18 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     asks = (asks + [ASK_ALL] * n)[:n]
     perm = torch.randperm(n, generator=g).tolist()
     asks = [asks[i] for i in perm]
+=======
+    if query is not None:
+        asks = [int(query)] * n
+    else:
+        mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
+        total = float(sum(mix)) or 1.0
+        # The probe asks the fields the rung asks, as often as the rung asks them.
+        asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
+        asks = (asks + [ASK_ALL] * n)[:n]
+        perm = torch.randperm(n, generator=g).tolist()
+        asks = [asks[i] for i in perm]
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     out = []
     for i, r in enumerate(rows):
         row = tuple(r) + (asks[i],)
@@ -321,13 +361,38 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     return out
 
 
+def probe_query(phase) -> Optional[int]:
+    """What goes in the query slot of a structure probe on this rung.
+
+    A naming rung is promoted on the kind of round it introduces -- everything
+    else about it is rehearsal -- so its describer's code is measured on that
+    kind too, and the probe asks ``phase.primary``.
+
+    ``mutual`` has the same observation *schema* (a tuple and a query slot) but
+    never fills the query in: :meth:`MutualBatch.obs` pads it with zeros,
+    because both sides simply hold a thing and nobody is asked about a field.
+    The probes were writing ASK_ALL there, which is a value that slot never
+    takes in training, and ``K_FIELD`` has its own embedding table -- so every
+    structure number on ``mutual`` was read off an observation the speaker had
+    never been trained on. The probe feeds what the rung feeds.
+
+    ``None`` outside the tuple rungs, where there is no query slot at all.
+    """
+    if phase is None or not getattr(phase, "tuples", False):
+        return None
+    if getattr(phase, "mutual", False):
+        return 0
+    return int(getattr(phase, "primary", 3))
+
+
 def sample_meanings(cfg: Config, world: World, role: int, n: int,
                     *, held_out: bool | None = False, phase=None,
-                    seed: Optional[int] = None) -> list[tuple[int, ...]]:
+                    seed: Optional[int] = None,
+                    query: Optional[int] = None) -> list[tuple[int, ...]]:
     if phase is not None and phase.tuples:
         return tuple_meanings(cfg, n, seed if seed is not None
                               else random.Random().randrange(1 << 30),
-                              phase=phase, held_out=bool(held_out))
+                              phase=phase, held_out=bool(held_out), query=query)
     from .world import n_obs_slots
     width = n_obs_slots(cfg.world, cfg)
     out = []
@@ -411,6 +476,10 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
 
     A role that does not speak in the phase is reported as NaN with
     ``silent`` set, rather than probed anyway -- a lineup guesser never talks.
+
+    Every probe asks the rung's own kind of round (:func:`probe_query`), so a
+    describer is measured on the job the rung is promoted for rather than on a
+    blend of that and the rehearsal rounds mixed in beneath it.
     """
     rng = rng or random.Random(0)
     out: dict[str, Any] = {}
@@ -438,7 +507,8 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
         kinds = phase_kinds(cfg, role, view)
         ctx = opening_context(cfg, pop, world, view, device)
         meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
-                                   seed=rng.randrange(1 << 30))
+                                   seed=rng.randrange(1 << 30),
+                                   query=probe_query(view))
         per_agent = []
         from .properties import disentanglement
         real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
@@ -446,6 +516,8 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
         cap = max(1, cfg.log.max_agents_probed)
         if len(pool) > cap:
             pool = random.Random(cfg.train.seed + len(pool)).sample(pool, cap)
+        from .env import parse_words
+        lexicon: set = set()
         for agent in pool:
             msgs = utterances_for_meanings(cfg, agent, meanings, context=ctx,
                                            device=device, phase=view, role=role)
@@ -456,11 +528,16 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
             dis = disentanglement(meanings, msgs, real, cfg.channel.max_msg_len)
             from .properties import field_coverage
             cov = field_coverage(meanings, msgs, real, rng=rng)
+            mine = {tuple(w) for m in msgs for w in parse_words(cfg, m)}
+            lexicon |= mine
             per_agent.append({"agent": agent.name, "generation": agent.generation,
                               "topsim": r["topsim"], "null": r["null_mean"],
                               "z": r["z"], "topsim_l1": r_l1["topsim"],
                               "posdis": dis["posdis"], "bosdis": dis["bosdis"],
                               "field_coverage": cov["coverage"],
+                              "distinct_forms": len({tuple(m) for m in msgs}),
+                              "distinct_words": len(mine),
+                              "n_probes": len(msgs),
                               "per_field": cov["per_field"]})
         vals = [a["topsim"] for a in per_agent if a["topsim"] == a["topsim"]]
         l1s = [a["topsim_l1"] for a in per_agent if a["topsim_l1"] == a["topsim_l1"]]
@@ -476,6 +553,15 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
             "posdis": avg("posdis"),
             "bosdis": avg("bosdis"),
             "field_coverage": avg("field_coverage"),
+            # How many different things a speaker says at all, over probes it
+            # answers deterministically. Beside the sampled word count this
+            # separates a large lexicon from a speaker that is merely unsure:
+            # a flawless 12-word code, emitted with 98% per-symbol accuracy,
+            # shows up as ~170 distinct sampled words.
+            "distinct_forms": avg("distinct_forms"),
+            "distinct_words": avg("distinct_words"),
+            "lexicon_size": len(lexicon),
+            "n_probes": per_agent[0]["n_probes"] if per_agent else 0,
             "per_field_coverage": [
                 (sum(a["per_field"][i] for a in per_agent) / len(per_agent))
                 for i in range(len(per_agent[0]["per_field"]))] if per_agent else [],
@@ -617,8 +703,18 @@ class StabilityTracker:
         cross = float("nan")
         if ("farmer" in by_role and "buyer" in by_role
                 and kind_of["farmer"] == kind_of["buyer"]):
+            # Below `split_roles_at` one pool fills both seats, so row i of each
+            # list is the *same agent* in the other seat. Comparing it with
+            # itself asks whether an agent agrees with itself, which it does,
+            # and with two founders that was half of every pair: cross read
+            # 0.56 where the honest number -- the two founders sharing no form
+            # at all -- was 0.16. Training never seats an agent opposite
+            # itself, and neither does this.
+            shared = getattr(pop, "shared", False)
             d = [normalised_levenshtein(a, b)
-                 for fm in by_role["farmer"] for bm in by_role["buyer"]
+                 for i, fm in enumerate(by_role["farmer"])
+                 for j, bm in enumerate(by_role["buyer"])
+                 if not (shared and i == j)
                  for a, b in zip(fm, bm)]
             cross = 1.0 - sum(d) / len(d) if d else float("nan")
         vals = [v for v in coherence.values() if v == v]
@@ -997,12 +1093,78 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
     return {"n": len(same), "same_meaning": s, "different_meaning": d, "consistency": s - d}
 
 
+def _report_fields(res) -> float:
+    """Mean per-field report accuracy over both roles, or NaN if not a mutual round."""
+    vals = []
+    for k in ("farmer_report_fields", "buyer_report_fields"):
+        v = (res or {}).get(k)
+        if v:
+            vals.extend(float(x) for x in v)
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _report_side(res) -> float:
+    """How often ONE side got all three fields at once, averaged over the roles.
+
+    Sits between the per-field numbers and the whole round, and the gap between
+    it and the product of the per-field rates is the whole story on held-out
+    combinations: independent fields would multiply, and these do not.
+    """
+    vals = [(res or {}).get(k) for k in ("farmer_report", "buyer_report")]
+    vals = [float(v) for v in vals if isinstance(v, (int, float)) and v == v]
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _report_field_vec(res) -> "list[float] | None":
+    """(fruit, colour, quality) report accuracy, averaged over the two roles.
+
+    The mean over all six numbers hides which field is carrying it, and on
+    held-out combinations that is the whole question: the reserved set is a
+    Latin square, so for every (fruit, colour) pair exactly one quality is
+    withheld and the held-out round asks for precisely the value the training
+    distribution says cannot occur there. A listener that has fit that
+    distribution is pushed *away* from the right quality, which can hold one
+    field near zero while the other two generalise perfectly well.
+    """
+    rows = [(res or {}).get(k) for k in ("farmer_report_fields", "buyer_report_fields")]
+    rows = [r for r in rows if r]
+    if not rows:
+        return None
+    n = min(len(r) for r in rows)
+    return [sum(float(r[i]) for r in rows) / len(rows) for i in range(n)]
+
+
+def pool_field_floor(pool) -> float:
+    """Per field, the best a listener that hears nothing can do on this pool.
+
+    Combinations are drawn uniformly from a pool, but a *pool* need not have
+    uniform field marginals: the reserved quarter is 16 rows of 64, and one
+    fruit can easily be six of them. A guesser that ignores the message and
+    always says the commonest value scores that share, so it is the floor a
+    per-field number has to be read against -- exactly as ``round_chance`` is
+    the floor for a lineup. Returns the mean of that share over the three
+    fields.
+    """
+    try:
+        n = int(pool.shape[0])
+    except Exception:
+        return float("nan")
+    if n <= 0:
+        return float("nan")
+    shares = []
+    for col in range(int(pool.shape[1])):
+        counts = torch.bincount(pool[:, col].reshape(-1).long())
+        shares.append(float(counts.max()) / n)
+    return sum(shares) / len(shares) if shares else float("nan")
+
+
 # ---- the evidence a curriculum rung is judged on ---------------------------
 def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    sampler_for, n_eval: int, n_topsim: int, n_semantics: int,
                    chance: float, device: str = "cpu",
                    rng: Optional[random.Random] = None,
                    holdout_sampler_for=None,
+                   holdout_floor_for=None,
                    kind_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
@@ -1064,8 +1226,19 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     # Held-out combinations, played exactly like the rung itself.
     out["holdout_success"] = float("nan")
     out["holdout_ratio"] = float("nan")
+    out["holdout_fields"] = float("nan")
+    out["seen_fields"] = float("nan")
+    out["holdout_field_acc"] = None
+    out["seen_field_acc"] = None
+    out["holdout_field_ratios"] = None
+    out["holdout_side"] = float("nan")
+    out["seen_side"] = float("nan")
+    out["holdout_field_ratio"] = float("nan")
     if holdout_sampler_for is not None:
         hs, seen = [], []
+        hf, sf = [], []
+        hv, sv = [], []
+        hd, sd = [], []
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1083,12 +1256,35 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             if h.get("n"):
                 hs.append(h["success_rate"])
                 seen.append(s["success_rate"])
+                # Where a round is scored as a conjunction, the conjunction is a
+                # terrible estimator of whether the code generalises: `mutual`
+                # wants three fields right on each of two novel meanings, so a
+                # per-field shortfall is raised to the sixth power. Per-field
+                # accuracy on the same rounds answers the same question without
+                # the exponent -- the argument the request rungs already make
+                # ("which field arrived, not the conjunction").
+                a, b = _report_fields(h), _report_fields(s)
+                if a == a:
+                    hf.append(a)
+                if b == b:
+                    sf.append(b)
+                va, vb = _report_field_vec(h), _report_field_vec(s)
+                if va:
+                    hv.append(va)
+                if vb:
+                    sv.append(vb)
+                da, db = _report_side(h), _report_side(s)
+                if da == da:
+                    hd.append(da)
+                if db == db:
+                    sd.append(db)
         if hs:
             out["holdout_success"] = sum(hs) / len(hs)
             base = sum(seen) / len(seen) if seen else float("nan")
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
+<<<<<<< HEAD
         if phase.reporting and last_abl:
             # Per field, for the report rungs: a listener whose heads have learned
             # the training set's joint puts no mass on a reserved combination
@@ -1127,6 +1323,57 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             out["holdout_field_success"] = sum(hs_f) / len(hs_f) if hs_f else float("nan")
             out["seen_field_success"] = sum(seen_f) / len(seen_f) if seen_f else float("nan")
             out["holdout_field_ratio"] = sum(ratios) / len(ratios) if ratios else float("nan")
+=======
+        for key, rows in (("holdout_field_acc", hv), ("seen_field_acc", sv)):
+            if rows:
+                n = min(len(r) for r in rows)
+                out[key] = [sum(r[i] for r in rows) / len(rows) for i in range(n)]
+        if hd:
+            out["holdout_side"] = sum(hd) / len(hd)
+        if sd:
+            out["seen_side"] = sum(sd) / len(sd)
+        if hf and sf:
+            out["holdout_fields"] = sum(hf) / len(hf)
+            out["seen_fields"] = sum(sf) / len(sf)
+            h_floor = s_floor = 0.0
+            if holdout_floor_for is not None:
+                got = holdout_floor_for(phase)
+                if got is not None:
+                    h_floor, s_floor = got
+                    h_floor = 0.0 if h_floor != h_floor else h_floor
+                    s_floor = 0.0 if s_floor != s_floor else s_floor
+            # Headroom over what a message-blind guesser gets, so a memorised
+            # code reads 0 rather than the base rate it would score anyway.
+            # Per field, then averaged -- not a ratio of the two means. The
+            # ratio of means weights each field by its headroom, so the field
+            # the language learned best also counts most towards whether the
+            # language generalises, and one strong field can carry two weak
+            # ones over the bar. Measured on the run that promoted out of
+            # `mutual`: fruit transferred 0.887 of its headroom, colour 0.406
+            # and quality 0.411, and the ratio of means read 0.617 against a
+            # 0.60 bar where each field counted once reads 0.568. That is the
+            # same masking the per-role and per-kind gates already refuse --
+            # "a pooled average would let a fluent farmer carry a buyer that
+            # never learned to speak".
+            ha = out.get("holdout_field_acc") or []
+            sa = out.get("seen_field_acc") or []
+            ratios = []
+            for i in range(min(len(ha), len(sa))):
+                # A ratio between two numbers both at the floor is noise, and
+                # noise reads 1.00 as readily as 0.00. A field the language
+                # never learned has nothing to say about generalising, so it is
+                # left out rather than counted as a pass or a failure.
+                if sa[i] - s_floor > 0.05:
+                    ratios.append(max(0.0, min(1.0, (ha[i] - h_floor)
+                                               / (sa[i] - s_floor))))
+            if ratios:
+                out["holdout_field_ratios"] = ratios
+                out["holdout_field_ratio"] = sum(ratios) / len(ratios)
+            elif out["seen_fields"] - s_floor > 0.05:
+                out["holdout_field_ratio"] = max(0.0, min(
+                    1.0, (out["holdout_fields"] - h_floor)
+                    / (out["seen_fields"] - s_floor)))
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.
@@ -1166,6 +1413,10 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             "bosdis": c.get("bosdis", float("nan")),
             "field_coverage": c.get("field_coverage", float("nan")),
             "per_field_coverage": c.get("per_field_coverage", []),
+            "distinct_forms": c.get("distinct_forms", float("nan")),
+            "distinct_words": c.get("distinct_words", float("nan")),
+            "lexicon_size": c.get("lexicon_size", 0),
+            "n_probes": c.get("n_probes", 0),
             "positional": positional_structure(sem.per_position.get(label, [])),
             "positional_rows": sem.per_position.get(label, []),
         }
@@ -1361,7 +1612,8 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
         real = [i for i, k in enumerate(kinds) if k not in (K_EMPTY, K_FIELD)]
         ctx = opening_context(cfg, pop, world, view, device)
         meanings = sample_meanings(cfg, world, role, n_samples, phase=view,
-                                   seed=rng.randrange(1 << 30))
+                                   seed=rng.randrange(1 << 30),
+                                   query=probe_query(view))
         agents = pop.pool(role)
         msgs: list[list[int]] = [[] for _ in meanings]
         # one batched greedy decode per agent over its share of the meanings

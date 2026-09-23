@@ -318,8 +318,16 @@ def role_word_counts(cfg: Config, batches: Sequence[Any]) -> dict[str, Counter]:
     return out
 
 
-def cross_role_overlap(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
+def cross_role_overlap(cfg: Config, batches: Sequence[Any],
+                       shared_pool: bool = False) -> dict[str, Any]:
     """One community language, or two mutually foreign codes?
+
+    ``shared_pool`` says the two seats are being filled from one pool of agents
+    (everything below ``curriculum.split_roles_at``). There are no two codes to
+    compare there -- the same agents speak in both seats -- so the question is
+    reported as not yet askable rather than answered with a number that is
+    really "does an agent use the same words in either chair". It read 0.87
+    through the naming rungs of a run whose two founders shared no form at all.
 
     Computed over the words each role actually emitted in sampled play:
 
@@ -338,7 +346,14 @@ def cross_role_overlap(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
     f, b = counts["farmer"], counts["buyer"]
     nf, nb = sum(f.values()), sum(b.values())
     out: dict[str, Any] = {"farmer_word_tokens": nf, "buyer_word_tokens": nb,
-                           "farmer_types": len(f), "buyer_types": len(b)}
+                           "farmer_types": len(f), "buyer_types": len(b),
+                           "shared_pool": bool(shared_pool)}
+    if shared_pool:
+        out.update({"weighted_overlap": float("nan"), "jaccard_types": float("nan"),
+                    "farmer_share_shared": float("nan"),
+                    "buyer_share_shared": float("nan"),
+                    "note": "one pool fills both seats: there are not two codes yet"})
+        return out
     if not nf or not nb:
         out.update({"weighted_overlap": float("nan"), "jaccard_types": float("nan"),
                     "farmer_share_shared": float("nan"), "buyer_share_shared": float("nan"),

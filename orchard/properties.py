@@ -98,10 +98,22 @@ def field_coverage(meanings: Sequence[Sequence[int]], messages: Sequence[Sequenc
                    fields: Sequence[int], rng=None, n_shuffles: int = 3) -> dict[str, Any]:
     """How much of each field the whole message carries, chance-corrected.
 
-    I(message; field) / H(field) per field, minus the same with the field
-    shuffled (the plug-in estimate is inflated when messages are many and
-    samples few), clipped to [0, 1]; ``coverage`` is the mean over fields. A code
-    that repeats the variety in every slot covers one field of three.
+    Per field: I(message; field) minus the same with the field shuffled, over
+    the headroom that subtraction leaves -- ``H(field) - null`` -- clipped to
+    [0, 1]; ``coverage`` is the mean over fields. A code that repeats the
+    variety in every slot covers one field of three.
+
+    The denominator is the headroom rather than ``H(field)`` because the numbers
+    are plug-in estimates over a few hundred probes, and the plug-in estimate of
+    I(message; field) is inflated by however many distinct messages there are:
+    in the limit where every probe gets its own message it reaches ``H(field)``
+    whatever the message means, which is why the shuffled null is subtracted at
+    all. But the same bias is in the numerator's ceiling, so dividing by
+    ``H(field)`` left a metric whose maximum moved with the sample: the *same
+    flawless compositional code* read 0.50 over 100 probes, 0.71 over 200 and
+    0.93 over 800, while a 0.30 bar sat still. Against the headroom it reads
+    1.00 at every one of them, and a code carrying three-quarters of each field
+    reads 0.56-0.58 at every one of them.
     """
     import random as _r
     rng = rng or _r.Random(0)
@@ -119,7 +131,11 @@ def field_coverage(meanings: Sequence[Sequence[int]], messages: Sequence[Sequenc
             s = list(ys)
             rng.shuffle(s)
             null += _mi(msgs, s) / n_shuffles
-        per.append(max(0.0, min(1.0, (real - null) / h)))
+        # Floor the headroom: when the messages are so nearly all distinct that
+        # the shuffled null already reaches H(field), there is nothing left to
+        # measure and the answer is "we cannot tell", which reads as ~0 here
+        # because the numerator has gone to zero with it.
+        per.append(max(0.0, min(1.0, (real - null) / max(h - null, 0.05 * h))))
     return {"coverage": sum(per) / len(per) if per else float("nan"), "per_field": per}
 
 

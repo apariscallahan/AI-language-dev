@@ -397,12 +397,36 @@ class RewardConfig:
     # convention has ``convention_min_support`` recent uses behind it.
     convention: float = 0.30
     convention_min_support: int = 12
+    # How many other meanings' conventions a form is contrasted against. The
+    # contrast is what stops a collapsed code earning the bonus, and it is the
+    # whole cost of the term: one edit distance per episode pays the bonus,
+    # `convention_contrast_samples` per *distinct* utterance pay for the
+    # contrast, and a speaker still unsure of its words repeats almost nothing,
+    # so nothing caches. Measured at batch 4,096 on a rung whose utterances are
+    # nearly all distinct, against a ~2.7 s update:
+    #
+    #     samples      1      2      4      8     16
+    #     per update  0.15s  0.22s  0.29s  0.44s  0.75s
+    #
+    # The contrast takes the *closest* of the sample, so unlike an average it
+    # needs enough of a sample to find a near neighbour. What a collapsed
+    # fruit-only code earns, which must be nothing:
+    #
+    #     samples      4       8       16      all
+    #     earns       0.0595  0.0098  0.0000  0.0000
+    #
+    # 16 is where it reaches zero, and it is what this was before there was a
+    # knob. Below 8 the collapse starts paying again, which is the failure the
+    # contrast exists to prevent, so this is not the place to buy speed: the
+    # community size is (see `population.n_farmers`).
+    convention_contrast_samples: int = 16
     # Whether the convention bonus waits for a working channel like the costs do.
     # Measured: ungated, even strongly weighted, it raised coherence among six
     # speakers from random weights only to ~0.2 and did not get their lineup off
     # chance -- a population that size needs founding small (see
     # population.founders_*), after which the bonus is fully on anyway.
     convention_gated: bool = True
+<<<<<<< HEAD
     # The rung from which the speaker pays for length, rarity and coining, and is
     # paid for agreeing. Off below it. Measured: with the costs on from the
     # second rung, the population collapsed onto one one-atom word (coherence
@@ -422,10 +446,58 @@ class RewardConfig:
     # next rung on they are simply on. 0 turns the trigger off (on at once).
     costs_ramp_trigger: float = 1.0
     costs_ramp_updates: int = 200
+=======
+    # A floor on where the speaker starts paying for length and novelty; the
+    # rung-by-rung rule is `Phase.invents`, and `curriculum.costs_apply` needs
+    # both. Measured: with the costs on from the second rung, the population
+    # collapsed onto one one-atom word (coherence 1.000, 1.0 atoms per word, 17
+    # distinct words among 15 speakers) and colour never left chance -- the
+    # cheapest way to agree, before a word for colour exists, is for everyone to
+    # say the same short nothing. The rule that follows: the costs stay off
+    # while a rung still has to *invent* a word, and come on where a rung only
+    # reuses them.
+    #
+    # This was `offer`, read as "the first rung above every rung that invents".
+    # That is true but too blunt: it also spared `mutual` and `order`, which
+    # invent nothing, and `mutual` turned out to need the pressure badly. It is
+    # the first rung with no lineup -- no candidates, no near misses -- so
+    # nothing there forces a message to decompose, and a run duly settled on a
+    # lookup table: 48 memorised labels, coverage 0.84, and held-out
+    # combinations at 0.01 against 0.36 on trained ones, a productivity ratio of
+    # 0.03 against a 0.60 bar. Among codes with room for 48 meanings the costs
+    # price a fused label 3.5-6.5x a multi-word one (one 3-atom word 0.065,
+    # three 1-atom words 0.015), which is exactly the pressure `mutual` lacks.
+    # The one-atom collapse is cheaper still at 0.005 but holds only 16 codes,
+    # so the task forbids it -- unlike the convention bonus, whose collapse was
+    # both cheap and well paid.
+    costs_from_rung: str = "mutual"
+    # The costs do not arrive at full strength the moment a rung starts. They
+    # wait until that rung's own channel is working -- rolling success at this
+    # multiple of the rung's promotion floor -- and then ramp in over
+    # `costs_ramp_updates`. 0 for the trigger restores the old step gate.
+    #
+    # Turning them on at the first update of `mutual` was measured, and it
+    # throttled the channel instead of shaping it: the atom cost drove words to
+    # exactly 1.00 atoms (the hyphen went unused at all), which caps a word at
+    # one of 16 atoms, and at 1.19 words per utterance that is ~51 possible
+    # messages for 48 meanings -- a bijection with no slack. Against the same
+    # episode count with the costs off, success was 0.023 where it had been
+    # 0.142, and the lexicon 14 words where it had been 88. `mutual` invents no
+    # new *word*, but it does have to make its messages longer -- `name-all`
+    # ran at ~2.4 atoms and `mutual` grew that to ~3.6 unaided -- and charging
+    # per atom while the message has to grow is the documented failure in
+    # another dress.
+    #
+    # A language has to exist before it can be economised. That rule was already
+    # applied across rungs; this applies it inside one.
+    costs_ramp_trigger: float = 1.0      # x the rung's own success floor
+    costs_ramp_updates: int = 200        # 0 -> 1 over this many updates after that
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     # The rung from which the convention bonus pays a speaker for using the
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish
     # inventing: a form only counts once it has `convention_min_support` recent
+<<<<<<< HEAD
     # uses behind it. It comes on at the last naming rung, when every word
     # exists: the founders keep a dialect each through the single-field rungs
     # (nobody dies there), and something has to pay the two of them, and then
@@ -437,6 +509,30 @@ class RewardConfig:
     # this meaning's modal form *minus* similarity to theirs, so one form for
     # everything earns nothing. More is a steadier baseline at more cost.
     convention_contrast_samples: int = 16
+=======
+    # uses behind it. The rarity cost stays with the costs: it charges a *new*
+    # word, which `ask-qty` and `quote` need.
+    #
+    # It used to wait for the community at `mutual`, on the reasoning that this
+    # is a pressure to agree and two founders are not a community. What that
+    # left was four rungs in which nothing at all paid a speaker for saying the
+    # same thing twice -- not to its partner, and not to itself. Measured on the
+    # run this was changed for, at `name-all`: within-role coherence 0.15-0.17,
+    # so the two founders shared no form; and 686 distinct words over sampled
+    # play for a meaning space of 64 things, which is not a large vocabulary but
+    # a speaker unsure of its own (a flawless 12-word code emitted at 98%
+    # per-symbol accuracy already reads as ~170).
+    #
+    # `name-all` is where it belongs by the same rule the costs follow -- off
+    # while a rung still has to invent a word, on at the first rung that only
+    # reuses them. Fruit, colour and quality were each invented and promoted
+    # below it; its own job is to say three of them at once. And the documented
+    # collapse (everyone on one short form) is not available to this term: it is
+    # contrastive, so a form that fits every meaning scores its similarity to
+    # this meaning's convention minus its similarity to every other meaning's,
+    # which is zero.
+    convention_from_rung: str = "name-all"
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -620,6 +716,11 @@ class BottleneckConfig:
     batch_size: int = 256
     lr: float = 1e-3
     store_capacity: int = 40_000          # ring buffer of recent successful episodes
+    # What share of the buffer the rungs that are *not* running keep between
+    # them. At 0 one rung's traffic flushes every earlier rung, which is how a
+    # hundred updates of `ask-qty` erased all 22,359 `mutual` transcripts and
+    # left a newborn nothing to learn the naming language from.
+    history_share: float = 0.4
     only_successful: bool = True          # learn from trades that worked
     # How strongly the newborn's sample favours common meanings (addendum 2.3).
     #   1.0 = whatever the parent generation actually did, in proportion
@@ -629,11 +730,33 @@ class BottleneckConfig:
     # This is the lever for vocabulary loss and regularisation across
     # generations, so it is a first-class knob rather than a constant.
     frequency_skew: float = 1.0
+<<<<<<< HEAD
     # The share of the (fruit, colour, quality) combinations in its sample that a
     # newborn is *not* shown at all. It has to name those from the parts it did
     # see, which is what makes the bottleneck a pressure towards a language
     # built from reusable parts rather than one name per thing. 0 shows a
     # newborn every combination the store holds (a near-clone).
+=======
+    # Share of *meanings* withheld from each newborn's apprenticeship. Not
+    # transcripts -- meanings: a random slice of the meaning space, different
+    # for every newborn, whose utterances it is never shown and must work out
+    # for itself from the rest.
+    #
+    # This is the half of iterated learning that `coverage` above cannot give.
+    # Coverage is about how many *tokens* a learner sees, and the argument for
+    # setting it to 1.0 -- that children acquire essentially all the vocabulary
+    # around them -- is sound on that axis. Compositionality comes off a
+    # different one: in Kirby's iterated-learning models a grammar emerges
+    # because the learner is shown a *subset of the meanings* and has to produce
+    # forms for the rest, and only a code with reusable parts can. Shown every
+    # meaning, a learner can memorise a lookup table exactly as faithfully as
+    # its parents did, and the bottleneck selects for nothing.
+    #
+    # Measured, with this at 0: `mutual` reached field coverage 0.84 on a code
+    # that scored 0.36 on trained combinations and 0.01 on held-out ones -- a
+    # productivity ratio of 0.03 against the 0.60 bar. 48 memorised labels,
+    # transmitted perfectly.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     meaning_holdout: float = 0.25
     token_loss_weight: float = 1.0
     decision_loss_weight: float = 1.0
@@ -876,6 +999,58 @@ SCALE_KEYS = frozenset({
     "log.zeroshot_episodes", "log.ablation_episodes", "log.topsim_samples",
     "log.stability_probes", "log.max_agents_probed", "log.word_analysis_samples",
 })
+
+# The settings that decide the *shape* of an agent's parameters. Unlike
+# SCALE_KEYS, which a resume may legitimately change -- a smaller community, a
+# different batch size -- these have exactly one valid reading on a resume: the
+# one the weights in the file were trained under. Leaving them to the command
+# line means a forgotten ``--config`` prints sixty ``size mismatch`` lines that
+# name tensors, and not one of them names the setting that is wrong.
+ARCH_KEYS = frozenset({
+    "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
+    "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
+    "world.n_varieties", "world.max_qty", "world.n_quality",
+    "world.n_colors", "world.n_price_bins",
+    "curriculum.n_candidates",
+})
+
+
+def config_get(cfg: "Config | dict", path: str):
+    """Read a dotted path out of a Config or out of its ``to_dict`` form."""
+    obj = cfg
+    for part in path.split("."):
+        obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
+    return obj
+
+
+def config_set(cfg: "Config", path: str, value) -> None:
+    parts = path.split(".")
+    obj = cfg
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def config_diff(a: dict, b: dict, prefix: str = "", *,
+                both_only: bool = False) -> dict:
+    """{dotted path: (a's value, b's value)} for every leaf that differs.
+
+    ``both_only`` skips leaves one side does not have at all. A snapshot written
+    before a setting existed is not running under a different value of it, and
+    reporting `history_share: snapshot None, here 0.4` as drift would make every
+    new setting look like a mistake on every resume that predates it.
+    """
+    out: dict[str, tuple] = {}
+    keys = (set(a) & set(b)) if both_only else (set(a) | set(b))
+    for k in sorted(keys):
+        va, vb = a.get(k), b.get(k)
+        path = "%s%s" % (prefix, k)
+        if isinstance(va, dict) and isinstance(vb, dict):
+            out.update(config_diff(va, vb, path + ".", both_only=both_only))
+        elif va != vb:
+            out[path] = (va, vb)
+    return out
+
 
 # Named experiments in configs/, and the settings each is allowed to change.
 # They are method changes by design, and are reported as such.

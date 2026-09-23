@@ -102,6 +102,7 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
         self.assertTrue(growth_applies(cfg, phase_named(cfg, "mutual")))
         self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
 
+<<<<<<< HEAD
     def test_agreement_arrives_once_every_word_exists(self):
         """The convention bonus is paid from the last naming rung on.
 
@@ -109,18 +110,114 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
         something has to pay them -- and then the community that arrives at
         `mutual` -- to settle on one word per meaning. It must not wait for the
         costs, which are a different pressure and are ramped in later.
+=======
+    def test_agreement_arrives_at_the_first_rung_that_invents_no_word(self):
+        """The convention bonus follows the same rule as the costs, one rung up.
+
+        A pressure to reuse a word is off while the rung still has to invent
+        one, and on at the first rung that only reuses them. For the costs that
+        is `offer`; for agreement it is `name-all`, which invents nothing --
+        fruit, colour and quality were each invented and promoted below it, and
+        its own job is to say three of them at once.
+
+        It used to wait for the community at `mutual`, which left four rungs in
+        which nothing paid a speaker for saying the same thing twice. The run
+        that was measured there had two founders sharing no form at all
+        (within-role coherence 0.15-0.17) and a speaker so unsure of its own
+        words that sampled play showed 686 of them over a 64-meaning world.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         """
-        from orchard.curriculum import convention_applies, costs_apply, growth_applies
+        from orchard.curriculum import convention_applies, costs_apply
         cfg = Config()
         first = lambda f: next(p for p in ladder(cfg) if f(cfg, p))
+<<<<<<< HEAD
         self.assertEqual(first(convention_applies).name, "name-all")
         self.assertLessEqual(first(convention_applies).index, first(growth_applies).index)
         self.assertLess(first(convention_applies).index, first(costs_apply).index,
                         "agreement waits for the costs again")
         for p in ladder(cfg):
             if p.referential and not p.whole:
+=======
+        self.assertLess(first(convention_applies).index, first(costs_apply).index,
+                        "agreement waits for the costs again")
+        for p in ladder(cfg):
+            if p.naming and p.primary < 3:
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
                 self.assertFalse(convention_applies(cfg, p),
-                                 "%s pays two founders to agree with each other" % p.name)
+                                 "%s pays for agreeing on a word it is still "
+                                 "inventing" % p.name)
+        self.assertTrue(convention_applies(cfg, phase_named(cfg, "name-all")),
+                        "nothing pays for reusing a word on the rung whose whole "
+                        "job is to reuse three of them")
+
+    def test_the_costs_are_a_per_rung_rule_not_a_threshold(self):
+        """`ask-qty` and `quote` sit above `mutual` and still have a word to
+        invent, so no single threshold gets this right: at `offer` it spares
+        them but also spares `mutual` and `order`, which invent nothing; at
+        `mutual` it charges them while they are still naming quantity and price.
+        """
+        from orchard.curriculum import costs_apply
+        cfg = Config()
+        want = {"name-fruit": False, "name-color": False, "name-quality": False,
+                "name-all": False, "mutual": True, "ask-qty": False,
+                "order": True, "quote": False, "offer": True, "judge": True,
+                "haggle": True, "bargain": True, "market": True}
+        for p in ladder(cfg):
+            self.assertEqual(costs_apply(cfg, p), want[p.name],
+                             "%s: costs %s, expected %s"
+                             % (p.name, costs_apply(cfg, p), want[p.name]))
+        # and the floor still holds them off entirely if a run wants that
+        cfg.reward.costs_from_rung = "market"
+        self.assertFalse(costs_apply(cfg, phase_named(cfg, "mutual")))
+        self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
+
+    def test_the_costs_price_a_fused_name_above_a_compositional_one(self):
+        """Why `mutual` gets them: it is the first rung with no lineup, so
+        nothing else there forces a message to decompose.
+
+        The pressure has to survive the obvious objection -- that a length cost
+        just makes everything shorter, and the shortest code is the collapse
+        this project keeps rediscovering. It does not, because the collapse
+        cannot carry the meaning space: the task forbids what the cost would
+        otherwise reward. That is the difference from the convention bonus,
+        whose collapse was both cheap and well paid.
+        """
+        import torch
+        from orchard.env import length_cost
+        cfg = Config()
+        c, w = cfg.channel, cfg.world
+        meanings = w.n_varieties * w.n_colors * w.n_quality
+
+        def cost_of(words):
+            out = []
+            for word in words:
+                for j, a in enumerate(word):
+                    if j:
+                        out.append(c.hyphen_id)
+                    out.append(a)
+                out.append(c.space_id)
+            out[-1] = c.end_id
+            toks = torch.full((1, c.dialogue_len), c.pad_id, dtype=torch.long)
+            toks[0, :len(out)] = torch.tensor(out)
+            v = float(length_cost(cfg, toks, list(range(c.max_msg_len)))[0])
+            return v, c.atomic_vocab ** sum(len(x) for x in words)
+
+        one_atom, room = cost_of([[1]])
+        self.assertLess(room, meanings,
+                        "one atom can encode the whole world, so the cheapest "
+                        "code is the collapse and this pressure is unsafe")
+        fused_2, room_2 = cost_of([[1, 2]])
+        split_2, _ = cost_of([[1], [2]])
+        fused_3, _ = cost_of([[1, 2, 3]])
+        split_3, room_3 = cost_of([[1], [2], [3]])
+        self.assertGreaterEqual(room_2, meanings)
+        self.assertGreaterEqual(room_3, meanings)
+        self.assertGreater(fused_2, split_2 * 2,
+                           "a fused two-atom label is not meaningfully dearer "
+                           "than two short words (%.4f vs %.4f)" % (fused_2, split_2))
+        self.assertGreater(fused_3, split_3 * 2,
+                           "a fused three-atom label is not meaningfully dearer "
+                           "than three short words (%.4f vs %.4f)" % (fused_3, split_3))
 
     def test_the_costs_wait_for_every_rung_that_invents_a_word(self):
         """Length and rarity are pressures on a word that exists."""
@@ -320,3 +417,124 @@ class TestOnePopulationUntilTrading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestTheCostsWaitForTheChannel(unittest.TestCase):
+    """Costs arrive when a rung's own channel works, not when the rung starts.
+
+    `mutual` invents no new *word*, which is what `Phase.invents` asks, but it
+    does have to make its messages longer -- `name-all` ran at ~2.4 atoms and
+    `mutual` grew that to ~3.6 unaided. Charging per atom from the rung's first
+    update throttled exactly that: the hyphen fell out of use entirely (1.00
+    atoms per word), capping a word at one of 16 atoms, so ~51 messages had to
+    carry 48 meanings. At the same episode count success was 0.023 against the
+    0.142 the same rung reached with the costs off.
+    """
+
+    def _trainer(self, tmp, rung="mutual"):
+        from orchard.train import Trainer
+        cfg = Config()
+        cfg.model.d_model, cfg.model.n_layers, cfg.model.d_ff = 32, 1, 64
+        cfg.train.batch_size, cfg.train.device, cfg.log.plot = 32, "cpu", False
+        tr = Trainer(cfg, tmp, quiet=True)
+        tr.curriculum.index = [p.name for p in tr.curriculum.phases].index(rung)
+        tr.update_cost_gate()
+        return cfg, tr
+
+    def _feed(self, tr, rate, n=1200):
+        import torch
+        tr.update_cost_gate(torch.full((n,), float(rate)))
+
+    def test_a_rung_that_is_not_working_yet_pays_nothing(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        self.assertEqual(tr.cost_gate, 0.0, "charged before a single batch")
+        self._feed(tr, 0.0)
+        self.assertEqual(tr.cost_gate, 0.0, "charged a rung at zero success")
+        self._feed(tr, cfg.curriculum.mutual_min_success * 0.5)
+        self.assertEqual(tr.cost_gate, 0.0, "charged a rung at half its floor")
+        tr.close()
+
+    def test_it_ramps_in_once_the_floor_is_cleared(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        self._feed(tr, cfg.curriculum.mutual_min_success * 2)
+        self.assertEqual(tr.cost_gate, 0.0, "the ramp jumped straight to full")
+        self.assertIsNotNone(tr._costs_ramp_from, "the ramp never started")
+        seen = []
+        for step in (1, 50, 100, 200, 400):
+            tr.updates = tr._costs_ramp_from + step
+            self._feed(tr, cfg.curriculum.mutual_min_success * 2)
+            seen.append(tr.cost_gate)
+        self.assertEqual(seen, sorted(seen), "the ramp is not monotone: %s" % seen)
+        self.assertGreater(seen[0], 0.0)
+        self.assertLess(seen[1], 1.0, "fully charged within 50 updates")
+        self.assertEqual(seen[-1], 1.0, "never reaches full strength")
+        tr.close()
+
+    def test_a_rung_that_invents_still_pays_nothing_however_well_it_does(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp(), rung="quote")
+        for _ in range(3):
+            self._feed(tr, 1.0)
+        self.assertEqual(tr.cost_gate, 0.0,
+                         "`quote` is still naming price and was charged anyway")
+        tr.close()
+
+    def test_the_old_step_gate_is_still_reachable(self):
+        import tempfile
+        cfg, tr = self._trainer(tempfile.mkdtemp())
+        cfg.reward.costs_ramp_trigger = 0.0
+        tr.update_cost_gate()
+        self.assertEqual(tr.cost_gate, 1.0)
+        tr.close()
+
+
+class TestTheBottleneckWithholdsMeanings(unittest.TestCase):
+    """`coverage` decides how many transcripts a learner sees; this decides how
+    many *meanings*. Compositionality in iterated learning comes off the second
+    axis: the learner has to produce forms for meanings nobody taught it, and
+    only a code with reusable parts can. Shown every meaning, it memorises the
+    table as faithfully as its parents and the bottleneck selects for nothing --
+    measured as `mutual` reaching field coverage 0.84 on a code that scored 0.36
+    on trained combinations and 0.01 on held-out ones."""
+
+    def _store(self, cfg, n_meanings=12, per=6):
+        import torch
+        from orchard.bottleneck import StoredEpisode, TranscriptStore
+        st = TranscriptStore(cfg)
+        c = cfg.channel
+        for m in range(n_meanings):
+            for _ in range(per):
+                st._buf.append(StoredEpisode(
+                    f_obs=torch.zeros(4, dtype=torch.long),
+                    b_obs=torch.zeros(4, dtype=torch.long),
+                    tokens=torch.full((c.dialogue_len,), c.pad_id, dtype=torch.long),
+                    active=torch.zeros(c.dialogue_len, dtype=torch.bool),
+                    f_dec=torch.zeros(10, dtype=torch.long),
+                    b_dec=torch.zeros(10, dtype=torch.long),
+                    episode=0, f_generation=0, b_generation=0, meaning=(m, 0)))
+        return st
+
+    def test_each_newborn_has_a_different_gap(self):
+        cfg = Config()
+        st = self._store(cfg)
+        gaps = [st.withhold_meanings(random.Random(seed)) for seed in range(6)]
+        for g in gaps:
+            self.assertTrue(g, "nothing was withheld at all")
+            self.assertLess(len(g), 12, "a newborn was shown no meanings")
+            self.assertAlmostEqual(len(g) / 12, cfg.bottleneck.meaning_holdout,
+                                   delta=0.15)
+        self.assertGreater(len({frozenset(g) for g in gaps}), 1,
+                           "every newborn gets the same gap, so the same meanings "
+                           "are lost to the whole population")
+
+    def test_nothing_is_withheld_when_it_is_switched_off(self):
+        cfg = Config()
+        cfg.bottleneck.meaning_holdout = 0.0
+        self.assertEqual(self._store(cfg).withhold_meanings(random.Random(0)), set())
+
+    def test_a_thin_store_is_left_alone(self):
+        cfg = Config()
+        self.assertEqual(self._store(cfg, n_meanings=3).withhold_meanings(
+            random.Random(0)), set())

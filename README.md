@@ -451,14 +451,20 @@ positional structure 0.03 while the buyer's had 0.39, and every farmer newborn's
 token accuracy was 0.000).
 
 Until `haggle` **both seats are filled from one pool of agents**, so there is
-one language rather than two that have to be reconciled afterwards. An agent is
-never seated opposite itself — not in training (`Population.pair`), and not in
+one language rather than two that have to be reconciled afterwards. `farmers`
+and `buyers` are literally the same list, and everything that rebuilds the
+population has to keep it that way (`curriculum.pooled_at`): restoring the two
+saved lists separately, as resuming used to, made two copies of every founder
+that then trained apart -- twice the reported population, two languages, and an
+`IndexError` one rung later when the first newcomer grew only one of the lists.
+An agent is never seated opposite itself — not in training (`Population.pair`), and not in
 any measurement either. The measurements used to draw the two seats
 independently, so with two founders half of every promotion check was an agent
 reading its *own* words, which training never asks for. Two founders who had
 each invented a dialect the other could read scored 0.92 in training and 0.60
 in the check, and `name-fruit` ran out its budget with a working code.
 
+<<<<<<< HEAD
 Two founders who never die do each keep a dialect through the single-field
 rungs: `coherence 0.500` in the checkpoint line means they agree on no form at
 all, each reading the other's. Deaths used to paper over this — a newborn
@@ -466,6 +472,24 @@ apprenticed to the survivor inherited its words — at the cost of half the
 population. Convergence now comes where the project means it to: the convention
 bonus arrives at `name-all`, when every word exists, and at `mutual` newcomers
 are taught from transcripts of both and turnover leaves the commoner form.
+=======
+Two founders who never die will each keep a dialect if nothing pays them not
+to, and nothing did: the convention bonus used to wait for the community at
+`mutual`, so all four naming rungs ran with no term anywhere rewarding a
+speaker for saying the same thing twice. Measured at `name-all`: within-role
+coherence 0.15–0.17, which is two codes with no form in common. It now comes on
+at `name-all` (§6), the first rung that invents no word of its own. Newcomers
+and turnover still do the rest of the work from `mutual`.
+
+**Cross-role coherence and cross-role overlap cannot be read while the pool is
+shared.** Row *i* of "the farmers" and row *i* of "the buyers" are the same
+agent in the other chair, so comparing them asks whether an agent agrees with
+itself. With two founders that was half of every cross pair, which pins
+`coherence across` at about halfway to 1 however foreign the two codes are — it
+read 0.56 for the pair whose honest number was 0.16. Self-pairs are now
+excluded from cross-role coherence, and cross-role vocabulary overlap is
+reported as not yet askable until the roles split.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
 **A naming rung adds a kind of round; it never swaps to one.** `name-color` is
 60% colour rounds and 40% fruit rounds, so the fruit words stay in use and stay
@@ -613,6 +637,54 @@ fooled by redundancy: a variety-only code like `a13-a13-a13-a13` scores 1.00 on
 it by naming the variety in every slot. Coverage asks how much of *each* field
 the messages carry, corrected for chance.
 
+**A measured bar has to be measured on the right thing.** `name-all` is the only
+rung judged on message structure, and it is also the rung that mixes questions
+most — 70% whole things, 30% single fields. The structure probes used to follow
+that mixture while `meaning_distance` and field coverage both ignore the query
+slot, so 30% of the probes asked a perfect describer for one field and then
+scored its one-word answer against all three. Two consequences, both measured on
+a flawless, noise-free, fully compositional speaker:
+
+| | perfect speaker scored | bar |
+|---|---|---|
+| field coverage, probes following the mixture, ÷ H(field) | 0.33 (100 probes) / 0.49 (200) | 0.30 |
+| topsim over null, probes following the mixture | 0.32 | 0.10 |
+| field coverage, probes asking the rung's own kind, ÷ headroom | **1.00** at 100, 200 and 800 probes | 0.30 |
+| topsim over null, probes asking the rung's own kind | **1.00** | 0.10 |
+
+No real code beats a perfect one, so the rung could not be left. Two fixes:
+
+* **The structure probes ask the kind of round the rung is promoted on**
+  (`metrics.probe_query`), which is the rule promotion already follows
+  everywhere else. The same function fixed a second probe that was off
+  distribution: `mutual` has a query slot in its schema but never fills it in
+  (`MutualBatch.obs` pads it), while the probes wrote ASK_ALL there — and
+  `K_FIELD` has its own embedding table, so every structure number on `mutual`
+  was read off an observation its speakers had never been trained on.
+* **Field coverage is normalised by the headroom its own shuffled null leaves**
+  (`H(field) − null`), not by `H(field)`. Both numbers are plug-in estimates
+  over a few hundred probes, and the plug-in estimate of `I(message; field)` is
+  inflated by however many distinct messages there are — in the limit where
+  every probe gets its own message it reaches `H(field)` whatever the message
+  means, which is why the null is subtracted at all. The same bias was in the
+  numerator's ceiling, so dividing by `H(field)` left a metric whose *maximum*
+  moved with the sample: the same perfect code read 0.50 over 100 probes, 0.71
+  over 200 and 0.93 over 800, while the bar sat still — and the light check,
+  which probes half as often, was strictly harder to pass than the checkpoint
+  one. Against the headroom it reads 1.00 at every sample size, a code carrying
+  three-quarters of each field reads 0.56–0.58 at every sample size, and a
+  message unrelated to the meaning still reads ~0.
+
+`tests/test_rungs.py::TestAPerfectSpeakerPasses` holds both: a flawless
+describer, run through the real measurement functions rather than a dict of
+ones, has to score at least 0.75 on every structure bar it is judged on.
+
+Positional structure is still pooled across the agents of a role
+(`analyse_token_semantics` splits the probes between them), so two dialects that
+put different fields in the same slot depress it — measured, two *perfect*
+dialects score 0.30 where one scores 0.40, against a 0.15 bar. It is not the
+binding check and is left as is.
+
 Success alone is never enough, because a pair can score on base rates without
 saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
@@ -684,6 +756,7 @@ not restrictions: nothing ever stops an agent from saying anything.
 | `reward.atom_cost` | 0.03 | per atom after the first in a word |
 | `reward.word_cost` | 0.005 | per word — a sixth of an atom, so sentences are cheap and words are not |
 | `reward.rarity_cost` | 0.05 | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life_updates` = 80), centred on the batch so it favours established forms without ever favouring silence |
+<<<<<<< HEAD
 | `reward.convention` | 0.30 | for matching the population's current form *for this meaning* (a lot, and which field of it was asked about), minus the similarity to other meanings' forms (`convention_contrast_samples` = 16 of them), so one form for everything earns nothing |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
@@ -712,6 +785,138 @@ fully satisfiable that way. Earlier evidence pointed the same direction: charged
 from episode 0 even a small cost drives the describer to silence, and ramping
 them in with the first rung's success capped that success at 0.42 against 0.62
 with them off.
+=======
+| `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus its similarity to the **closest** other meaning's form — so a code that says the same thing for two meanings earns nothing for either |
+| `reward.convention_contrast_samples` | 16 | how many other meanings the contrast looks through for the closest. It is the whole cost of the term — host-side edit distances, one per episode for the bonus and this many per distinct utterance for the contrast, and an unsure speaker repeats nothing so nothing caches. At batch 4,096: 0.29 s per update at 4, 0.75 s at 16, against a ~2.7 s update. Below 8 the sample starts missing the near neighbour and a collapsed code starts earning again, so this is not where to buy speed |
+| `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
+
+One rule decides when each of them starts: **a pressure to reuse a word is off
+while the rung still has to invent one, and on at the first rung that only
+reuses them.** A language has to exist before it can be economised, and the
+failure is not subtle: with the costs on from the second rung a GPU run
+collapsed onto a single one-atom utterance — coherence 1.000, 1.00 atoms per
+word, ~1 word per utterance, 17 distinct words among 15 speakers — and colour
+never left chance. Before a word for a colour exists, the cheapest way to be
+short *and* to agree with everyone is for everyone to say the same short
+nothing, and the costs are fully satisfiable that way. Earlier evidence pointed
+the same direction: charged from episode 0 even a small cost drives the
+describer to silence, and ramping them in with the first rung's success capped
+that success at 0.42 against 0.62 with them off.
+
+**The costs — length and rarity — apply to any rung that invents no new word**
+(`Phase.invents`), never before `reward.costs_from_rung` as a floor. That comes
+out as on for `mutual`, `order` and everything from `offer` up; off for the four
+naming rungs, and off for `ask-qty` and `quote`, which each still have a field
+to name. No single threshold expresses that: set at `offer` it spares `ask-qty`
+and `quote` but also spares `mutual` and `order`; set at `mutual` it charges the
+two rungs that are still inventing.
+
+`mutual` turned out to need them badly, and the reason is structural. It is the
+first rung with **no lineup** — no candidates, no near misses — so nothing in
+the task forces a message to decompose, and "reconstruct the tuple from 64" is
+solved perfectly by a lookup table. A run settled on exactly that: 48 memorised
+labels, field coverage 0.84, and held-out combinations at 0.01 against 0.36 on
+trained ones — a productivity ratio of 0.03 against a 0.60 bar, flat over 200
+updates while every other number improved. High coverage with near-zero held-out
+*is* the signature of a memorised code, which is why both are measured.
+
+**They also ramp in rather than switching on.** Turning them on at `mutual`'s
+first update was measured, and it throttled the channel instead of shaping it:
+the atom cost drove words to exactly 1.00 atoms — the hyphen went unused
+entirely — which caps a word at one of 16 atoms, so at 1.19 words per utterance
+about 51 possible messages had to carry 48 meanings. Against the same episode
+count with the costs off, success was 0.023 where it had been 0.142 and the
+lexicon 14 words where it had been 88. `mutual` invents no new *word*, but it
+does have to make its messages longer — `name-all` ran at ~2.4 atoms and
+`mutual` grew that to ~3.6 unaided — and charging per atom while the message has
+to grow is the documented failure in another dress.
+
+So within a rung the gate waits for that rung's own rolling success to reach
+`reward.costs_ramp_trigger` × its promotion floor, then ramps to full over
+`reward.costs_ramp_updates`. A language has to exist before it can be
+economised; that rule was already applied across rungs, and this applies it
+inside one. The run log says when it fires:
+
+```
+[costs] mutual reached 0.104 (1.0x its 0.10 floor): the speaker starts paying
+        for length and novelty, ramped in over 200 updates
+```
+
+The costs are the pressure it was missing. Among codes with room for the 48
+trained meanings:
+
+| code | capacity | cost |
+|---|---|---|
+| one 1-atom word | 16 — **too few** | 0.0050 |
+| two 1-atom words | 256 | 0.0100 |
+| three 1-atom words (one per field) | 4,096 | 0.0150 |
+| one 2-atom word (fused) | 256 | 0.0350 |
+| one 3-atom word (fused) | 4,096 | 0.0650 |
+
+A fused label costs 3.5–6.5× a multi-word one, because `atom_cost` is six times
+`word_cost` — sentences are cheap, long words are not. And the one-atom collapse
+is cheaper than all of them but holds only 16 codes, so the **task** forbids
+what the cost would otherwise reward. That is the difference from the convention
+bonus above, whose collapse was both cheap *and* well paid: a length cost makes
+collapse marginally cheaper, it does not make it profitable.
+
+**The convention bonus comes on at `name-all`** (`reward.convention_from_rung`),
+by the same rule one rung earlier than it can apply to the costs: fruit, colour
+and quality were each invented and promoted below it, and `name-all`'s own job
+is to say three of them at once. It pays for agreeing rather than for economy,
+and it cannot punish a new word, because a form only counts once it has 12
+recent uses behind it — nor can it collapse the language, because it is
+contrastive, and a form that fits every meaning scores its similarity to this
+meaning's convention minus its similarity to every other meaning's, which is
+zero.
+
+It waited for the community at `mutual` until a run showed what that left: four
+rungs in which nothing paid a speaker for saying the same thing twice, not to
+its partner and not to itself. At `name-all` that run had within-role coherence
+0.15–0.17 — two founders with no form in common — and 686 distinct words over
+sampled play for a world of 64 things. The second number is not a large
+vocabulary. It is a speaker unsure of its own: the count is taken over sampled
+play, and a flawless 12-word code emitted at 98% per-symbol accuracy already
+reads as ~170 words. The checkpoint line and the report now print the greedy
+lexicon beside it — what the describers actually say when asked — so the two
+cannot be confused.
+
+A convention is a form *for a meaning*, and on a rung that asks different
+questions about the same thing, the question is part of the meaning: keyed on
+the tuple alone, `name-all`'s conventions blended the answers to "what fruit?"
+and "what is it?" into one modal form. The key now carries what was asked.
+
+**The contrast subtracts the closest other form, not the average one.** Against
+the average it punished exactly what this project is for. A compositional code's
+forms resemble each other — that is what sharing a morpheme means — so the
+average reads it as undistinctive and taxes it, while a collapsed code that
+names one field and drops the rest looks maximally distinctive. Scored over a
+48-meaning space:
+
+| code | contrast = mean | contrast = closest |
+|---|---|---|
+| compositional (fruit + colour + quality) | 0.133 | 0.062 |
+| arbitrary short labels | 0.281 | 0.158 |
+| **collapsed: one field, one atom** | **0.204** | **0.000** |
+| collapsed: one form for everything | 0.000 | 0.000 |
+
+The collapsed code was paid *more than the compositional code it replaces*, and
+a GPU run duly found it. At `mutual` the task signal starts at zero and the
+costs are off, so the convention bonus is the only thing shaping what gets said:
+600 updates in, the population had gone from 27 words to 7, from 1.70 atoms per
+word to 1.01, from 1.39 words per utterance to 1.03, coherence 0.31 → 0.92, and
+field coverage from balanced to [0.83, 0.13, 0.05] — fruit named, colour and
+quality gone, channel 0.00 of headroom. That is the collapse this section
+already warned about, arrived at by a different road.
+
+Against the *closest* other form the question becomes "is this meaning's
+convention the one my form is nearest to", which a collapsed code fails by
+construction: every meaning's modal form is the same, so the closest other is
+identical to its own and the bonus is exactly zero. Choosing between a
+compositional code and an arbitrary one is not this term's job —
+`min_holdout_ratio` and `min_field_coverage` do that — but paying for the
+collapse was.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
 ### Growing the community
 
@@ -789,6 +994,7 @@ Sampling stays proportional to how often each meaning actually came up
 experience still mirrors the parent generation's — it is simply no longer
 artificially thin.
 
+<<<<<<< HEAD
 The withheld combinations are the bottleneck proper. Seeing every combination
 makes a newborn a near-clone (token accuracy 0.82 straight out of the
 apprenticeship on the GPU runs), and a language whose forms only survive when
@@ -801,6 +1007,37 @@ common and rare forms **separately** rather than as an aggregate, so the
 asymmetry is visible rather than assumed. When a rare meaning's form is lost and
 rebuilt out of words that are common elsewhere, that is the shape of an irregular
 verb levelling out, and `FormTracker` logs it with before/after examples.
+=======
+### The other axis: meanings, not transcripts
+
+`coverage` is about how many *transcripts* a learner sees, and 1.0 is right on
+that axis for the reason above. Compositionality comes off a different one. In
+Kirby's iterated-learning models a grammar emerges because the learner is shown
+a **subset of the meanings** and has to produce forms for the rest — and only a
+code with reusable parts can. Shown every meaning, a learner memorises the
+lookup table exactly as faithfully as its parents did, and the bottleneck
+selects for nothing.
+
+That is what a run showed at `mutual`: field coverage 0.84 on a code scoring
+0.36 on trained combinations and **0.01 on held-out** ones, a productivity ratio
+of 0.03 against the 0.60 bar. Forty-eight memorised labels, transmitted
+perfectly. The mechanism §4 is built on was present and had nothing to select.
+
+So **`bottleneck.meaning_holdout` (0.25) withholds a slice of the meaning space
+from each newborn** — its utterances for those meanings are simply not in the
+curriculum, and it has to work them out from the rest. The slice is drawn fresh
+per newborn, so nothing is lost to the *population*: every learner has a
+different gap. A learner that would be starved outright is given everything
+instead, and each birth records how much was held back.
+
+Every birth records what vocabulary it was actually shown, and the report gives
+retention for common and rare forms **separately** rather than as an aggregate,
+so the asymmetry is visible rather than assumed. When a rare meaning's form is
+lost and rebuilt out of words that are common elsewhere, that is the shape of an
+irregular verb levelling out, and `FormTracker` logs it with before/after
+examples. This is why metrics are bucketed into frequent and rare meanings: a
+global average hides exactly this effect.
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
 ---
 
@@ -901,15 +1138,20 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 | per-field reports | on a report rung, for each role and each field it reports: accuracy intact and muted, and the share of the headroom the channel is worth for that field |
 | topological similarity | Spearman correlation between pairwise meaning distance and pairwise message distance, against its own **shuffled null** (scipy if present, pure-Python fallback otherwise) |
 | positional structure, posdis, bosdis | how strongly each slot maps to a field |
+<<<<<<< HEAD
 | **field coverage** | bias-corrected information about *each* of the five fields in live messages — the measure that exposed a variety-only code scoring 1.00 on positional structure |
 | vocabulary stats | distinct words, word length in atoms, words per utterance, token entropy, silent share, share at the buffer end |
+=======
+| **field coverage** | bias-corrected information about *each* field in live messages — the measure that exposed a variety-only code scoring 1.00 on positional structure. Normalised by the headroom its own shuffled null leaves, so a perfect code reads 1.00 whatever the probe count |
+| vocabulary stats | distinct words **over sampled play**, beside the **greedy lexicon** — what the describers say when asked. The first counts variants as well as words (a flawless 12-word code at 98% per-symbol accuracy reads as ~170), so the pair is what says whether a big number is a big vocabulary or an unsure speaker. Plus word length in atoms, words per utterance, token entropy, silent share, share at the buffer end |
+>>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 | stability | re-probing the same meaning against the same agent at different times |
 | cross-generation intelligibility | a newborn straight out of its apprenticeship, tested against veterans it never played |
 | zero-shot generalisation | success on the reserved combinations against success on trained ones — whole-round in the lineup, per field on a report rung |
 | length ↔ frequency | correlation between how often a meaning occurs and how long its message is, in symbols and in words |
 | per-bucket metrics | everything above, split into frequent and rare meanings |
 | form survival | whether a meaning's form survives, drifts, or is rebuilt compositionally across turnover |
-| cross-role overlap | histogram intersection of the two roles' word use |
+| cross-role overlap | histogram intersection of the two roles' word use; reported as not yet askable while one pool fills both seats, since the two roles are then the same agents |
 | language properties | reference, productivity, word classes, intentionality, decontextualised, displaced, interchangeable, generic, perspectives, cultural transmission, duality of patterning — each with how it is measured, its value, and present / partial / absent / untestable / not reached |
 
 Structure measures (topsim, positional structure, coverage) are taken from
