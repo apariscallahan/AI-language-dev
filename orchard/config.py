@@ -40,11 +40,13 @@ from typing import Any
 # --------------------------------------------------------------------------
 @dataclass
 class WorldConfig:
-    # A thing to talk about is a (fruit, colour, quality) triple: 4 x 3 x 3 = 36
-    # combinations, of which a quarter are never trained on (holdout_combo_frac).
-    # Fruit and colour are separate fields on purpose: a code can only describe a
-    # combination it has never seen if it names them separately, which is what
-    # makes an adjective worth inventing.
+    # A thing to talk about is a lot: (fruit, colour, quality, quantity, price).
+    # The first three make a *combination* -- 4 x 4 x 4 = 64 of them, of which a
+    # quarter are never trained on (holdout_combo_frac). Fruit and colour are
+    # separate fields on purpose: a code can only describe a combination it has
+    # never seen if it names them separately, which is what makes an adjective
+    # worth inventing. Quantity (0 to max_qty) and price (n_price_bins) are named
+    # in the naming rungs too, so no trading rung ever has to invent a word.
     # The three fields are the same size on purpose. It lets the held-out set be
     # a Latin square -- one quality withheld from every (fruit, colour) lot, one
     # colour from every (fruit, quality), one fruit from every (colour, quality)
@@ -176,7 +178,14 @@ class ChannelConfig:
     (``RewardConfig.symbol_cost``), and the report flags it if utterances ever
     actually reach the buffer's end.
     """
-    atomic_vocab: int = 16     # meaningless atoms; ids 0 .. atomic_vocab-1
+    # Meaningless atoms; ids 0 .. atomic_vocab-1. There are 27 field values to
+    # name (4 fruits, 4 colours, 4 qualities, 9 quantities, 6 prices); with 32
+    # atoms every value *can* have an atom of its own, and whether a population
+    # reuses atoms across fields (homonyms told apart by context) or builds
+    # multi-atom words instead is something to measure, not to force. Fewer
+    # atoms than values makes duality of patterning necessary; that is the
+    # `duality` experiment in configs/, not the baseline.
+    atomic_vocab: int = 32
                                # HYPHEN = atomic_vocab       joins atoms into a word
                                # SPACE  = atomic_vocab + 1   separates words
                                # END    = atomic_vocab + 2   ends the utterance
@@ -272,6 +281,16 @@ class ModelConfig:
     n_heads: int = 4
     d_ff: int = 96
     dropout: float = 0.0
+    # One cross-attention step from every hidden state to the barn's rows, keyed
+    # on each row's (fruit, colour) and valued on its (quality, stock), added to
+    # the hidden state through a zero-initialised projection. It is the barn's
+    # analogue of the lineup's candidate pointer: "compare what was heard against
+    # each row" made directly expressible, instead of a lookup the network has
+    # to discover among sixteen shuffled rows. Measured, supervised, with the
+    # answer given: without it the stock of the asked-for lot stayed at the
+    # base rate after 800 steps (0.27-0.34; quality 0.5); with it both reached
+    # 1.00 by step 500. Only active when the observation is a barn.
+    barn_lookup: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -347,15 +366,15 @@ class RewardConfig:
     # three short words, and must not be taxed for it.
     atom_cost: float = 0.03         # per atom after the first in each word
     word_cost: float = 0.005        # per word -- deliberately much smaller
-    symbol_cost: float = 0.0        # per emitted symbol -- atoms, hyphens and spaces
-                                    # all count (addendum 2.1).  A soft pressure toward
-                                    # brevity on top of the hard per-turn cap, because
-                                    # people do not routinely max out the longest
-                                    # sentence they could physically produce.  It is
-                                    # also the whole of the Zipf mechanism (2.2): the
-                                    # cost is paid once per episode, so meanings that
-                                    # come up often pay it far more often and feel far
-                                    # more pressure to shorten.
+    # Per emitted symbol -- atoms, hyphens and spaces all count (addendum 2.1).
+    # A small flat charge on top of the two above, because the cheapest way to
+    # repeat a word is with spaces, and a speaker with the word cost alone
+    # repeated one word twelve times to the buffer end ("a1 a1 a1 ...": 0.06
+    # under the word cost, 0.29 with this). It is also part of the Zipf
+    # mechanism (2.2): paid once per episode, so meanings that come up often pay
+    # it far more often and feel far more pressure to shorten. A five-word
+    # request costs 0.09 under it, against a task reward above 1.
+    symbol_cost: float = 0.01
     economics: float = 0.25         # farmer margin / buyer surplus (zero-sum in price)
 
     qty_tol: int = 0                # tolerance when comparing believed quantities
@@ -392,20 +411,32 @@ class RewardConfig:
     # exists, is for everyone to say the same short nothing.
     # The rule that follows: the costs stay off while a rung still has to
     # *invent* a word, and come on at the first rung that only reuses them.
-    # That is `offer` -- the farmer describes a lot with the quantity, quality
-    # and price words the rungs below it built -- and it covers the two fields
-    # no naming rung teaches: quantity (`ask-qty`) and price (`quote`).
-    costs_from_rung: str = "offer"
+    # Every field now has a naming rung, so that is `mutual` -- and even there
+    # they wait for the rung to be working (`costs_ramp_trigger`) and are ramped
+    # in (`costs_ramp_updates`): switched fully on at the transition, the mutual
+    # rung climbed at half the pace of one with them off.
+    costs_from_rung: str = "mutual"
+    # Within the rung named above, the costs come on only once the rung's
+    # rolling success has reached this multiple of its promotion floor, and then
+    # rise linearly from 0 to full over `costs_ramp_updates` updates; from the
+    # next rung on they are simply on. 0 turns the trigger off (on at once).
+    costs_ramp_trigger: float = 1.0
+    costs_ramp_updates: int = 200
     # The rung from which the convention bonus pays a speaker for using the
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish
     # inventing: a form only counts once it has `convention_min_support` recent
-    # uses behind it. It comes on with the community. The founders now keep a
-    # dialect each through the naming rungs (nobody dies there any more), and
-    # with this folded into the costs, a community of 32 formed at `mutual` with
-    # nothing paying anyone to agree for five more rungs. The rarity cost stays
-    # with the costs: it charges a *new* word, which `ask-qty` and `quote` need.
-    convention_from_rung: str = "mutual"
+    # uses behind it. It comes on at the last naming rung, when every word
+    # exists: the founders keep a dialect each through the single-field rungs
+    # (nobody dies there), and something has to pay the two of them, and then
+    # the community that arrives at `mutual`, to settle on one word per meaning.
+    # The rarity cost stays with the costs: it charges a *new* word.
+    convention_from_rung: str = "name-all"
+    # How many other meanings' conventions a form is contrasted against when the
+    # bonus is computed (a fixed sample per batch): the bonus pays similarity to
+    # this meaning's modal form *minus* similarity to theirs, so one form for
+    # everything earns nothing. More is a steadier baseline at more cost.
+    convention_contrast_samples: int = 16
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -446,16 +477,18 @@ class CurriculumConfig:
     # The CPU runs took the lineup off at ~550 updates. Rungs not named use
     # ``default_rung_updates``.
     rung_budget_updates: dict = field(default_factory=lambda: {
-        "name-fruit": [80, 1500],
+        # The first code forms suddenly and late -- ~300-600 updates on the CPU
+        # runs, 525 and 1,525 on two GPU runs -- so the first rung gets the room.
+        "name-fruit": [80, 2000],
         "name-color": [80, 1500],
         "name-quality": [80, 1500],
+        "name-quantity": [80, 1500],
+        "name-price": [80, 1500],
         "name-all": [80, 2500],
         "mutual": [80, 3500],
-        # The request rungs: each adds one field to an order, so each should be
-        # far cheaper than the naming rung that invented the words.
-        "ask-qty": [80, 2000],
-        "order": [80, 2000],
-        "quote": [80, 2000],
+        # The report rungs in the trading world: every word is inherited, so
+        # each should be far cheaper than the naming rung that invented it.
+        "order": [80, 1500],
         "offer": [80, 2500],
         "judge": [80, 2000],
         "haggle": [80, 3500],
@@ -480,10 +513,13 @@ class CurriculumConfig:
     min_success_over_chance: float = 2.0
     min_topsim_over_null: float = 0.10
     min_channel_transfer: float = 0.25
-    # per-role bars in refer-swap and refer-mutual
+    # per-role bars in the swap and mutual rungs
     min_positional_structure: float = 0.15   # mean slot->field strength, each role
-    mutual_min_report: float = 0.30          # each role reports the other's tuple
-    mutual_min_success: float = 0.10         # both do, in the same round
+    # Each role reports the other's whole lot -- five fields exactly -- in
+    # `mutual`; the per-field bars (min_field_transfer) are the evidence, this
+    # conjunction is the floor. Was 0.30 for a three-field thing.
+    mutual_min_report: float = 0.25
+    mutual_min_success: float = 0.08         # both do, in the same round
     # The first rung at which the population is split into farmers and buyers.
     # Below it everyone is one pool speaking one language, taking both sides of
     # the lineup; at the split each agent is copied into a farmer and a buyer,
@@ -495,18 +531,24 @@ class CurriculumConfig:
     # the two sides can diverge in *strategy*, which only starts to matter where
     # selling and buying pay differently: `haggle`.
     split_roles_at: str = "haggle"
-    # each role, each field (variety, quantity, quality): share of headroom over
-    # a muted channel, so no field can ride on the others
+    # each role, each reported field: share of headroom over a muted channel,
+    # so no field can ride on the others
     min_field_transfer: float = 0.25
-    order_min_success: float = 0.50          # farmer fills the buyer's order exactly
+    # In a report rung, the fields the rung introduced have to arrive *together*
+    # at least this often (five of them exactly, in `order`), on top of the
+    # per-field bars and a real gain over silence.
+    order_min_success: float = 0.25
     # swap and mutual: mean over fields of I(message; field) / H(field), chance-
     # corrected, for each describing role
     min_field_coverage: float = 0.30
-    # Share of lineup rounds that are "hard": one anchor plus near misses of it,
-    # each differing in one field, target uniform among them. At 0.75, quantity
-    # is needed to pick the target in ~46% of rounds (31% with independent
-    # candidates), variety in ~36%, quality in ~33%.
-    hard_distractor_frac: float = 0.75
+    # Share of open lineup rounds that are "hard": one anchor plus near misses of
+    # it, each differing in one field (a different field each), target uniform
+    # among them, so no field can ride on the others. With three candidates at
+    # most two fields can decide a round, so with five fields each is the one
+    # that decides in roughly a quarter of hard rounds; the remaining rounds
+    # draw the candidates independently and are easy. Was 0.75 with three
+    # fields, where each field decided about a third of the rounds.
+    hard_distractor_frac: float = 0.9
     # If a rung never hits threshold inside its budget, advancing anyway would
     # just rebuild the same failure one rung up.  "stop" ends the run and writes
     # the report; "hold" keeps training and flags it loudly.
@@ -587,6 +629,12 @@ class BottleneckConfig:
     # This is the lever for vocabulary loss and regularisation across
     # generations, so it is a first-class knob rather than a constant.
     frequency_skew: float = 1.0
+    # The share of the (fruit, colour, quality) combinations in its sample that a
+    # newborn is *not* shown at all. It has to name those from the parts it did
+    # see, which is what makes the bottleneck a pressure towards a language
+    # built from reusable parts rather than one name per thing. 0 shows a
+    # newborn every combination the store holds (a near-clone).
+    meaning_holdout: float = 0.25
     token_loss_weight: float = 1.0
     decision_loss_weight: float = 1.0
 
@@ -639,11 +687,10 @@ class TrainConfig:
     # its guesses evenly (choice-logit spread 0.5 -> 0.17 in 100 updates) and
     # the speaker's gradient through it dies with it. Measured on the lineup,
     # CPU and GPU alike: with hindsight on from the start the code never formed
-    # (chance after 2,500 updates); without it, it formed at ~550 updates. So the
-    # rungs where a code has to form from nothing -- `refer`, and `refer-swap`,
-    # where the buyer describes for the first time -- run without it, and it
-    # joins at `refer-mutual`, the rung it was added for (drawing quantity and
-    # quality out of a code that already carries variety).
+    # (chance after 2,500 updates); without it, it formed at ~550 updates. So
+    # every rung where a word has to form from nothing -- all six naming rungs --
+    # runs without it, and it joins at `mutual`, where every word exists and the
+    # listener's job is to put five of them into five heads.
     hindsight_from_rung: str = "mutual"
     episodes: int = 6_000_000             # the run's ceiling (~23k updates); rung budgets stop it earlier
     batch_size: int = 256                 # episodes per update (x rung_batch_scale)
@@ -765,6 +812,10 @@ class Config:
         with open(path, "r", encoding="utf-8") as fh:
             return Config.from_dict(json.load(fh), allow_legacy=allow_legacy)
 
+
+# Rungs older ladders had. Their budgets are ignored; their snapshots do not load
+# (the observation layout changed with them).
+RETIRED_RUNGS = frozenset({"refer", "refer-swap", "refer-mutual", "ask-qty", "quote"})
 
 # Settings older versions had, and what replaced them. Everything that means an
 # amount of learning moved from episodes to training updates.
@@ -1050,8 +1101,9 @@ def validate(cfg: Config) -> None:
         assert 0 <= int(lo) <= int(hi), "rung %s: budget must be (min, max) updates" % name
         # A budget for a rung that does not exist is silently ignored, and the
         # rung it was meant for quietly falls back to the default. Three separate
-        # settings in this project outlived the rung they named.
-        assert name in rungs, (
+        # settings in this project outlived the rung they named. (Rungs an older
+        # ladder had are tolerated so an old run's config.json still loads.)
+        assert name in rungs or name in RETIRED_RUNGS, (
             "curriculum.rung_budget_updates names %r, which is not a rung: %s"
             % (name, ", ".join(sorted(rungs))))
     if cfg.curriculum.start_phase:

@@ -93,8 +93,9 @@ reported rather than hidden:
   multiply the hardest cost in the system — one forward pass per agent per
   symbol step — for a negotiation that does not yet need them.
 - **Quantities 1–20.** `world.max_qty` is 8. The meaning space is made large by
-  the three-field product (4 × 4 × 4 things, × quantity × price) rather than by
-  a long quantity range, and 8 already makes memorisation infeasible.
+  the five-field product (4 fruits × 4 colours × 4 qualities × 9 quantities × 6
+  prices = 3,456 lots) rather than by a long quantity range, and 8 already makes
+  memorisation infeasible.
 
 ### 1.2 The addendum: an open vocabulary
 
@@ -126,9 +127,9 @@ compositionality is supposed to:
 
 | addendum § | pressure | intended outcome | implementation |
 |---|---|---|---|
-| 2.1 | a length cost per turn | no absurdly long sentences, without a hard ban | `reward.atom_cost`, `reward.word_cost` — see [§6](#6-speaker-pressures-and-the-community) |
+| 2.1 | a length cost per turn | no absurdly long sentences, without a hard ban | `reward.symbol_cost`, `reward.atom_cost`, `reward.word_cost` — see [§6](#6-speaker-pressures-and-the-community) |
 | 2.2 | the length cost paid *per episode*, against a skewed meaning distribution | common meanings get short words (Zipf) | `world.zipf_alpha`; the correlation is reported, not assumed |
-| 2.3 | a newborn's sample dominated by frequent meanings | no broadly-useless over-specific words; rare forms are at risk | `bottleneck.frequency_skew`, `bottleneck.coverage` |
+| 2.3 | a newborn's sample dominated by frequent meanings | no broadly-useless over-specific words; rare forms are at risk | `bottleneck.frequency_skew`, `bottleneck.coverage`, `bottleneck.meaning_holdout` |
 | 2.4 | generational drift of obscure forms — *not* a bespoke mechanism, but a prediction to instrument | irregular forms levelling out into compositional ones | `lexicon.FormTracker`, reported with before/after examples |
 
 Plus the analyses in its §3: length–frequency correlation, word-like unit
@@ -148,25 +149,47 @@ the space never used).
 Language is only needed when one party holds something the other cannot see and
 cannot guess. That is built in explicitly and enforced in code.
 
-A thing in this world is a **(fruit, colour, quality)** combination:
+### Everything is a lot
+
+The unit of everything that is ever talked about is a **lot**:
+
+```
+(fruit, colour, quality, quantity, price)
+```
 
 | field | values |
 |---|---|
 | fruit | APPLE, BANANA, PEAR, PLUM |
 | colour | RED, YELLOW, GREEN, PURPLE |
 | quality | LOW, MED, HIGH, PRIME |
+| quantity | 0–8 (0 is "none of that", which a farmer has to be able to say) |
+| price | six bins from 1.00 to 3.50 in steps of 0.50 |
 
-4 × 4 × 4 = **64 things to name**. The three fields are separate on purpose:
-that is what makes an adjective worth inventing, because a code can only
-describe a combination it has never met if it names the parts.
+A buyer's request is a lot: the fruit and colour it wants, the lowest quality it
+will take, how many it needs, the most it will pay. A farmer's barn is a list of
+lots: each stocked (fruit, colour) cell with its quality and how many are left,
+all at the farm's one floor price. And the naming game ([§5](#5-the-curriculum))
+describes lots. So there is **one observation layout** for "a thing to talk
+about" — five slots in that order, plus a slot saying which field is being asked
+about — and it is the same five slots whether the thing is the lot a naming round
+asks about or the request a buyer brings to market. The words a population
+invents in the naming game are, slot for slot, the words it places an order
+with; nothing has to be relearned when trading starts, and no field has to be
+*invented* under trading conditions.
+
+That last point is why the lot exists. The design before this one named three
+fields — (fruit, colour, quality) — and left quantity and price to be invented
+in the trading rungs, where hindsight feedback, the speaker costs and the
+convention bonus were already on. Those are exactly the conditions the naming
+rungs show stop a code from forming, and quantity never arrived
+([§11](#11-findings-with-the-evidence)).
 
 | the Farmer privately knows | the Buyer privately knows |
 |---|---|
-| how much of **each (fruit, colour) lot** is in the barn | which fruit, in which colour, they want |
-| the quality of each lot | the minimum quality they will accept |
-| the lowest per-unit price they will take | how many they need, and the most they can pay |
+| for each (fruit, colour) cell: its quality and how many are left | which fruit, in which colour, it wants |
+| the lowest per-unit price it will take | the minimum quality it will accept |
+| | how many it needs, and the most it can pay |
 
-Quantities run 1–8; prices are six bins from 1.00 to 3.50 in steps of 0.50.
 Price is never set by the world — it has to be proposed and agreed.
 
 A deal is possible only if the barn has that fruit in that colour, in enough
@@ -175,18 +198,24 @@ that alone.** Both then independently declare what they think was agreed, and
 the trade succeeds only if those declarations match *each other* and describe a
 deal that is actually executable. One agent being right is never enough.
 
-The barn is laid out as one lot per (fruit, colour) — 16 cells — rather than one
-per fruit. With a single colour per fruit, two thirds of shoppers could not be
-served by anybody and refusing every deal beat trading.
+The barn has one cell per (fruit, colour) — 16 cells, each stocked with
+probability `world.p_stocked` (0.85) — and the farmer sees it as **rows in a
+random order** that changes every encounter. So the only way to find "the lot
+the buyer asked about" is to match its fruit and colour against the words that
+were heard: a lookup by content, which is what a transformer's attention does
+well, rather than by an arithmetic cell index. (With a single colour per fruit,
+two thirds of shoppers could not be served by anybody and refusing every deal
+beat trading; that is why there are colours at all.)
 
 ### A quarter of the combinations are never trained on
 
-Sixteen of the 64 combinations are reserved (`world.holdout_combo_frac` = 0.25),
-and nothing in the project ever trains on them: no lineup describes one, no barn
-stocks one, no shopper asks for one. They are chosen as a **Latin square** — one
-quality withheld from every (fruit, colour) pair, one colour from every (fruit,
-quality), one fruit from every (colour, quality) — which makes the set balanced
-in every direction. Two things follow, and both matter:
+Sixteen of the 64 (fruit, colour, quality) combinations are reserved
+(`world.holdout_combo_frac` = 0.25), and nothing in the project ever trains on
+them: no lineup describes one, no barn stocks one, no shopper asks for one. They
+are chosen as a **Latin square** — one quality withheld from every (fruit,
+colour) pair, one colour from every (fruit, quality), one fruit from every
+(colour, quality) — which makes the set balanced in every direction. Two things
+follow, and both matter:
 
 * every fruit, colour and quality still appears constantly in training, so there
   is always something to generalise *from*; what is withheld is a pairing, never
@@ -198,10 +227,12 @@ in every direction. Two things follow, and both matter:
   of 0.33 with the channel muted.
 
 The Latin square requires the three fields to be the same size, which is why
-there are four of each. Success on the reserved combinations is the productivity
-test, and it gates promotion ([§5](#5-the-curriculum)). A code that gives each
-thing its own name scores at chance there however well it has drilled the rest;
-a code with reusable parts does not.
+there are four of each. Quantity and price are never held out: every value of
+each is trained, and what is tested is whether the *combination* generalises.
+Success on the reserved combinations is the productivity test, and it gates
+promotion ([§5](#5-the-curriculum)). A code that gives each thing its own name
+scores at chance there however well it has drilled the rest; a code with
+reusable parts does not.
 
 ### The property everything rests on
 
@@ -214,7 +245,7 @@ common enough to learn from. That made the buyer's wanted variety predictable
 from the farmer's own stock — the farmer could score 0.67 against a 0.33 base
 rate without listening to anything. Worse, when a farm held only one variety, the
 farmer's best answer was always "the one I have", so that dimension could never
-reward listening even in principle. Farms now carry a multi-variety inventory and
+reward listening even in principle. Farms now carry a multi-lot inventory and
 nothing is coerced.
 `tests/test_env.py::test_knowing_one_side_does_not_predict_the_other` exists so
 this cannot come back unnoticed.
@@ -233,12 +264,14 @@ for.** That lifts P(stock ≥ need) a long way while leaving the farmer's stock
 broadly spread and therefore still unguessable.
 
 Viability is now **67.7%** (measured over 200,000 scenarios at the shipped
-defaults; `--smoke` reports 0.686 on its own sample). The remaining third fails
+defaults; `--smoke` reports ~0.68 on its own sample). The remaining third fails
 for reasons that overlap — of failed rounds, 72% have quality too low, 68% not
 enough stock, 47% the fruit/colour not stocked at all, 13% a price gap — so
 walking away stays a real, multi-reason outcome rather than a rare edge case.
 Narrowing the stock range instead would have hit the same viability while
-pushing the buyer's blind-guess baseline from 0.57 to 0.70.
+pushing the buyer's blind-guess baseline from 0.57 to 0.70. The world's
+statistics did not change when the barn became rows of lots; only its layout
+did.
 
 ### The control that cannot be fooled
 
@@ -275,10 +308,10 @@ Agents do not choose from a fixed word list. They emit a **stream of symbols**,
 one at a time, from
 
 ```
-{ a0 … a15 }  ∪  { HYPHEN, SPACE, END }
+{ a0 … a31 }  ∪  { HYPHEN, SPACE, END }
 ```
 
-(`channel.atomic_vocab` = 16 atoms; 20 token ids in all once padding is counted.)
+(`channel.atomic_vocab` = 32 atoms; 36 token ids in all once padding is counted.)
 
 - a **word** is atoms joined by `HYPHEN` — `a7-a2-a3` is one word;
 - an **utterance** (one turn) is words separated by `SPACE` — `a7-a2 a3` is two;
@@ -295,13 +328,20 @@ the agents had never emitted.)
 
 *Which* atoms make words, and where words split, is entirely the agents' own.
 Ideally separate words come to name separate fields — a fruit word (noun-like)
-beside a quality word (adjective-like) — and the report measures exactly that
-("word classes"); nothing requires it.
+beside a quality word (adjective-like) and a number — and the report measures
+exactly that ("word classes"); nothing requires it.
 
-The vocabulary is open — far more possible words than atoms — while the channel
-stays discrete. `channel.max_symbols` (24 per turn) is a **buffer, not a limit**
-anyone should feel: the report flags any utterance that reaches it, and the
-share at the buffer end should be ~0.
+**Why 32 atoms.** There are 27 field values to name (4 fruits, 4 colours, 4
+qualities, 9 quantities, 6 prices). With 32 atoms every value *can* have an atom
+of its own, and whether a population reuses atoms across fields (homonyms, told
+apart by context) or builds multi-atom words instead is something to measure,
+not to force. Fewer atoms than values would make duality of patterning
+*necessary*; that is the `duality` experiment in `configs/`, not the baseline.
+The vocabulary is open either way — far more possible words than atoms — while
+the channel stays discrete. `channel.max_symbols` (24 per turn) is a **buffer,
+not a limit** anyone should feel: a five-word request is nine symbols; the report
+flags any utterance that reaches the buffer end, and the share there should be
+~0.
 
 **A turn is at least one word** (`channel.allow_silence` = false): the first
 symbol of every turn must be an atom. That is the one hard rule besides the word
@@ -313,22 +353,24 @@ found.
 ### What keeps utterances short is a cost, not a rule
 
 Length is charged **per atom after the first in a word** (`reward.atom_cost`,
-0.03), plus a much smaller charge **per word** (`reward.word_cost`, 0.005).
-Ending a message is free, because brevity should not be taxed.
+0.03), a much smaller charge **per word** (`reward.word_cost`, 0.005), and a
+small flat charge **per symbol** (`reward.symbol_cost`, 0.01). Ending a message
+is free, because brevity should not be taxed.
 
-The split is deliberate. A fused name for a whole (fruit, colour, quality) is one
-long word; naming the parts is two or three short ones. Charging every symbol
-equally would tax the compositional utterance for being longer overall — so words
-are pressed to be short, while saying several of them costs almost nothing.
-Three atoms as one word cost 0.065; the same three atoms as two words cost 0.040.
-(`reward.symbol_cost`, the old flat per-symbol charge, is 0 and kept only so old
-configs load.)
+The split is deliberate. A fused name for a whole lot is one long word; naming
+the parts is five short ones. Charging every symbol equally would tax the
+compositional utterance for being longer overall — so words are pressed to be
+short, while saying several of them costs little. The flat per-symbol charge is
+there for repetition: with the word cost alone, a speaker repeated one word
+twelve times to the buffer end (`a1 a1 a1 …` costs 0.06 under the word cost and
+0.29 with the symbol cost). A five-word request costs 0.115 in all, against a
+task reward above 1.
 
 In the trading rungs this is also the Zipf mechanism: requests follow a Zipf-like
 frequency distribution, so a meaning that comes up constantly pays its length
 cost constantly, while a rare one barely pays it at all. Nothing rewards "short
 words for common things" directly; it is a prediction, and `report.md` reports
-the correlation rather than eyeballing it. (In the naming rungs things are drawn
+the correlation rather than eyeballing it. (In the naming rungs lots are drawn
 uniformly, so there is nothing for length to track, and the report says so.)
 
 ---
@@ -352,8 +394,8 @@ term for being understood: swap a partner between "decoded perfectly" and
 "ignored the message" and the only thing that moved was the joint trade outcome.
 
 So each agent now also states **what it believes the other party's private
-situation to be** — the farmer about the buyer's shopping list, the buyer about
-what is actually in the barn for the line it came for — and that statement is
+situation to be** — the farmer about the buyer's request, the buyer about
+what is actually in the barn for the lot it came for — and that statement is
 scored against the truth. Two reward terms follow from it:
 
 - `reward.decode` (0.45) pays an agent for having read the other correctly;
@@ -377,6 +419,11 @@ disclosed in every report, because it means success rate alone is not proof of
 language — which is why the ablation and the topsim/coherence figures sit beside
 it.
 
+The same two terms — read the other, be read — are what every rung below trading
+pays too ([§5](#5-the-curriculum)): a report round pays `decode` per field the
+reader got right and `understood` per field the speaker was read right on, plus
+the whole-round bonus only when everything arrived at once.
+
 ---
 
 ## 5. The curriculum
@@ -389,14 +436,14 @@ well. A run at that setting produced success 0.000 at *every* checkpoint,
 comprehension 0.000 throughout, and a channel whose scrambling cost nothing.
 
 So the task is built up over **thirteen rungs**, and a rung is only left behind
-once it has demonstrably worked. One rule shapes the whole ladder: **each rung
-adds exactly one thing and keeps everything below it in play.**
+once it has demonstrably worked. Two rules shape the whole ladder: **each rung
+adds exactly one thing and keeps everything below it in play**, and **every word
+is invented in a naming rung; every later rung only reuses words.**
 
 ### The naming rungs
 
-Four of the thirteen are about naming, and nothing is traded until they are
-done.
-Each is a lineup: the describer sees one thing and which field it is being asked
+Six of the thirteen are about naming, and nothing is traded until they are done.
+Each is a lineup: the describer sees one lot and which field it is being asked
 about, the guesser sees three candidates and picks. The describer alternates
 batch by batch, so every agent does both jobs — a single fixed describer produces
 a one-way code (in the run that motivated it, the farmer's utterances had
@@ -412,12 +459,13 @@ reading its *own* words, which training never asks for. Two founders who had
 each invented a dialect the other could read scored 0.92 in training and 0.60
 in the check, and `name-fruit` ran out its budget with a working code.
 
-Two founders who never die do each keep a dialect through the naming rungs:
-`coherence 0.500` in the checkpoint line means they agree on no form at all,
-each reading the other's. Deaths used to paper over this — a newborn apprenticed
-to the survivor inherited its words — at the cost of half the population.
-Convergence now comes where the project means it to: at `mutual`, newcomers are
-taught from transcripts of both, and turnover leaves the commoner form.
+Two founders who never die do each keep a dialect through the single-field
+rungs: `coherence 0.500` in the checkpoint line means they agree on no form at
+all, each reading the other's. Deaths used to paper over this — a newborn
+apprenticed to the survivor inherited its words — at the cost of half the
+population. Convergence now comes where the project means it to: the convention
+bonus arrives at `name-all`, when every word exists, and at `mutual` newcomers
+are taught from transcripts of both and turnover leaves the commoner form.
 
 **A naming rung adds a kind of round; it never swaps to one.** `name-color` is
 60% colour rounds and 40% fruit rounds, so the fruit words stay in use and stay
@@ -433,21 +481,24 @@ kind by kind. Forgetting fruit to learn colour is not progress.
 
 | rung | what is added | mixture of rounds | chance |
 |---|---|---|---|
-| `name-fruit` | a lineup whose candidates share colour and quality and differ only in fruit: only the fruit needs saying | all fruit | 1/3 |
-| `name-color` | colour rounds — same fruit, same quality, different colours. A word for a colour and nothing else. | 60% colour, 40% fruit | 1/3 |
+| `name-fruit` | a lineup whose candidates share every other field and differ only in fruit: only the fruit needs saying | all fruit | 1/3 |
+| `name-color` | colour rounds — same everything else, different colours. A word for a colour and nothing else. | 60% colour, 40% fruit | 1/3 |
 | `name-quality` | quality rounds. Every round still asks one field, but which field changes, so a word has to mean the same thing wherever it appears. | 50% quality, 25% fruit, 25% colour | 1/3 |
-| `name-all` | rounds where the candidates differ in any field, mostly one-field near misses, so the whole (fruit, colour, quality) is named at once | 70% all fields, 10% each single field | 1/3 |
+| `name-quantity` | quantity rounds: a word for each number, 0 to 8. Invented here so that no trading rung ever has to. | 50% quantity, the rest rehearsed | 1/3 |
+| `name-price` | price rounds: a word for each price bin, so every field a deal turns on has a word before any deal is attempted | 50% price, the rest rehearsed | 1/3 |
+| `name-all` | rounds where the candidates differ in any field, mostly one-field near misses, so the whole lot is named at once | 70% all fields, 6% each single field | 1/3 |
 
-**A guess is paid for how much of the thing it got.** A lineup round pays
+**A guess is paid for how much of the lot it got.** A lineup round pays
 `reward.refer_partial` (0.45) for each field the chosen candidate shares with
 the target, on top of the whole-round bonus. Every other rung on the ladder
-already paid per field; the lineup did not, so a guess that got two fields of
-three was worth exactly as much as one that got none, and nothing rewarded a
-message for *narrowing the field down*. That left `name-all` — which needs all
-three fields in one utterance — with no staircase between "one field" and "all
-of them". A run stalled there at 0.60 while naming each field on its own at
-0.74, 0.87 and 0.97, with utterances 1.5 words long where three were needed.
-Partial credit does not count as success: promotion still needs the exact pick.
+already paid per field; the lineup did not, so a guess that got most of the
+fields was worth exactly as much as one that got none, and nothing rewarded a
+message for *narrowing the field down*. That left `name-all` — which needs every
+field in one utterance — with no staircase between "one field" and "all of
+them". A run stalled there at 0.60 while naming each field on its own at 0.74,
+0.87 and 0.97, with utterances 1.5 words long where three were needed. With the
+staircase the next run passed it at 0.73–0.80. Partial credit does not count as
+success: promotion still needs the exact pick.
 
 **The single-field rungs come first because they are learnable from nothing.** A
 code has to exist before it can be made compositional: `name-fruit` needs one
@@ -456,65 +507,64 @@ rather than starting again. The point of the first rung is that 1/3 is a gradien
 RL can climb, where the full task's success probability from random weights is
 about 1e-3 (`--smoke` measures it as 0.0000).
 
-**Hard rounds.** `curriculum.hard_distractor_frac` (0.75) of all-field rounds are
-built as an anchor plus one-field near misses, so every field has to be named.
-The first version of this built the near misses *around the target*, which made
-the target the most central candidate — 42% success with the channel muted
-against 25% chance. The cluster is now shuffled and the target drawn uniformly
-from it, and a test checks that "pick the most central candidate" scores chance.
+**Hard rounds.** `curriculum.hard_distractor_frac` (0.9) of all-field rounds are
+built as an anchor plus one-field near misses — each near miss differing from the
+anchor in a *different* field, and the field drawn uniformly — so every field has
+to be named. Two things were got wrong here before. The first version built the
+near misses *around the target*, which made the target the most central
+candidate — 42% success with the channel muted against 25% chance; the cluster
+is now shuffled and the target drawn uniformly from it, and a test checks that
+"pick the most central candidate" scores chance. The second drew the near miss
+uniformly over all one-field neighbours, which weighted each field by how many
+values it has: with nine quantities against four fruits, fruit decided an open
+round 7% of the time and a describer could drop it almost for free. With three
+candidates at most two fields can decide a round, so with five fields each is the
+deciding one in roughly a quarter of hard rounds, and a test checks that no
+field is favoured.
 
-### The request rungs
+### The report rungs
 
-Between naming and trading sit four rungs that are one event with the fields
-turned up one at a time: **one side says facts only it holds, and the other has
-to put them in its decision heads.** They are the naming ladder's method carried
-into the trade format, and they exist because the two hardest fields in the
-world — quantity (8 values) and price (6 bins) — have no naming rung at all.
-Nothing else ever teaches them before a deal depends on both.
+Between naming and trading sit four rungs that are one event with the roles
+turned up one at a time: **one side holds a lot, and the other has to put it in
+its heads** — the five belief heads, one per field, the same heads `haggle` will
+score. Every word is inherited from the naming rungs; what each rung adds is
+something to *do* with the words.
 
 | rung | what is added | who reports | turns |
 |---|---|---|---|
-| `ask-qty` | **quantity**: the buyer says how many it needs and the farmer has to fill that number | farmer | 1 |
-| `order` | the rest of the order — fruit and colour alongside the quantity | farmer | 1 |
-| `quote` | **price**: the order now carries what the buyer will pay | farmer | 1 |
-| `offer` | **the other direction**: the buyer asks about a lot, the farmer answers with what it holds — how much, what quality, what it wants for it — and the buyer reports what it was told | buyer | 2 |
-| `judge` | **the decision**: the same dialogue, and now the buyer has to say whether the deal is worth doing at all, weighing what it was told against what it needs | buyer | 2 |
+| `mutual` | both hold a private lot and each must report the other's, all five fields. The community arrives; newcomers, deaths and hindsight feedback switch on. | both | 2 |
+| `order` | the buyer states its request — the same five fields, the same layout — and the farmer, **looking at its barn**, reports it. Nothing new to say; what is new is listening with a barn in view. | farmer | 1 |
+| `offer` | the other direction too: the farmer answers with what it holds of the lot that was asked for — how many, what quality, at what floor — and the buyer reports that. The first rung where a farmer **finds a lot in its barn** by the words it heard, and describes a lot from a barn row rather than from the naming layout. | both | 2 |
+| `judge` | the same dialogue, and now **both decide** whether the deal is any good, each weighing what it was told against what it holds, with nothing yet riding on the answer | both | 2 |
 
-Like a naming rung, each is **judged on the field it introduced** and has to
+Like a naming rung, each is **judged on the fields it introduced** and has to
 show it **still carries** the ones below it, field by field against a muted
-channel. A conjunction of four fields would hide which one is at chance, and
-that is exactly what the old ladder did: `haggle` reported 0.07 success, and the
+channel. A conjunction of ten fields would hide which one is at chance, and that
+is exactly what the old ladder did: `haggle` reported 0.07 success, and the
 diagnosis — quality 0.88, variety 0.52, **quantity 0.20** — had to be dug out by
 hand afterwards.
-
-`offer` is the half of the market dialogue that nothing else trains. In every
-rung below it the buyer talks and the farmer acts; in `haggle` the farmer has to
-describe its own barn, and without `offer` that skill would have to appear at
-the same moment as the price agreement and the accept/reject decision.
 
 `judge` exists because of the way `haggle` failed: **always accept**, plus
 base-rate guessing, for 7% success and a channel carrying 0.00–0.02. Roughly 68%
 of rounds are worth doing, so accepting everything scores 0.68 and looks like
-competence. `judge` scores nothing but that decision, and it is judged on the
-**gain over silence** rather than on the raw rate — a pair that accepts
-everything scores exactly what a mute pair scores, which is zero of the
-headroom, and cannot pass. ("Twice the chance rate", the bar everywhere else, is
-not a reachable number when silence already scores 0.68.)
+competence. `judge` is judged on the **gain over silence** rather than on the
+raw rate — a pair that accepts everything scores exactly what a mute pair scores,
+which is zero of the headroom, and cannot pass. ("Twice the chance rate", the
+bar everywhere else, is not a reachable number when silence already scores
+0.68.)
 
 ### The trading rungs
 
 | rung | what is added | turns | chance |
 |---|---|---|---|
-| `mutual` | both hold a private thing and each must report the other's; still no price, no accept/reject | 2 | measured (muted channel) |
 | `haggle` | the pool splits into farmers and buyers, and the deal starts paying: both sides must name the same one, and it only counts if it is actually executable | 2 | ~0 |
 | `bargain` | several turns, so counter-offers become possible | 4 | ~0 |
 | `market` | the full economy: persistent stock, restocking, viability | 4 | ~0 |
 
 **The role split moved to `haggle`.** Everything below it is one language in two
-seats: the request rungs run in both directions — `quote` has the buyer saying
-prices, `offer` has the farmer saying them — and one pool learns both from the
-same words. The split exists so the two sides can diverge in *strategy*, which
-only starts to matter where selling and buying pay differently.
+seats: the report rungs run in both directions, and one pool learns both from
+the same words. The split exists so the two sides can diverge in *strategy*,
+which only starts to matter where selling and buying pay differently.
 
 **Weights carry across every transition.** The population that learned to name is
 the population that learns to haggle — nothing is reinitialised at a boundary.
@@ -534,15 +584,29 @@ All of these have to hold at the same check before the next rung starts:
 - the channel control showing a real drop when messages are muted
   (`min_channel_transfer` = 0.25 of the headroom);
 - on mixed rungs, every rehearsed kind of round still clear of chance;
-- on `name-all` and `mutual`, **structure** — positional structure ≥ 0.15 and
-  **field coverage** ≥ 0.30 — and **success on the reserved combinations**, at
-  least 60% of the rate on trained ones (`min_holdout_ratio`).
+- on `name-all`, **structure** — positional structure ≥ 0.15 and **field
+  coverage** ≥ 0.30 — and **success on the reserved combinations**, at least 60%
+  of the rate on trained ones (`min_holdout_ratio`).
 
-In the lineup rungs and `mutual` every one of these is checked **per role**,
-never pooled: each role's own utterances must show topsim over null and
+In the lineup rungs and the report rungs every one of these is checked **per
+role**, never pooled: each role's own utterances must show topsim over null and
 positional structure, and each role must decode in the view where it is the one
-decoding, or report the other's thing (`mutual_min_report` = 0.30). A pooled
-average would let a fluent partner carry a role that never learned to speak.
+decoding, or report the other's lot. A pooled average would let a fluent partner
+carry a role that never learned to speak.
+
+On a report rung the checks are **per field** as well: every field a role reports
+must carry `min_field_transfer` (0.25) of the headroom over a muted channel —
+labelled "still carries" if an earlier rung introduced it, so forgetting is
+visible as forgetting — the fields the rung introduced must arrive together above
+an absolute floor *and* a real gain over silence, and the **held-out gate is per
+field**: the three fields of a reserved combination have to be reported nearly
+as well as those of a trained one, as a share of the headroom. That last form is
+deliberate. A listener whose heads have learned the training set's joint puts no
+mass on a reserved combination however compositional the *language* is, so the
+whole-round ratio sits near zero — the `mutual` rung stalled on exactly that,
+with per-field coverage 0.96 / 0.75 / 0.77 and a whole-round held-out ratio of
+0.02 ([§11](#11-findings-with-the-evidence)). In the lineup, where the candidates
+are given, the whole-round test is fair and is kept.
 
 Field coverage is the check that matters most, because positional structure is
 fooled by redundancy: a variety-only code like `a13-a13-a13-a13` scores 1.00 on
@@ -553,9 +617,10 @@ Success alone is never enough, because a pair can score on base rates without
 saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
 **Every rung has a budget** (`curriculum.rung_budget_updates`, in training
-updates): 80–1,500 for the single-field naming rungs, 80–2,500 for `name-all`
-and `offer`, 80–2,000 for `ask-qty`, `order` and `quote`, 80–3,500 for `mutual`,
-`haggle` and `bargain`, open for `market`.
+updates): 80–2,000 for `name-fruit` (the first code forms suddenly and late:
+525 and 1,525 updates on two GPU runs), 80–1,500 for the other single-field
+rungs and `order`, 80–2,500 for `name-all` and `offer`, 80–2,000 for `judge`,
+80–3,500 for `mutual`, `haggle` and `bargain`, open for `market`.
 Promotion is checked every 25 updates with a light probe, so a rung that works is
 left promptly. A rung whose community is still filling up does not spend its
 budget, and cannot pass, until everyone has arrived. A rung that reaches its
@@ -575,7 +640,7 @@ all.
 ### Hindsight feedback
 
 After each round, the heads a rung scores are also trained towards the outcome:
-the lineup target, the partner's actual meaning, the order that was placed, the
+the lineup target, the partner's actual lot, the request that was placed, the
 other trader's actual situation (`train.hindsight_coef` = 1.0). This is feedback
 about *what happened*, never about which words to use, and it reaches the speaker
 through the straight-through channel for every field the listener has to recover.
@@ -591,9 +656,10 @@ messages carry nothing: it spreads its guesses evenly (the spread of its choice
 logits fell from 0.5 to 0.17 in 100 updates) and the speaker's gradient, which
 runs through the listener, dies with it. With hindsight on from the first rung
 the lineup code never formed, on the CPU or the GPU (still at chance after 2,500
-updates); without it, it formed at ~550 updates. So every rung where a code has
-to form from nothing runs without it, and it joins where it was meant to help:
-drawing quantity and quality out of a code that already carries variety.
+updates); without it, it formed at ~550 updates. So every rung where a word has
+to form from nothing — all six naming rungs — runs without it, and it joins
+where every word exists and the listener's job is to put five of them into five
+heads.
 
 ### Telling inherited structure from new structure
 
@@ -609,27 +675,43 @@ vocabulary would show up.
 
 ## 6. Speaker pressures and the community
 
-Four terms are paid to or charged to the *speaker* only. All are reward terms,
+Five terms are paid to or charged to the *speaker* only. All are reward terms,
 not restrictions: nothing ever stops an agent from saying anything.
 
 | knob | default | what it does |
 |---|---|---|
+| `reward.symbol_cost` | 0.01 | per emitted symbol — atoms, hyphens and spaces |
 | `reward.atom_cost` | 0.03 | per atom after the first in a word |
 | `reward.word_cost` | 0.005 | per word — a sixth of an atom, so sentences are cheap and words are not |
 | `reward.rarity_cost` | 0.05 | per word, scaled by how rare the form is in the population's recent usage (`usage_half_life_updates` = 80), centred on the batch so it favours established forms without ever favouring silence |
-| `reward.convention` | 0.30 | for matching the population's current form *for this meaning*, minus the similarity to other meanings' forms, so one form for everything earns nothing |
+| `reward.convention` | 0.30 | for matching the population's current form *for this meaning* (a lot, and which field of it was asked about), minus the similarity to other meanings' forms (`convention_contrast_samples` = 16 of them), so one form for everything earns nothing |
 | `train.shaping_reinforce` | 0.2 | how strongly these reach the speaker's token choices |
 
-**The costs — length and rarity — are off until `offer`** (`reward.costs_from_rung`): off through every rung that still has to invent a word, on at the first rung that only reuses them. **The convention bonus comes on earlier, at `mutual`** (`reward.convention_from_rung`), with the community: it pays for agreeing rather than for economy, and it cannot punish a new word, because a form only counts once it has 12 recent uses behind it. It has to arrive there — the two founders keep a dialect each through the naming rungs, and something must pay a community of newcomers to settle on one word per meaning. A language has to
-exist before it can be economised, and the failure is not subtle: with the costs
-on from the second rung a GPU run collapsed onto a single one-atom utterance —
-coherence 1.000, 1.00 atoms per word, ~1 word per utterance, 17 distinct words
-among 15 speakers — and colour never left chance. Before a word for a colour
-exists, the cheapest way to be short *and* to agree with everyone is for everyone
-to say the same short nothing, and the costs are fully satisfiable that way.
-Earlier evidence pointed the same direction: charged from episode 0 even a small
-cost drives the describer to silence, and ramping them in with the first rung's
-success capped that success at 0.42 against 0.62 with them off.
+**The costs — length and rarity — are off until `mutual`**
+(`reward.costs_from_rung`): off through every rung that still has to invent a
+word, on at the first rung that only reuses them. Even there they wait: they come
+on once the rung's rolling success has reached its promotion floor
+(`reward.costs_ramp_trigger` = 1.0 × the floor) and then rise linearly from 0 to
+full over `reward.costs_ramp_updates` (200) updates; every later rung has them
+on. Switched fully on at the transition, the mutual rung climbed at half the
+pace of one with them off ([§11](#11-findings-with-the-evidence)).
+
+**The convention bonus comes on earlier, at `name-all`**
+(`reward.convention_from_rung`), when every word exists: it pays for agreeing
+rather than for economy, and it cannot punish a new word, because a form only
+counts once it has 12 recent uses behind it. It has to arrive there — the two
+founders keep a dialect each through the single-field rungs, and something must
+pay them, and then the community that arrives at `mutual`, to settle on one word
+per meaning. A language has to exist before it can be economised, and the failure
+is not subtle: with the costs on from the second rung a GPU run collapsed onto a
+single one-atom utterance — coherence 1.000, 1.00 atoms per word, ~1 word per
+utterance, 17 distinct words among 15 speakers — and colour never left chance.
+Before a word for a colour exists, the cheapest way to be short *and* to agree
+with everyone is for everyone to say the same short nothing, and the costs are
+fully satisfiable that way. Earlier evidence pointed the same direction: charged
+from episode 0 even a small cost drives the describer to silence, and ramping
+them in with the first rung's success capped that success at 0.42 against 0.62
+with them off.
 
 ### Growing the community
 
@@ -639,7 +721,7 @@ chance in 200k episodes: each farmer kept its own drifting code (coherence
 two invent a code in ~80–140k episodes.
 
 So a community is **founded small** (`population.founders_farmers/_buyers` = 2)
-whatever its final size, and the founders take **all four naming rungs alone**
+whatever its final size, and the founders take **all six naming rungs alone**
 (`population.grow_from_rung` = `mutual`). From there a newcomer joins every 40
 updates until the pool is full, born like any newborn — random weights, then the
 transmission bottleneck on the community's transcripts — so it learns the
@@ -684,7 +766,10 @@ with the founders already at generation 7–8.
 A newborn's apprenticeship (the **transmission bottleneck**) is supervised
 learning on the parent generation's recent successful transcripts. It sees
 **nearly all of them** (`bottleneck.coverage` = 1.0, up to `max_samples` =
-40,000), not a few hundred.
+40,000), not a few hundred — with one deliberate hole: a quarter of the (fruit,
+colour, quality) **combinations** in its sample are withheld from it altogether
+(`bottleneck.meaning_holdout` = 0.25), so those it has to put together from parts
+it did see.
 
 That sizing is a deliberate departure from the brief's "a few hundred to
 low-thousands", and the reason is worth stating. An earlier version drew a small
@@ -704,13 +789,18 @@ Sampling stays proportional to how often each meaning actually came up
 experience still mirrors the parent generation's — it is simply no longer
 artificially thin.
 
-Every birth records what vocabulary it was actually shown, and the report gives
-retention for common and rare forms **separately** rather than as an aggregate,
-so the asymmetry is visible rather than assumed. When a rare meaning's form is
-lost and rebuilt out of words that are common elsewhere, that is the shape of an
-irregular verb levelling out, and `FormTracker` logs it with before/after
-examples. This is why metrics are bucketed into frequent and rare meanings: a
-global average hides exactly this effect.
+The withheld combinations are the bottleneck proper. Seeing every combination
+makes a newborn a near-clone (token accuracy 0.82 straight out of the
+apprenticeship on the GPU runs), and a language whose forms only survive when
+every combination is shown is not a compositional one. Iterated learning is
+known to push towards reusable parts precisely because what a learner is not
+shown it has to reconstruct; a quarter of the combinations, different for every
+newborn, is that pressure without putting common words at risk. Every birth
+records which combinations it was not shown, and the report gives retention for
+common and rare forms **separately** rather than as an aggregate, so the
+asymmetry is visible rather than assumed. When a rare meaning's form is lost and
+rebuilt out of words that are common elsewhere, that is the shape of an irregular
+verb levelling out, and `FormTracker` logs it with before/after examples.
 
 ---
 
@@ -723,18 +813,38 @@ initialised, reading its private observation and the dialogue so far as a single
 sequence: GELU feed-forward, learned positional embeddings, one attention mask
 over observation and dialogue, LayerNorm, and a head per decision.
 
-Ten decision heads: accept/reject, variety, quantity, price, four belief heads
-(the other party's fruit, quantity, quality and price), the lineup choice, and a
-belief about the other party's colour. Beside them sit the head that emits the
-next message symbol and a value head.
+Ten decision heads: accept/reject, variety, quantity, price, five belief heads
+(the other party's fruit, colour, quality, quantity and price — one per field of
+a lot), and the lineup choice. Beside them sit the head that emits the next
+message symbol and a value head.
 
-Separate embedding tables give each observation *position* its own identity, so
-"stock of GREEN APPLE" is a different thing to look at from "stock of GOLD PEAR"
-even though both are quantities; there are also embeddings for the speaker
-("these were my words"), the role, and which field the round is asking about.
+Separate embedding tables give each observation *position* its own identity, and
+each observation slot also carries the *kind* of field it holds, so a quantity in
+a barn row and a quantity in a request are both quantities while "row 7's stock"
+is a different thing to look at from "row 3's". There are also embeddings for the
+speaker ("these were my words"), the role, and which field the round is asking
+about. The shared observation layout is as wide as the barn — 16 rows of four
+plus the floor price, 65 slots — and every other observation (a lot and its
+query slot: 6; a lineup: 16) is padded to it.
+
+Two pieces of structure express the two lookups the game asks for, so that
+neither has to be discovered as a relational trick from nothing. The lineup
+guesser's **candidate pointer** scores the final hidden state against each
+candidate's own embedding: "does this description fit this candidate" is a dot
+product. The farmer's **barn lookup** (`model.barn_lookup`) is one
+cross-attention step from every hidden state to the barn's rows, keyed on each
+row's (fruit, colour) — the same tables the words for fruit and colour are
+grounded in everywhere else — and valued on its (quality, stock): a state that
+has decoded "green pears" only has to reproduce those two embeddings as its
+query to read back how many green pears there are and how good they are. It is
+applied only to a barn, so the naming rungs never touch it, and its output
+starts small so a farmer arriving at `order` keeps the listening it has.
+Measured, supervised, with the answer given ([§11](#11-findings-with-the-evidence)):
+without it the stock and quality of the asked-for lot stayed at the base rate
+after 800 steps; with it both reached 1.00 by step 500.
 
 Sizes are a declared scale choice ([§14](#14-one-method-declared-scale)): 55k
-parameters per agent at the reference scale, up to 849k in `gpu_large`.
+parameters per agent at the reference scale, up to 850k in `gpu_large`.
 
 ### Why Gumbel-softmax
 
@@ -759,23 +869,24 @@ Temperature anneals 1.5 → 0.5 over 1,000 updates and entropy bonuses over 800,
 **counted within each rung** (`train.anneal_per_rung`). They used to count from
 the start of the run, which was fine when a run was one rung; with thirteen,
 everything sat at its floor from update 1,000 on, so `name-all` — which begins
-around update 2,000 and has to find three-word utterances where one used to do —
-explored nothing. In the run that stalled there, the only new word-forms came
-from newborns. `train.gumbel_mix_reinforce` (0.1) mixes a score-function term back over the
-symbols — see [§11](#11-findings-with-the-evidence) for why it has to exist.
+thousands of updates in and has to find five-word utterances where one used to
+do — explored nothing. In the run that stalled there, the only new word-forms
+came from newborns. `train.gumbel_mix_reinforce` (0.1) mixes a score-function
+term back over the symbols — see [§11](#11-findings-with-the-evidence) for why it
+has to exist.
 
 ### Everything is counted in training updates
 
 **Everything that means an amount of learning is counted in training updates**
 (one update = one batch), never episodes: rung budgets, promotion checks,
-checkpoints, the temperature and entropy anneals, community growth, lifespans,
-and how long the population remembers what it has been saying. An episode count
-means different amounts of learning at every batch size, and that difference
-silently broke a GPU run twice — once through lifespans, once through the
-population's usage memory (20,000 episodes was ~80 updates on the CPU runs but
-~5 on the GPU, so the coining cost and convention bonus were chasing a 16×
-shorter memory). `tests/test_config.py` fails if a schedule is named in anything
-but updates.
+checkpoints, the temperature and entropy anneals, the cost ramp, community
+growth, lifespans, and how long the population remembers what it has been
+saying. An episode count means different amounts of learning at every batch
+size, and that difference silently broke a GPU run twice — once through
+lifespans, once through the population's usage memory (20,000 episodes was ~80
+updates on the CPU runs but ~5 on the GPU, so the coining cost and convention
+bonus were chasing a 16× shorter memory). `tests/test_config.py` fails if a
+schedule is named in anything but updates.
 
 ---
 
@@ -787,18 +898,25 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 |---|---|
 | task success | fraction of rounds ending in a mutually consistent success, always beside its muted-channel baseline |
 | channel ablation | intact / scrambled / muted, and the share of the headroom the messages account for |
+| per-field reports | on a report rung, for each role and each field it reports: accuracy intact and muted, and the share of the headroom the channel is worth for that field |
 | topological similarity | Spearman correlation between pairwise meaning distance and pairwise message distance, against its own **shuffled null** (scipy if present, pure-Python fallback otherwise) |
 | positional structure, posdis, bosdis | how strongly each slot maps to a field |
-| **field coverage** | bias-corrected information about *each* field in live messages — the measure that exposed a variety-only code scoring 1.00 on positional structure |
+| **field coverage** | bias-corrected information about *each* of the five fields in live messages — the measure that exposed a variety-only code scoring 1.00 on positional structure |
 | vocabulary stats | distinct words, word length in atoms, words per utterance, token entropy, silent share, share at the buffer end |
 | stability | re-probing the same meaning against the same agent at different times |
 | cross-generation intelligibility | a newborn straight out of its apprenticeship, tested against veterans it never played |
-| zero-shot generalisation | success on the reserved combinations against success on trained ones |
+| zero-shot generalisation | success on the reserved combinations against success on trained ones — whole-round in the lineup, per field on a report rung |
 | length ↔ frequency | correlation between how often a meaning occurs and how long its message is, in symbols and in words |
 | per-bucket metrics | everything above, split into frequent and rare meanings |
 | form survival | whether a meaning's form survives, drifts, or is rebuilt compositionally across turnover |
 | cross-role overlap | histogram intersection of the two roles' word use |
 | language properties | reference, productivity, word classes, intentionality, decontextualised, displaced, interchangeable, generic, perspectives, cultural transmission, duality of patterning — each with how it is measured, its value, and present / partial / absent / untestable / not reached |
+
+Structure measures (topsim, positional structure, coverage) are taken from
+speakers whose *own observation* is a lot: every describer in the naming rungs,
+and the buyer in the market. A farmer in the market speaks about the lot it was
+asked for, and its own observation is a barn, so a structure measure over that
+would be noise; its words are judged by what the buyer recovers from them.
 
 Degenerate outcomes are flagged loudly during the run: success stuck at chance,
 vocabulary collapse, length-cap babbling, a channel that carries nothing, and the
@@ -813,9 +931,9 @@ used).
 |---|---|
 | `report.md` | rewritten at every checkpoint: summary statistics, an honest assessment, final metrics, the inferred dictionary, the curriculum and every transition, the vocabulary, length↔frequency, frequent vs rare, forms lost and rebuilt, the properties scorecard, example transcripts early/middle/late, the economy, population and transmission, and the method caveats |
 | `trades.jsonl` / `.csv` | every logged episode: hidden state, the full symbol transcript, its word segmentation, both decisions, outcome, failure classification, rewards and money |
-| `lineups.jsonl` | naming rounds, which have no trades to log |
+| `lineups.jsonl` | naming and report rounds, which have no trades to log: what was shown, said, asked for and reported |
 | `metrics.jsonl` | every checkpoint's full metric suite |
-| `births.jsonl` | every birth: what the newborn was trained on, which meanings it never saw, how it fared against veterans |
+| `births.jsonl` | every birth: what the newborn was trained on, which combinations it was not shown, how it fared against veterans |
 | `promotions.jsonl` | every promotion check, passed or not, with its evidence |
 | `transcripts.txt` | sampled rounds, each as an expected / dialogue / outcome block, with a banner at each rung |
 | `token_semantics.json`, `history.json` | the post-hoc token analysis and the metric history the report is built from |
@@ -932,6 +1050,62 @@ cost with the mix on drove utterances from 3.83 symbols (93% at the cap) down to
 it costs transmission, so the default is a small 0.1. Set it to 0 to reproduce
 the babbling, or turn it up to watch agents go quiet.
 
+### The naming ladder climbs; what came after it did not
+
+The runs of 2026-09-20 and 2026-09-21 on a 4090 (the `gpu_community` preset,
+founded 2 + 2) are the most complete evidence there is, and they are what the
+current design answers.
+
+1. **The three-field naming ladder passed end to end.** `name-fruit` at 525
+   updates on one run and 1,525 on the other (the first code forms suddenly and
+   late, and the budget is now 2,000); `name-color` and `name-quality` in ~775
+   each; `name-all` in 2,125, at 0.73–0.80 success against 0.667 required,
+   held-out 0.74 against 0.76 on trained combinations, per-field coverage
+   ~0.4–0.5, 1.4 words per utterance of 1.7 atoms. Before the partial credit and
+   the per-rung anneal, the same rung had stalled at 0.55–0.66 with one-atom
+   utterances (`a0` for `PEAR x0 MED`, `APPLE x3 PRIME` and `PEAR x3 HIGH`
+   alike).
+2. **A resume split the pool in two.** Below the trading rungs one pool fills
+   both seats, and the snapshot wrote it twice; the loader restored the two lists
+   separately, so the run came back with two populations under the same ids. They
+   drifted apart from the first update, and within one checkpoint `mutual` had
+   collapsed to fruit-only messages (coverage 0.85 / 0.13 / 0.06, success
+   0.002). The snapshot now records that the pool is shared, the loader restores
+   it as one, and a snapshot from the old bug is repaired with a warning
+   (`tests/test_lots.py`).
+3. **With the pool intact, `mutual` climbed** — 0.04 → 0.36 in 900 updates,
+   per-field coverage 0.96 / 0.75 / 0.77 — **and stalled on the held-out gate at
+   0.02.** The listener's report heads had learned the training set's joint: with
+   one quality never seen for each (fruit, colour), the quality head simply never
+   produced it, however compositional the words were. Measured per field the
+   held-out combinations were reported at 0.61 of the headroom of trained ones.
+   The gate on report rungs is now per field ([§5](#promotion-is-on-evidence-not-on-a-schedule)).
+4. **Quantity never arrived.** The old `ask-qty` rung asked the buyer to invent a
+   word for quantity with hindsight, the speaker costs and the convention bonus
+   already on: 0.28 against a muted 0.20 after 225 updates, with buyers babbling
+   `a1 a1 a1 a1 a1 a1 a1 a1 a1 a1 a1 a1` to the buffer end. That is the
+   from-scratch failure the naming rungs had already shown hindsight causes, now
+   in a rung with every other pressure on as well. It is why every field of a lot
+   has a naming rung, why the request *is* a lot, and why nothing above the
+   naming rungs ever has to invent a word.
+5. **The costs on from the transition halve the pace.** `mutual` with the costs
+   fully on from its first update reached 0.015–0.023 at update 140; with them
+   off, 0.037–0.14. They now wait for the rung to reach its floor and ramp in
+   over 200 updates.
+6. **Repetition is what the word cost buys.** With the costs on, the cheapest
+   way to fill the buffer is one word repeated with spaces; a small flat
+   per-symbol charge (0.01) makes twelve repeats cost 0.29 instead of 0.06 while
+   a five-word request still costs under 0.12.
+7. **The plain transformer cannot find a lot in its barn.** Trained supervised
+   on the barn plus a hand-made two-atom request, with the answer given, the
+   reference-size network learned the request's fruit and colour to 1.00 within
+   100 steps and left the asked-for lot's stock at 0.26–0.34 and its quality at
+   the 0.45 base rate after 800 steps. The same network with one cross-attention
+   step to the barn rows reached 0.86 / 1.00 at step 300 and 1.00 / 1.00 from
+   step 400 on. `offer` would have stalled on the plain network however good
+   the words were; the lookup is now part of the agent ([§8](#8-training)),
+   and `tests/test_lots.py` repeats the drill.
+
 ### The rest of the log
 
 1. **Farmer bottleneck bug.** A static buyer-opens speaking order meant farmer
@@ -945,9 +1119,13 @@ the babbling, or turn it up to watch agents go quiet.
 3. **`haggle` plateaued at ~7% success with channel transfer 0.00–0.02** —
    always-accept plus base-rate guessing. Diagnosis: the language carried quality
    (0.88) and some variety (0.52) but **quantity at chance** (0.20 exact). The
-   earlier rungs had never required it. `order` was added for exactly this.
+   earlier rungs had never required it. `judge` and the per-field report checks
+   exist for exactly this.
 4. **The first hard-distractor design leaked the target** (42% muted against 25%
-   chance) — fixed by the anchor-cluster design, and a test guards it.
+   chance) — fixed by the anchor-cluster design, and a test guards it. **The
+   second weighted the near-miss field by its number of values**, so fruit
+   decided 7% of open rounds once quantity had nine values; the field is now
+   drawn uniformly and a test checks no field is favoured.
 5. **A variety-only code can look perfectly structured.** A 2 + 2 validation run
    passed the first two rungs while carrying 1.5 bits of variety and 0.01–0.05
    bits of anything else, e.g. `a13-a13-a13-a13`. "Positional structure 1.00" was
@@ -972,6 +1150,10 @@ the babbling, or turn it up to watch agents go quiet.
 10. **A report can flatter a run.** One version judged a lineup success of 0.244
     against the *trading* chance (~0) and called it "far above chance". Every
     number is now compared against its own rung's chance rate.
+11. **A probe embedded a buyer's request under a farmer's schema** for as long
+    as one pool has filled both seats; it fitted by luck until the request became
+    a lot and a price landed in the fruit table. Every probe now takes the seat's
+    schema from the rung.
 
 ### Do not draw conclusions from single runs
 
@@ -989,32 +1171,40 @@ across seeds and reports mean, spread **and every individual seed**; see
 **Validated.** The environment and its independence property; the tensor path
 agreeing exactly with the readable scalar one; the reward loop; the held-out set
 and the lineup builder (no reserved combination is ever a training target, every
-candidate could be the answer, and "pick the most central candidate" scores
-chance); one configuration on every device with no device-specific arithmetic;
-every schedule in updates; gradient checkpointing changing nothing. Every rung
-of the ladder plays a real training step, passes on perfect evidence and fails
-on empty evidence — the check that would have caught the trading rungs going
-unexercised for as long as they did. 182 tests, about two minutes.
+candidate could be the answer, "pick the most central candidate" scores chance,
+and no field is favoured as the deciding one); one configuration on every device
+with no device-specific arithmetic; every schedule in updates; gradient
+checkpointing changing nothing. Every rung of the ladder plays a real training
+step, passes on perfect evidence and fails on empty evidence; every report rung
+runs a checkpoint and yields the per-role, per-field evidence its gate reads;
+a snapshot of one pool comes back as one pool; the bottleneck withholds the
+combinations it says it does; the costs wait and ramp; the barn lookup is
+inactive off a barn, small at birth, and learns the lookup when told the answer.
+216 tests, about four minutes.
 
 **Demonstrated in runs.** Founding at 2 + 2 and growing gets a lineup code off
 chance where 6 + 6 never does; the code forms suddenly and late (~300–600
-updates); alternating describers are necessary; hindsight feedback must wait.
+updates on the CPU, 525–1,525 on the GPU); alternating describers are necessary;
+hindsight feedback must wait; the three-field naming ladder climbs to and through
+`name-all`; `mutual` climbs once the pool is kept whole.
 
 **Not yet validated — the open questions.**
 
-- The full ladder has never been climbed end to end. `name-fruit` and the swap
-  and mutual rungs have been passed by a 2 + 2 → 6 + 6 population on an older,
-  narrower world; the current four-field naming ladder has not.
-- **Whether colour is learnable at all** is the live question. The cumulative
-  mixture, the deferred speaker costs and the deferred community growth are all
-  aimed at it, and none of them has been shown to work yet — they are diagnosis
-  plus a fix, not a result.
+- **The five-field naming ladder has not been run on a GPU.** `name-quantity`
+  and `name-price` are new, and so are the 32-atom inventory and the 65-slot
+  layout. What is verified is that they play, score and judge correctly, and
+  (locally, at the reference scale) that the first code still forms — see the
+  end of this section.
+- Whether the farmer learns the **lookup** in `offer` *by reinforcement*:
+  finding the asked-for lot among its barn rows by content, and describing it
+  from a row rather than from the naming layout. This is the one genuinely new
+  skill the trading half asks for, it is deliberately the only new thing in its
+  rung, and the agent now has a structure that learns it in a few hundred
+  supervised steps; whether hindsight on the buyer's report is enough to teach
+  it in play is the open question.
 - Whether separate words specialise to separate fields — the adjective question,
   and the point of the whole naming ladder. The report's "word classes" row is
   where it would show.
-- **The request rungs have never been run for real.** `ask-qty`, `order`,
-  `quote`, `offer` and `judge` are new, and what is verified is that they play,
-  score and judge correctly — not that a population learns them.
 - `haggle` and above. Price coordination (both sides must pick the same bin,
   `reward.price_tol` = 0) is the likely next bottleneck; if it stalls there, that
   is a candidate for a further rung rather than for quietly loosening the test.
@@ -1022,7 +1212,9 @@ updates); alternating describers are necessary; hindsight feedback must wait.
   whole meaning — the setting where duality of patterning is *necessary*).
 
 **Do not relax a promotion criterion to make a run pass.** The thresholds are the
-experiment.
+experiment. Where a threshold was recalibrated here it was because the game
+changed under it (five fields exactly instead of three), and the change is in the
+config comment beside it.
 
 ---
 
@@ -1035,7 +1227,11 @@ re-encoding the whole conversation so far, then a backward pass through all of
 them. The 24-symbol buffer makes generation 6× longer than the old 4-symbol cap;
 that is the right trade, but it makes this loop the bottleneck. On a GPU the cost
 is dominated by the *number of calls*, not arithmetic, so wall time grows with
-the number of agents, not with the batch.
+the number of agents, not with the batch: the 4090 ran the naming rungs at
+2,000–4,000 episodes per second with two founders and `mutual` at ~600 with
+eight. The 65-slot observation (the barn as rows) makes every prefix ~30 slots
+longer than before; on the GPU that is arithmetic, not calls, and it was not
+what the runs were waiting on.
 
 What makes it fast (speed and memory only; the same code runs on a CPU):
 
@@ -1054,10 +1250,8 @@ What makes it fast (speed and memory only; the same code runs on a CPU):
   — 56–365 GB at batch 4,096, which is how a 48 + 48 run met an out-of-memory
   error in its first batch. `CommNet.encode` now checkpoints embedding, layers
   and final norm, keyed on grad mode (not train mode — newborns leave their
-  apprenticeship in eval mode) and embeds only the conversation so far: 0.17 /
-  0.71 / 2.4 MB per episode for lineup / mutual / market, so batch 4,096 needs
-  ~10 GB in the market rung. `tests/test_config.py` checks it gives the same
-  update.
+  apprenticeship in eval mode) and embeds only the conversation so far.
+  `tests/test_config.py` checks it gives the same update.
 
 **The next two engineering wins, in order.**
 
@@ -1069,7 +1263,7 @@ What makes it fast (speed and memory only; the same code runs on a CPU):
    stacked tensors is per-agent already; gradient clipping must be done per agent
    slice; births replace one slice and its optimiser state; the bottleneck trains
    a single module and writes it back. This turns ~n_agents calls per symbol step
-   into one, and is what would make 128 + 128 practical.
+   into one, and is what would make communities above 16 + 16 practical.
 2. **A KV cache for generation** — needs a hand-written causal attention layer
    instead of `nn.TransformerEncoder`, plus an equivalence test against the
    full-sequence forward. Cuts arithmetic, not call count, so do it second.
@@ -1084,7 +1278,9 @@ Until then, communities much larger than the presets are slow: check
   is what exposed the variety-only code.
 - **A muted-channel baseline for every success number.** Any new lineup generator
   must be checked with "pick the most central candidate": it must score chance.
-- **Per-role, per-field numbers** in `promotions.jsonl`.
+- **Per-role, per-field numbers** in `promotions.jsonl` and on every checkpoint
+  line: `farmer reads fruit 0.95, colour 0.70, quality 0.66, quantity 0.12,
+  price 0.30` is a diagnosis; `0.005` is not.
 - **Snapshots plus `orchard.analyse`**, to measure without training.
 - **The supervised capacity check**, before blaming the architecture.
 - **Short rung-only experiments** (a few hundred updates, `--resume` from a
@@ -1108,9 +1304,14 @@ output — and nothing else:
 | preset | community | brain | batch | episodes |
 |---|---|---|---|---|
 | *(none)* | 2 → 6, then 6 + 6 | d48, 2 layers, 55k params | 256 | 6M |
-| `gpu_small` | 2 → 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M |
-| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 100M |
-| `gpu_large` | 2 → 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M |
+| `gpu_small` | 2 → 6, then 6 + 6 | d64, 2 layers, 130k | 1,024 | 20M |
+| `gpu_community` | 2 → 8, then 8 + 8 | d96, 3 layers, 380k | 4,096 | 100M |
+| `gpu_large` | 2 → 16, then 16 + 16 | d128, 4 layers, 850k | 4,096 | 120M |
+
+The communities are smaller than the brief's 8–20 per role at the top end on
+purpose: each agent is a separate forward pass per symbol step
+([§13](#13-performance-and-engineering)), and eight per role is what a 4090 runs
+at a useful pace today. Batching the agents is what lifts that.
 
 The run header prints the two separately — a `scale` line and a `method` line —
 so a big run and a small one can be compared, and neither can quietly become a
@@ -1123,7 +1324,9 @@ held-out set. `configs/duality.json` is a declared experiment (12 fruits against
 8 atoms, and a 32-symbol buffer) and says so in its header.
 
 Old config keys raise an error naming their replacement rather than being
-silently ignored, and old snapshots still load (`Config.from_dict(allow_legacy=True)`).
+silently ignored. **Snapshots from before the lot layout do not load** — the
+observation layout, the query embedding and the atom inventory all changed —
+and the loader says so rather than failing inside `load_state_dict`.
 
 ---
 
@@ -1132,19 +1335,19 @@ silently ignored, and old snapshots still load (`Config.from_dict(allow_legacy=T
 ```
 orchard/
   config.py      every knob, JSON-serialisable; nothing is hardcoded
-  world.py       private state, the held-out Latin square, the independence property
-  economy.py     market days, seasons, multi-lot inventories, replenishment
+  world.py       lots, the barn as rows, the held-out Latin square, the independence property
+  economy.py     market days, seasons, lot inventories, replenishment
   env.py         episode mechanics, word parsing, trade resolution, reward
   agents.py      the randomly-initialised transformer policies
   batched.py     the tensor world and reward the training loop uses
   rollout.py     batched play (probes and evaluation)
   gumbel.py      training: straight-through Gumbel channel + REINFORCE decisions
-  curriculum.py  the ladder of rungs, their worlds, and promotion
+  curriculum.py  the ladder of rungs, the lineup and report games, and promotion
   conventions.py the population's recent usage: rarity cost, convention bonus
   population.py  ageing, death, birth, generation counting, the role split
-  bottleneck.py  iterated learning, frequency-skewed apprenticeship
+  bottleneck.py  iterated learning: frequency-skewed apprenticeship, withheld combinations
   metrics.py     success, topsim, entropy, stability, intelligibility,
-                 zero-shot, channel ablation, per-rung evidence
+                 zero-shot, channel ablation, per-rung and per-field evidence
   lexicon.py     words, length↔frequency, buckets, form survival
   ledger.py      trades.jsonl / trades.csv / metrics.jsonl / births.jsonl / run.log
   render.py      human-readable transcripts (placeholder names only)
@@ -1156,7 +1359,8 @@ orchard/
   hardware.py    device resolution; pins fp32 everywhere
   run.py         the CLI (also --smoke, --benchmark, --resume, --compare)
 configs/         scale presets and named experiments
-tests/           170 tests; test_config.py is the one that keeps the method honest
+tests/           216 tests; test_config.py is the one that keeps the method honest,
+                 test_lots.py the one that keeps the lot layout and its mechanisms honest
 sweep.py         the same arm across seeds, because one run proves nothing
 compare_runs.py  two finished runs side by side, from what they recorded
 cloud_run.sh     the GPU launcher: checks the device, picks a folder, auto-resumes

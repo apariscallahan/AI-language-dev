@@ -114,8 +114,8 @@ def assess(cfg: Config, final: dict[str, Any], chance: float) -> dict[str, Any]:
     ev.append("population coherence %.3f (1.0 = every agent says the same thing "
               "for the same meaning)" % coh)
     if retention == retention:
-        ev.append("zero-shot retention %.2f on held-out (variety, quantity) combinations"
-                  % retention)
+        ev.append("zero-shot retention %.2f on held-out (fruit, colour, quality) "
+                  "combinations" % retention)
     elif zs.get("suppressed"):
         ev.append("zero-shot retention not reported (%s)" % zs["suppressed"])
     ov = final.get("cross_role_overlap") or {}
@@ -335,14 +335,18 @@ def _summary_lines(cfg: Config, final: dict[str, Any], wall_minutes: float) -> l
             for v in views)))
     rows.append(("channel carries", "%s of the headroom over a muted channel"
                  % f(ev.get("transfer"), "%.2f")))
+    from .world import LOT_FIELDS
     for lbl in ("farmer", "buyer"):
         sp = prs.get(lbl)
         if sp:
             cov = sp.get("per_field_coverage") or []
+            names = LOT_FIELDS if len(cov) <= len(LOT_FIELDS) else tuple(
+                "slot %d" % i for i in range(len(cov)))
             rows.append(("%s messages" % lbl,
-                         "topsim %s (null %s); field coverage %s [variety %s, quantity %s, quality %s]"
+                         "topsim %s (null %s); field coverage %s [%s]"
                          % (f(sp.get("topsim")), f(sp.get("null")), f(sp.get("field_coverage")),
-                            *[f(x, "%.2f") for x in (cov + [float("nan")] * 3)[:3]])))
+                            ", ".join("%s %s" % (n, f(x, "%.2f"))
+                                      for n, x in zip(names, cov)))))
     rows.append(("coherence", "farmer %s, buyer %s, across roles %s"
                  % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                     f(st.get("coherence_cross")))))
@@ -545,9 +549,9 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
                  "{:,}".format(growth[-1].get("update", 0)),
                  "{:,}".format(growth[-1]["episode"]), growth[-1]["phase"]))
             A("")
-        A("`refer-swap` and `refer-mutual` are judged per role: each role has to clear "
-          "every bar on its own, describing and decoding, rather than on a pooled "
-          "average that a fluent partner could carry.")
+        A("The naming rungs, `mutual` and the report rungs are judged per role and per "
+          "field: each role has to clear every bar on its own, describing and decoding, "
+          "rather than on a pooled average that a fluent partner could carry.")
         A("")
         A("Furthest rung reached: **%s** (%s updates, %s episodes in it at the end)."
           % (reached, "{:,}".format(int(g(cur, "updates_in_current_phase", 0))),
@@ -980,8 +984,8 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("- In a lineup round that includes it, a guess is also paid `reward.refer_partial` "
       "for each field the candidate it picked shares with the target. Only the exact "
       "pick counts as success; the partial term exists because nothing else rewarded "
-      "a message for narrowing the field down, which left the rung that needs all "
-      "three fields at once with no gradient between naming one and naming them all.")
+      "a message for narrowing the field down, which left the rung that needs every "
+      "field at once with no gradient between naming one and naming them all.")
     A("- Topological similarity is measured on greedily-decoded first utterances, so "
       "the meaning-to-message mapping is a deterministic function. Live play samples "
       "from the policy and is noisier.")

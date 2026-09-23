@@ -13,17 +13,17 @@ All of it is measurement.  Nothing here tells an agent how to speak; every
 
 Probing convention
 ------------------
-A meaning is a (variety, quantity) pair. To turn one into an actual observation
-the remaining fields are held at fixed reference values, so the probe is a
-deterministic function of the meaning and stays comparable across checkpoints
-and generations. Messages are decoded greedily for the same reason.
+A trading meaning is a (fruit, quantity) pair; a naming meaning is a lot. To
+turn one into an actual observation the remaining fields are held at fixed
+reference values, so the probe is a deterministic function of the meaning and
+stays comparable across checkpoints and generations. Messages are decoded
+greedily for the same reason.
 
 *Who* is probed depends on the phase. In the trading rungs it is the buyer, who
-opens by naming what it wants. In the lineup rungs it is whoever describes: the
-farmer in ``refer``, both roles in ``refer-swap`` and ``refer-mutual``. An
-earlier version always probed buyers with a shopping-list observation, which in
-``refer`` read "the population's form for this meaning" off agents that never
-spoke in that rung.
+opens by naming what it wants. In the naming rungs it is whoever describes: both
+roles, since the describer alternates. An earlier version always probed buyers
+with a shopping-list observation, which in a rung where only farmers described
+read "the population's form for this meaning" off agents that never spoke.
 
 Greedy forms are the policy's *mode*. When a policy is still high-entropy the
 mode can be one repeated symbol for a whole row of meanings while sampled play
@@ -51,16 +51,31 @@ from .world import World
 # ==========================================================================
 # probing
 # ==========================================================================
+# The values the other fields of a lot are pinned at when a probe sweeps one.
+REF_QTY = 3
+REF_PRICE = 2
+
+
 def reference_buyer_obs(cfg: Config, key: tuple[int, ...]) -> tuple[int, ...]:
-    """A buyer observation expressing meaning ``key``, with the other fields pinned."""
-    from .world import n_obs_slots
-    if len(key) >= 3:
-        fruit, colour, qty = key[0], key[1], key[2]
-    else:                       # a trading meaning: (fruit, quantity)
-        fruit, qty, colour = key[0], key[1], 0
-    ref_quality = 0
-    ref_price = cfg.world.n_price_bins - 2
-    vals = (fruit, colour, qty, ref_quality, ref_price)
+    """A buyer observation expressing meaning ``key``, with the other fields pinned.
+
+    A request is a lot -- (fruit, colour, quality, quantity, price) -- then the
+    asked-about slot, "all of it". ``key`` may be a whole lot, a (fruit, colour,
+    quality) combination, or a trading meaning (fruit, quantity).
+    """
+    from .world import QUERY_ALL, n_obs_slots
+    w = cfg.world
+    ref_price = min(REF_PRICE, w.n_price_bins - 1)
+    ref_qty = min(REF_QTY, w.max_qty)
+    if len(key) >= 5:
+        fruit, colour, quality, qty, price = key[:5]
+    elif len(key) >= 3:                 # a combination: pin quantity and price
+        fruit, colour, quality = key[:3]
+        qty, price = ref_qty, ref_price
+    else:                               # a trading meaning: (fruit, quantity)
+        fruit, qty = key[0], key[1]
+        colour, quality, price = 0, 0, ref_price
+    vals = (fruit, colour, quality, qty, price, QUERY_ALL)
     return tuple(vals) + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
 
 
@@ -79,14 +94,29 @@ def reference_obs(cfg: Config, key: tuple[int, ...], phase=None) -> tuple[int, .
     q = ASK_ALL
     if getattr(phase, "query", None) is not None:
         q = int(phase.query)
-    vals = tuple(key[:3]) + (q,)
+    lot = tuple(reference_buyer_obs(cfg, key)[:5])
+    vals = lot + (q,)
     return vals + (0,) * (n_obs_slots(cfg.world, cfg) - len(vals))
 
 
 def meaning_keys(cfg: Config, world: World, phase=None) -> list[tuple]:
-    """The meanings a probe should sweep, for this rung."""
+    """The meanings a probe should sweep, for this rung.
+
+    In a naming rung: every trained (fruit, colour, quality) combination at a
+    reference quantity and price, plus one combination swept over every
+    quantity and every price -- so the form for each field value is followed
+    without probing all 3,000-odd lots.
+    """
     if phase is not None and phase.tuples:
-        return [tuple(c) for c in world.holdout.training]
+        w = cfg.world
+        combos = [tuple(c) for c in world.holdout.training]
+        ref_qty, ref_price = min(REF_QTY, w.max_qty), min(REF_PRICE, w.n_price_bins - 1)
+        keys = [c + (ref_qty, ref_price) for c in combos]
+        if combos:
+            f0, c0, q0 = combos[0]
+            keys += [(f0, c0, q0, n, ref_price) for n in range(w.max_qty + 1) if n != ref_qty]
+            keys += [(f0, c0, q0, ref_qty, p) for p in range(w.n_price_bins) if p != ref_price]
+        return keys
     return [k for k, _ in world.meaning_table()]
 
 
@@ -128,7 +158,7 @@ def probe_messages(cfg: Config, pop: Population, keys: Sequence[tuple[int, int]]
     return out
 
 
-def live_encoding(cfg: Config, batches: Sequence[Any], field: int = 1,
+def live_encoding(cfg: Config, batches: Sequence[Any], field: int = 3,
                   given: int = 0, n_shuffles: int = 5, seed: int = 0) -> dict[str, Any]:
     """Does what speakers *actually said* carry a field, beyond another field?
 
@@ -136,6 +166,7 @@ def live_encoding(cfg: Config, batches: Sequence[Any], field: int = 1,
     inflated when most messages are unique, so this reports the excess over a
     shuffled null (the field permuted within each value of ``given``) -- the
     honest "bits the message carries about quantity once variety is known".
+    Fields index a lot: 0 fruit, 1 colour, 2 quality, 3 quantity, 4 price.
     Computed on sampled play, not greedy probes.
     """
     rows: list[tuple[tuple[int, ...], int, int]] = []
@@ -156,7 +187,7 @@ def live_encoding(cfg: Config, batches: Sequence[Any], field: int = 1,
                 else:
                     continue
             elif role == BUYER and hasattr(sb, "want_variety"):
-                mean = torch.stack([sb.want_variety, sb.need_qty], dim=1)
+                mean = sb.request                 # the buyer's request is a lot
             else:
                 continue
             L = cfg.channel.max_msg_len

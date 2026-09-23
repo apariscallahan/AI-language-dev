@@ -42,7 +42,7 @@ from .env import BUYER, FARMER, buyer_obs, farmer_obs, obs_for, speaker_of_turn
 from .population import Population
 from .rollout import run_episodes
 from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
-                    KIND_NAMES,
+                    KIND_NAMES, LOT_FIELDS,
                     Scenario, World, field_labels, field_spans, obs_schema)
 
 
@@ -138,7 +138,7 @@ def meaning_distance(a: Sequence[int], b: Sequence[int], cfg: Config, role: int,
     """Distance between two private states, over that role's real fields only.
 
     ``kinds`` overrides the trading-task schema -- a lineup describer's meaning
-    is a (variety, quantity, quality) tuple, not a shopping list.
+    is a lot (fruit, colour, quality, quantity, price), not a barn.
     """
     kinds = list(kinds) if kinds is not None else obs_schema(cfg.world, role)
     if metric == "hamming":
@@ -284,29 +284,30 @@ def phase_kinds(cfg: Config, role: int, phase=None) -> list[int]:
 def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
     """Human names for a speaker's observation slots in this phase."""
     if phase is not None and phase.tuples:
-        names = ["variety", "quantity", "quality"]
+        names = list(LOT_FIELDS) + ["asked"]
         kinds = phase_kinds(cfg, role, phase)
-        return names + ["-"] * (len(kinds) - len(names))
+        return names + ["-"] * max(0, len(kinds) - len(names))
     return field_labels(cfg.world, role)
 
 
 def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
                    held_out: bool = False) -> list[tuple[int, ...]]:
-    """(fruit, colour, quality) things to describe, plus the field being asked about.
+    """Lots to describe -- (fruit, colour, quality, quantity, price) -- plus the
+    field being asked about.
 
-    The describer's observation in a naming rung is the thing *and* the query, so
+    The describer's observation in a naming rung is the lot *and* the query, so
     a probe that left the query out would be asking about the wrong rung: in
     ``name-color`` every probe has to say "colour" for the answer to mean
     anything.
     """
-    from .curriculum import ASK_ALL, ReferentialWorld
+    from .curriculum import ASK_ALL, N_KINDS, ReferentialWorld
     from .world import n_obs_slots
     g = torch.Generator()
     g.manual_seed(seed)
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
     rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
-    mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
+    mix = getattr(phase, "mix", None) or ((0.0,) * (N_KINDS - 1) + (1.0,))
     total = float(sum(mix)) or 1.0
     # The probe asks the fields the rung asks, as often as the rung asks them.
     asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
@@ -339,14 +340,23 @@ def sample_meanings(cfg: Config, world: World, role: int, n: int,
 
 @torch.no_grad()
 def farmer_context_message(cfg: Config, pop: Population, world: World,
-                           device: str = "cpu") -> torch.Tensor:
-    """A single fixed Buyer opening, used as the constant context for Farmer probes."""
+                           device: str = "cpu", phase=None) -> torch.Tensor:
+    """A single fixed Buyer opening, used as the constant context for Farmer probes.
+
+    Played from the *buyer seat* of ``phase``: below the trading rungs one pool
+    fills both seats, so the agent asked may be a farmer by role, and embedding
+    a buyer's request under its own barn schema reads a price with the fruit
+    table (which only fitted by luck before the request became a lot).
+    """
+    from .curriculum import ladder, phase_schema
     c = cfg.channel
+    ph = phase if phase is not None else ladder(cfg)[-1]
     buyer = pop.buyers[0]
     sc = world.sample(held_out=False)
     obs = torch.tensor([buyer_obs(sc, cfg)], dtype=torch.long, device=device)
     tokens = torch.full((1, c.dialogue_len), c.pad_id, dtype=torch.long, device=device)
-    greedy_turn(cfg, buyer, obs, tokens, 0)
+    greedy_turn(cfg, buyer, obs, tokens, 0, schema=phase_schema(cfg, BUYER, ph),
+                self_mask=ph.self_mask(cfg, BUYER, device))
     return tokens[0, :c.max_msg_len].clone()
 
 
@@ -355,7 +365,7 @@ def opening_context(cfg: Config, pop: Population, world: World, phase=None,
                     device: str = "cpu") -> Optional[torch.Tensor]:
     """One fixed opening turn, for probing whoever speaks second in ``phase``."""
     if phase is None or not phase.tuples:
-        return farmer_context_message(cfg, pop, world, device)
+        return farmer_context_message(cfg, pop, world, device, phase=phase)
     first = phase.speaker_of_turn(0)
     agent = pop.pool(first)[0]
     m = sample_meanings(cfg, world, first, 1, phase=phase, seed=12345)
@@ -405,12 +415,25 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
     rng = rng or random.Random(0)
     out: dict[str, Any] = {}
     talking = dict((lbl, r) for r, lbl in speaking_roles(cfg, phase))
+    probeable = (set(phase.lot_speakers(cfg)) if phase is not None else {BUYER, FARMER})
     for role, label in ((BUYER, "buyer"), (FARMER, "farmer")):
         view = speaker_view(phase, cfg, role) if phase is not None else None
         if phase is not None and label not in talking:
             out[label] = {"mean": float("nan"), "max": float("nan"),
                           "mean_l1": float("nan"), "null_mean": float("nan"),
                           "per_agent": [], "silent": True}
+            continue
+        if role not in probeable:
+            # It speaks, but about the lot it was asked for: its own observation
+            # is a barn, and a structure measure over that would be noise.
+            out[label] = {"mean": float("nan"), "max": float("nan"),
+                          "mean_l1": float("nan"), "null_mean": float("nan"),
+                          "posdis": float("nan"), "bosdis": float("nan"),
+                          "field_coverage": float("nan"), "per_field_coverage": [],
+                          "per_agent": [], "silent": False,
+                          "note": "speaks about the lot it was asked for; its own "
+                                  "observation is a barn, so it is not probed for "
+                                  "structure"}
             continue
         kinds = phase_kinds(cfg, role, view)
         ctx = opening_context(cfg, pop, world, view, device)
@@ -652,7 +675,6 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     # 4096 attribute lookups on dataclasses that had to be built first.
     succ_t = batch.success_t
     referential = batch.sb is not None and not hasattr(batch.sb, "viable")
-    mutual = referential and batch.res is not None and "farmer_report_ok" in batch.res
     viable_t = (torch.ones_like(succ_t) if referential
                 else batch.viable_t.to(succ_t.device))
     succ = int(succ_t.sum())
@@ -696,19 +718,20 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     b_decode = float(batch.buyer_decode_t.float().mean())
     extra: dict[str, Any] = {}
     res = batch.res if isinstance(batch.res, dict) else None
-    if res is not None and "order_fields" in res:
-        # A request rung: how often each asked-for field arrived, and how often
-        # the one this rung introduced did. One conjunction would hide a field
-        # sitting at chance, which is how the old `haggle` failure looked.
-        of = res["order_fields"].float()
-        extra["request_fields"] = [float(x) for x in of.mean(0)]
-        extra["request_first"] = float(res["order_first"].float().mean())
-    if mutual:
-        extra["farmer_report"] = float(batch.res["farmer_report_ok"].float().mean())
-        extra["buyer_report"] = float(batch.res["buyer_report_ok"].float().mean())
-        ff, bf = batch.res["farmer_fields"].float(), batch.res["buyer_fields"].float()
-        extra["farmer_report_fields"] = [float(x) for x in ff.mean(0)]
-        extra["buyer_report_fields"] = [float(x) for x in bf.mean(0)]
+    if res is not None and "farmer_fields" in res:
+        # A report rung: how often each role reported each field, how often it
+        # got every field the rung introduced right at once, and how often it got
+        # everything. One conjunction would hide a field sitting at chance,
+        # which is how the old `haggle` failure looked.
+        for label in ("farmer", "buyer"):
+            if not res["%s_field_names" % label]:
+                continue                       # this role reports nothing here
+            ff = res["%s_fields" % label].float()
+            extra["%s_report" % label] = float(res["%s_report_ok" % label].float().mean())
+            extra["%s_report_fields" % label] = (
+                [float(x) for x in ff.mean(0)] if ff.shape[1] else [])
+            extra["%s_new" % label] = float(res["%s_new_ok" % label].float().mean())
+            extra["%s_field_names" % label] = list(res["%s_field_names" % label])
     return {
         **extra,
         "n": n,
@@ -812,6 +835,29 @@ def _headroom(intact: float, scrambled: float) -> float:
     return (intact - scrambled) / room
 
 
+def _report_keys(intact: dict[str, Any], muted: dict[str, Any]) -> dict[str, Any]:
+    """What a report rung's ablation adds: per role, exact / per field / the new
+    fields, intact and muted, and the share of the headroom each is worth."""
+    out: dict[str, Any] = {}
+    for label in ("farmer", "buyer"):
+        if "%s_report" % label not in intact:
+            continue
+        out["%s_report" % label] = intact["%s_report" % label]
+        out["muted_%s_report" % label] = muted["%s_report" % label]
+        out["%s_report_transfer" % label] = _headroom(intact["%s_report" % label],
+                                                      muted["%s_report" % label])
+        out["%s_fields_intact" % label] = intact["%s_report_fields" % label]
+        out["%s_fields_muted" % label] = muted["%s_report_fields" % label]
+        out["%s_field_transfer" % label] = [_headroom(a, m) for a, m in zip(
+            intact["%s_report_fields" % label], muted["%s_report_fields" % label])]
+        out["%s_field_names" % label] = intact["%s_field_names" % label]
+        out["%s_new" % label] = intact["%s_new" % label]
+        out["muted_%s_new" % label] = muted["%s_new" % label]
+        out["%s_new_transfer" % label] = _headroom(intact["%s_new" % label],
+                                                   muted["%s_new" % label])
+    return out
+
+
 def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
                      device: str = "cpu", rng: Optional[random.Random] = None,
                      phase=None, sampler=None) -> dict[str, Any]:
@@ -887,33 +933,7 @@ def channel_ablation(cfg: Config, pop: Population, world: World, n: int,
                                               scrambled["farmer_variety_acc"]),
         "length_only_variety": _headroom(scrambled["farmer_variety_acc"],
                                          muted["farmer_variety_acc"]),
-        **({"request_fields_intact": intact["request_fields"],
-            "request_fields_muted": muted["request_fields"],
-            "request_field_transfer": [_headroom(a, m) for a, m in zip(
-                intact["request_fields"], muted["request_fields"])],
-            "request_first": intact["request_first"],
-            "muted_request_first": muted["request_first"],
-            "request_first_transfer": _headroom(intact["request_first"],
-                                                muted["request_first"])}
-           if "request_fields" in intact else {}),
-        **({"intact_farmer_report": intact["farmer_report"],
-            "muted_farmer_report": muted["farmer_report"],
-            "intact_buyer_report": intact["buyer_report"],
-            "muted_buyer_report": muted["buyer_report"],
-            "farmer_report_transfer": _headroom(intact["farmer_report"],
-                                                muted["farmer_report"]),
-            "buyer_report_transfer": _headroom(intact["buyer_report"],
-                                               muted["buyer_report"]),
-            # per field: variety, quantity, quality
-            "farmer_fields_intact": intact["farmer_report_fields"],
-            "farmer_fields_muted": muted["farmer_report_fields"],
-            "buyer_fields_intact": intact["buyer_report_fields"],
-            "buyer_fields_muted": muted["buyer_report_fields"],
-            "farmer_field_transfer": [_headroom(a, m) for a, m in zip(
-                intact["farmer_report_fields"], muted["farmer_report_fields"])],
-            "buyer_field_transfer": [_headroom(a, m) for a, m in zip(
-                intact["buyer_report_fields"], muted["buyer_report_fields"])]}
-           if "farmer_report" in intact else {}),
+        **_report_keys(intact, muted),
         "intact_reward": intact["mean_reward"],
         "scrambled_reward": scrambled["mean_reward"],
         "success_drop": drop("success_rate"),
@@ -931,18 +951,19 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
                         device: str = "cpu") -> dict[str, Any]:
     """Does a buyer name a meaning the same way in two different contexts?
 
-    The same (variety, quantity, quality) is probed twice per buyer: as the
-    describer in a lineup (tuple layout, speaking first) and as the requester
-    in a trade (request layout, price held at a reference value). Similarity of
-    the two forms for the *same* meaning, minus their similarity for different
-    meanings, is how context-free the form-meaning pairing is.
+    The same lot is probed twice per buyer: as the describer in a lineup
+    (speaking first, the naming rung's context) and as the requester in a trade
+    (the market's context). The observation is identical -- a request *is* a lot
+    -- so what differs is only the rung. Similarity of the two forms for the
+    *same* lot, minus their similarity for different lots, is how context-free
+    the form-meaning pairing is.
     """
     from .conventions import similarity
     from .curriculum import ladder
     from .lexicon import reference_buyer_obs
-    # Taken from the ladder, not by name: this asked for "refer-swap" for long
-    # enough that the rungs were renamed under it, and the KeyError was swallowed
-    # by the caller, so the measure silently reported nothing for every run.
+    # Taken from the ladder, not by name: this once asked for a rung by a name
+    # that had been retired, and the KeyError was swallowed by the caller, so
+    # the measure silently reported nothing for every run.
     rungs = ladder(cfg)
     naming = next((p for p in rungs if p.swaps and p.whole), None)
     trade = next((p for p in rungs if p.trading), None)
@@ -950,12 +971,11 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
         return {"n": 0, "consistency": float("nan"),
                 "note": "the ladder has no naming rung or no trading rung"}
     lineup = naming.with_informer(BUYER)
+    # A request *is* a lot in the same layout, so the very same observation is
+    # handed to the buyer as a lineup describer and as a requester; what differs
+    # is the context (the rung, its speaking order, its self-mask).
     tup = tuple_meanings(cfg, n, seed=4242)
-    req = []
-    for m in tup:
-        r = list(reference_buyer_obs(cfg, (m[0], m[1])))
-        r[2] = m[2]
-        req.append(tuple(r))
+    req = list(tup)
     same, diff = [], []
     for agent in pop.buyers:
         a = utterances_for_meanings(cfg, agent, tup, device=device, phase=lineup,
@@ -1004,11 +1024,13 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out: dict[str, Any] = {"phase": phase.name, "views": [], "speakers": {},
                            "chance": chance}
     succ, trans = [], []
+    last_abl: dict[str, Any] = {}
     for v in phase.views():
         abl = channel_ablation(cfg, pop, world, n_eval, device=device, rng=rng,
                                phase=v, sampler=sampler_for(v))
         if not abl.get("n"):
             continue
+        last_abl = abl
         row = {"informer": None, "guesser": None,
                "success": abl["intact_success"], "muted_success": abl["muted_success"],
                "scrambled_success": abl["scrambled_success"],
@@ -1016,19 +1038,9 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
         if v.referential:
             row["informer"] = "farmer" if v.informer == FARMER else "buyer"
             row["guesser"] = "farmer" if v.guesser == FARMER else "buyer"
-        for k in ("farmer_report", "buyer_report"):
-            if "intact_" + k in abl:
-                out[k] = abl["intact_" + k]
-                out["muted_" + k] = abl["muted_" + k]
-                out[k + "_transfer"] = abl[k + "_transfer"]
-        for k in ("farmer_field_transfer", "buyer_field_transfer",
-                  "farmer_fields_intact", "buyer_fields_intact",
-                  "farmer_fields_muted", "buyer_fields_muted",
-                  "request_fields_intact", "request_fields_muted",
-                  "request_field_transfer", "request_first",
-                  "muted_request_first", "request_first_transfer"):
-            if k in abl:
-                out[k] = abl[k]
+        for k, val in abl.items():
+            if k.startswith(("farmer_", "buyer_", "muted_farmer_", "muted_buyer_")):
+                out[k] = val
         out["views"].append(row)
         succ.append(row["success"])
         trans.append(row["transfer"])
@@ -1036,6 +1048,18 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["success"] = sum(good) / len(good) if good else float("nan")
     good = [x for x in trans if x == x]
     out["transfer"] = sum(good) / len(good) if good else float("nan")
+    if phase.reporting:
+        # On a report rung "the channel carries" is judged on the fields the rung
+        # introduced, per role, not on the conjunction of everything both report
+        # (which in `judge` is ten fields, and small however well it works).
+        new_tr = []
+        for r, lbl in ((FARMER, "farmer"), (BUYER, "buyer")):
+            if phase.new_names(r):
+                x = out.get("%s_new_transfer" % lbl)
+                if isinstance(x, float) and x == x:
+                    new_tr.append(x)
+        if new_tr:
+            out["transfer"] = sum(new_tr) / len(new_tr)
 
     # Held-out combinations, played exactly like the rung itself.
     out["holdout_success"] = float("nan")
@@ -1065,6 +1089,44 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
+        if phase.reporting and last_abl:
+            # Per field, for the report rungs: a listener whose heads have learned
+            # the training set's joint puts no mass on a reserved combination
+            # however compositional the *language* is, so the whole-round ratio
+            # sits near zero. What the gate can fairly ask is that each field of
+            # a held-out combination is read nearly as well as of a trained one,
+            # as a share of the headroom over a muted channel.
+            from .curriculum import COMBO_FIELDS
+            hs_f, seen_f, ratios = [], [], []
+            for v in phase.views():
+                sam = holdout_sampler_for(v)
+                plain = sampler_for(v)
+                if sam is None:
+                    continue
+                try:
+                    h = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
+                                         device=device, rng=rng, phase=v, sampler=sam)
+                    s = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
+                                         device=device, rng=rng, phase=v,
+                                         sampler=lambda n, _ho=False, _p=plain: _p(n, held_out=False))
+                except Exception:
+                    continue
+                for label in ("farmer", "buyer"):
+                    names = h.get("%s_field_names" % label) or []
+                    hv = h.get("%s_report_fields" % label) or []
+                    sv = s.get("%s_report_fields" % label) or []
+                    mv = last_abl.get("%s_fields_muted" % label) or []
+                    for name, a, b, m in zip(names, hv, sv, mv):
+                        if name not in COMBO_FIELDS:
+                            continue
+                        hs_f.append(a)
+                        seen_f.append(b)
+                        room = b - m
+                        if room > 0.02:
+                            ratios.append(max(0.0, (a - m) / room))
+            out["holdout_field_success"] = sum(hs_f) / len(hs_f) if hs_f else float("nan")
+            out["seen_field_success"] = sum(seen_f) / len(seen_f) if seen_f else float("nan")
+            out["holdout_field_ratio"] = sum(ratios) / len(ratios) if ratios else float("nan")
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.

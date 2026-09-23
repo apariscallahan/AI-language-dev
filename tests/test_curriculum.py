@@ -98,10 +98,12 @@ class TestOneArchitectureEveryPhase(unittest.TestCase):
                                  "%s/%s schema is not the shared layout"
                                  % (phase.name, role))
 
-    def test_the_lineup_needs_the_most_room(self):
+    def test_the_layout_has_room_for_the_lineup_and_the_barn(self):
         cfg = cfg_small()
         cfg.curriculum.n_candidates = 6
-        self.assertGreaterEqual(n_obs_slots(cfg.world, cfg), 3 * 6)
+        self.assertGreaterEqual(n_obs_slots(cfg.world, cfg), 5 * 6 + 1)
+        from orchard.world import farmer_schema
+        self.assertGreaterEqual(n_obs_slots(cfg.world, cfg), len(farmer_schema(cfg.world)))
 
     def test_weights_carry_across_every_transition(self):
         """The same modules keep training; nothing is reinitialised."""
@@ -183,13 +185,15 @@ class TestLineupGame(unittest.TestCase):
         n = n_obs_slots(cfg.world, cfg)
         self.assertEqual(tuple(f.shape), (256, n))
         self.assertEqual(tuple(g.shape), (256, n))
-        # the informer sees exactly the thing it must describe and which field
+        # the informer sees exactly the lot it must describe and which field
         # is being asked about -- and nothing at all about the lineup
-        self.assertTrue(bool((f[:, :3] == rb.true_meaning).all()))
-        self.assertTrue(bool((f[:, 3] == rb.query).all()))
-        self.assertTrue(bool((f[:, 4:] == 0).all()), "informer saw the lineup")
+        W = rb.meanings.shape[-1]
+        self.assertEqual(W, 5)
+        self.assertTrue(bool((f[:, :W] == rb.true_meaning).all()))
+        self.assertTrue(bool((f[:, W] == rb.query).all()))
+        self.assertTrue(bool((f[:, W + 1:] == 0).all()), "informer saw the lineup")
         # the guesser sees the candidates and the query, not the answer
-        self.assertTrue(bool((g[:, :3 * rb.meanings.shape[1]]
+        self.assertTrue(bool((g[:, :W * rb.meanings.shape[1]]
                               == rb.meanings.reshape(256, -1)).all()))
 
     def test_scoring_is_the_guess(self):
@@ -421,7 +425,7 @@ class TestTheStoreActuallyFills(unittest.TestCase):
             update=500, phase=ladder(cfg)[0])
         for j in (0, 5, 40):
             got = store.meaning_of(batch, j)
-            want = (int(rb.true_meaning[j][0]), int(rb.true_meaning[j][1]))
+            want = tuple(int(x) for x in rb.true_meaning[j][:3])
             self.assertEqual(got, want,
                              "a lineup round was filed under the wrong meaning")
 

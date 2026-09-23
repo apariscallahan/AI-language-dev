@@ -1,8 +1,8 @@
 {
   "name": "gpu_large",
   "population": {
-    "n_farmers": 64,
-    "n_buyers": 64
+    "n_farmers": 16,
+    "n_buyers": 16
   },
   "model": {
     "d_model": 128,

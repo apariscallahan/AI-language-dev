@@ -1,8 +1,8 @@
 {
   "name": "gpu_community",
   "population": {
-    "n_farmers": 32,
-    "n_buyers": 32
+    "n_farmers": 8,
+    "n_buyers": 8
   },
   "model": {
     "d_model": 96,

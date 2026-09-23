@@ -41,9 +41,10 @@ size), so a
 convention can still change -- it just has to win over the population to do it.
 
 Conventions are pooled by *meaning kind*, not by role: in the lineup rungs a
-farmer and a buyer describing the same (variety, quantity, quality) tuple feed and
-are measured against the same convention. That is what keeps the two roles
-speaking one language rather than two.
+farmer and a buyer describing the same lot (fruit, colour, quality, quantity,
+price) feed and are measured against the same convention -- and so does a buyer
+placing that request in the market. That is what keeps the two roles speaking
+one language rather than two.
 """
 from __future__ import annotations
 
@@ -180,9 +181,24 @@ class PopulationUsage:
         return firsts, words
 
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
+        """One convention per (kind of meaning, the meaning, what was asked about).
+
+        A lot asked about for its colour alone is not the same meaning as the
+        whole lot: the population's form for the first is one word and for the
+        second is several, so the two must not be folded into one modal form.
+        A buyer's request in the market carries "the whole lot" in the same slot,
+        so it shares a convention with the `name-all` describer's lot.
+        """
+        from .curriculum import phase_schema
         n = n_real_fields(self.cfg, role, phase)
         kind = phase.meaning_kind(role)
-        return [(kind,) + tuple(r) for r in obs[:, :n].tolist()]
+        schema = phase_schema(self.cfg, role, phase)
+        q_at = next((i for i, k in enumerate(schema) if k == K_FIELD), None)
+        rows = obs[:, :n].tolist()
+        if q_at is None:
+            return [(kind,) + tuple(r) for r in rows]
+        qs = obs[:, q_at].tolist()
+        return [(kind,) + tuple(r) + (int(q),) for r, q in zip(rows, qs)]
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
@@ -237,7 +253,7 @@ class PopulationUsage:
                 kind = phase.meaning_kind(role)
                 need = R.convention_min_support / max(self.scale, 1e-12)
                 est = [k for k, v in self.form_total.items() if k[0] == kind and v >= need]
-                others = self._rng.sample(est, min(16, len(est)))
+                others = self._rng.sample(est, min(R.convention_contrast_samples, len(est)))
                 other_modal = [(k, self.modal(k)) for k in others]
                 other_modal = [(k, m) for k, m in other_modal if m]
                 other_keys = {ko: mo for ko, mo in other_modal}
@@ -285,6 +301,11 @@ class PopulationUsage:
                     self.words[w] += inc
                     self.word_total += inc
             for k, u in zip(d["_keys"], d["_firsts"]):
+                # A farmer's market utterance is keyed on its whole barn, which
+                # never repeats: no convention can form on it, and recording one
+                # key per episode would grow without bound. Words still count.
+                if k[0] == "barn":
+                    continue
                 self.forms[k][tuple(u)] += inc
                 self.form_total[k] += inc
         self.episodes += n_episodes

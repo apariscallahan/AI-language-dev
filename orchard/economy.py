@@ -3,11 +3,11 @@
 A *farm* is a lineage slot, not an agent: the orchard outlives whoever is running
 it, so an inventory belongs to the slot and survives the farmer's death.
 
-  * Each farm holds an **inventory**: a quantity and quality per variety, plus a
-    cost price.  All of it is private to whoever farms it.
+  * Each farm holds an **inventory**: a quantity and quality per (fruit, colour)
+    lot, plus a cost price.  All of it is private to whoever farms it.
   * A **day** is a block of encounters at the market.  Every encounter that day
     sees the same start-of-day inventory, because they happen at the same market.
-  * Sales are settled at the end of the batch and deplete the variety that sold;
+  * Sales are settled at the end of the batch and deplete the lot that sold;
     a farm with nothing left restocks immediately.
   * Every **season** (a few days) every farm replenishes with a fresh random
     inventory.
@@ -28,7 +28,7 @@ from typing import Any, Sequence
 import torch
 
 from .config import Config
-from .world import BuyerState, FarmerState, Scenario, World
+from .world import BuyerState, FarmerState, Scenario, World, n_cells
 
 
 @dataclass
@@ -59,7 +59,7 @@ class Economy:
 
     # ------------------------------------------------------------------
     def _draw(self, farm: int) -> Inventory:
-        """Fresh random variety/quantity/quality, avoiding held-out combinations."""
+        """Fresh random lots, avoiding held-out combinations."""
         saved = self.world.rng
         self.world.rng = self.rng
         try:
@@ -71,11 +71,18 @@ class Economy:
                          remaining=list(st.stocks))
 
     def _visible(self, farm: int) -> FarmerState:
-        """What the farmer can offer right now: the inventory at its remaining levels."""
+        """What the farmer can offer right now: the inventory at its remaining levels.
+
+        The rows are laid out in a fresh random order for every encounter, as
+        they are everywhere else.
+        """
         inv = self.inventories[farm]
         st = inv.state
+        cells = list(range(len(st.stocks)))
+        self.rng.shuffle(cells)
         return FarmerState(stocks=tuple(inv.remaining), qualities=st.qualities,
-                           n_colors=st.n_colors, reservation=st.reservation)
+                           n_colors=st.n_colors, reservation=st.reservation,
+                           order=tuple(cells))
 
     # ------------------------------------------------------------------
     def begin_day(self) -> None:
@@ -86,17 +93,17 @@ class Economy:
                 self.inventories[f] = self._draw(f)
 
     def _buyer_need(self) -> BuyerState:
-        """Drawn with no reference whatsoever to the farm being visited."""
+        """Drawn with no reference whatsoever to the farm being visited.
+
+        ``World.sample_buyer`` already refuses to shop for a reserved
+        combination, so nothing here needs a second look.
+        """
         saved = self.world.rng
         self.world.rng = self.rng
         try:
-            for _ in range(200):
-                b = self.world.sample_buyer()
-                if not self.world.is_held_out(b.want_variety, b.need_qty):
-                    return b
+            return self.world.sample_buyer()
         finally:
             self.world.rng = saved
-        return b
 
     # ------------------------------------------------------------------
     def make_batch(self, n: int, n_farmers: int, n_buyers: int
@@ -124,7 +131,8 @@ class Economy:
                 farmer_state = self._visible(farm)
                 buyer_state = self._buyer_need()
                 held = self.world.is_held_out(buyer_state.want_variety,
-                                              buyer_state.need_qty)
+                                              buyer_state.want_color,
+                                              buyer_state.min_quality)
                 scen.append(Scenario(farmer=farmer_state, buyer=buyer_state,
                                      day=self.day, held_out=held))
                 f_list.append(farm)
@@ -147,9 +155,9 @@ class Economy:
                 continue
             farm = int(f_idx[i])
             inv = self.inventories[farm]
-            v = o.traded_variety
-            sold = min(o.traded_qty, inv.remaining[v])
-            inv.remaining[v] -= sold
+            cell = o.traded_cell if o.traded_cell >= 0 else 0
+            sold = min(o.traded_qty, inv.remaining[cell])
+            inv.remaining[cell] -= sold
             inv.sold_total += sold
             if inv.empty:
                 self.soldouts += 1
@@ -161,7 +169,7 @@ class Economy:
     # tensor path
     # ------------------------------------------------------------------
     def inventory_tensors(self, device) -> tuple:
-        """Current per-farm stock, colour, quality and cost."""
+        """Current per-farm stock, quality and cost."""
         stocks = torch.tensor([inv.remaining for inv in self.inventories],
                               dtype=torch.long, device=device)
         quals = torch.tensor([list(inv.state.qualities) for inv in self.inventories],
@@ -194,7 +202,8 @@ class Economy:
             want_variety=sb.want_variety, want_color=sb.want_color,
             need_qty=sb.need_qty, min_quality=sb.min_quality,
             max_price=sb.max_price, held_out=sb.held_out,
-            n_colors=self.cfg.world.n_colors, day=self.day)
+            n_colors=self.cfg.world.n_colors, day=self.day,
+            order=tensor_world.layouts(n))
 
     def settle_tensor(self, f_idx, res: dict) -> dict[str, float]:
         """Deplete farms by the batch's completed sales, without a Python loop."""
@@ -209,18 +218,18 @@ class Economy:
         }
         if not self.cfg.economy.persistent_inventory:
             return stats
-        variety = res["agreed_variety"]
-        flat = f_idx.long() * self.cfg.world.n_varieties + variety.long()
-        n_cells = self.n_farms * self.cfg.world.n_varieties
-        sold = _t.zeros(n_cells, dtype=_t.long, device=qty.device)
+        cells = n_cells(self.cfg.world)
+        cell = res["deal_cell"].long()
+        flat = f_idx.long() * cells + cell
+        sold = _t.zeros(self.n_farms * cells, dtype=_t.long, device=qty.device)
         sold.scatter_add_(0, flat, qty)
-        sold = sold.view(self.n_farms, self.cfg.world.n_varieties).tolist()
+        sold = sold.view(self.n_farms, cells).tolist()
         for farm in range(self.n_farms):
             inv = self.inventories[farm]
-            for v in range(self.cfg.world.n_varieties):
-                if sold[farm][v]:
-                    inv.remaining[v] = max(0, inv.remaining[v] - sold[farm][v])
-                    inv.sold_total += sold[farm][v]
+            for c in range(cells):
+                if sold[farm][c]:
+                    inv.remaining[c] = max(0, inv.remaining[c] - sold[farm][c])
+                    inv.sold_total += sold[farm][c]
             if inv.empty:
                 self.soldouts += 1
                 stats["soldout"] += 1
@@ -230,11 +239,12 @@ class Economy:
     # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         w = self.cfg.world
+        labels = ["%s %s" % (c, v) for v in w.variety_names for c in w.color_names]
         return {
             "day": self.day, "season": self.season,
             "restocks": self.restocks, "soldouts": self.soldouts,
             "inventories": [
-                {"remaining": dict(zip(w.variety_names, inv.remaining)),
+                {"remaining": dict(zip(labels, inv.remaining)),
                  "cost": w.price_values[inv.state.reservation]}
                 for inv in self.inventories],
         }

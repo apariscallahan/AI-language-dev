@@ -245,10 +245,12 @@ class TestWordAnalysis(unittest.TestCase):
         a = reference_buyer_obs(cfg, (2, 5))
         b = reference_buyer_obs(cfg, (2, 5))
         self.assertEqual(a, b)
-        # a trading meaning is (fruit, quantity); the shopping list reads
-        # fruit, colour, quantity, ...
+        # a trading meaning is (fruit, quantity); the request is a lot:
+        # fruit, colour, quality, quantity, price, then "the whole lot"
+        from orchard.world import QUERY_ALL
         self.assertEqual(a[0], 2)
-        self.assertEqual(a[2], 5)
+        self.assertEqual(a[3], 5)
+        self.assertEqual(a[5], QUERY_ALL)
 
     def test_buckets_split_the_meaning_space(self):
         cfg = small_cfg()

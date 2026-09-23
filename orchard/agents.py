@@ -11,16 +11,19 @@ Sequence layout
 Every agent, both roles, sees one fixed-length sequence::
 
     idx 0            BOS (+ role embedding)
-    idx 1..4         its own four private observation fields, one per position
-    idx 5            SEP
-    idx 6..6+D-1     the dialogue, D = n_turns * max_msg_len, PAD where unspoken
-    idx 6+D          DECIDE
+    idx 1..N         its private observation, one slot per position (N is the
+                     shared layout's width -- the barn needs the most room)
+    idx N+1          SEP
+    idx N+2..N+1+D   the dialogue, D = n_turns * max_msg_len, PAD where unspoken
+    idx N+2+D        DECIDE
 
-The four observation positions carry a *field* embedding plus a *value*
-embedding, so the network knows which number is which; the role embedding tells
-it whether field 2 means "stock I hold" or "quantity I need".  The dialogue
-positions carry a token embedding plus a self/other speaker embedding -- an agent
-therefore always knows which words were its own.
+Every observation position carries a *field-kind* embedding, a *position*
+embedding and a *value* embedding, so the network knows which number is which.
+A thing to talk about is always a lot -- (fruit, colour, quality, quantity,
+price) in that order, in slots 1..5 -- whether it is the lot a naming round
+asks about or the request a buyer brings to market; a barn is a list of lot
+rows. The dialogue positions carry a token embedding plus a self/other speaker
+embedding -- an agent therefore always knows which words were its own.
 
 The model is causal (masked self-attention), which makes two things identical:
 
@@ -45,7 +48,7 @@ import torch.nn.functional as F
 from .config import Config
 from .env import BUYER, FARMER, speaker_of_turn
 from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
-                    n_obs_slots, obs_schema)
+                    N_LOT_FIELDS, QUERY_ALL, n_cells, n_obs_slots, obs_schema)
 
 # Sequence layout.  The number of observation slots is whatever the world's
 # schema needs (a farm with several varieties has more to look at than a buyer
@@ -113,8 +116,9 @@ class CommNet(nn.Module):
         self.price_emb = nn.Embedding(w.n_price_bins, d)
         # "which field are you being asked about" -- the naming rungs put this in
         # the describer's observation, and it is what a word for a colour alone
-        # has to be conditioned on.
-        self.field_emb = nn.Embedding(4, d)     # fruit, colour, quality, or all three
+        # has to be conditioned on. One value per field of a lot, plus "all of
+        # it", which is also what a buyer's request carries into the market.
+        self.field_emb = nn.Embedding(QUERY_ALL + 1, d)
         self.empty_emb = nn.Embedding(1, d)
         self.slot_emb = nn.Embedding(N_SLOT_TYPES, d)
         # One embedding per observation *position*, so "stock of GREEN" is a
@@ -166,12 +170,25 @@ class CommNet(nn.Module):
         self.choice_ln_query = nn.LayerNorm(d)
         self.n_candidates = max(2, cfg.curriculum.n_candidates)
         self.value_head = nn.Linear(d, 1)
+        # The barn lookup (ModelConfig.barn_lookup): a query from each hidden
+        # state against every barn row's identity, reading back the matching
+        # row's contents. Only ever applied to a barn, so the naming rungs never
+        # touch it; its output starts small so a farmer arriving at `order`
+        # keeps the listening it has.
+        self.n_cells = n_cells(w)
+        self.lookup_q = nn.Linear(d, d)
+        self.lookup_out = nn.Linear(d, d)
 
         self.register_buffer("_self_mask", speaker_self_mask(cfg, role), persistent=False)
         causal = torch.triu(torch.full((self.seq_len, self.seq_len), float("-inf")), diagonal=1)
         self.register_buffer("_causal", causal, persistent=False)
 
         self.apply(self._init)
+        # Small, not zero: a zero-initialised output gives the query no gradient
+        # at all until the output has moved, and the lookup then trails the plain
+        # network for hundreds of steps. At a tenth of the usual gain it perturbs
+        # a hidden state of norm ~sqrt(d) by a few percent and learns at once.
+        nn.init.xavier_uniform_(self.lookup_out.weight, gain=0.1)
 
     @staticmethod
     def _init(mod: nn.Module) -> None:
@@ -181,6 +198,31 @@ class CommNet(nn.Module):
             nn.init.xavier_uniform_(mod.weight)
             if mod.bias is not None:
                 nn.init.zeros_(mod.bias)
+
+    def is_barn(self, schema: "list[int] | None") -> bool:
+        """Does this observation layout hold the farmer's barn (lot rows)?"""
+        s = schema if schema is not None else self.schema
+        w = 4 * self.n_cells
+        return (len(s) > w and s[w] == K_PRICE
+                and s[:4] == [K_VARIETY, K_COLOR, K_QUALITY, K_QTY])
+
+    def barn_lookup(self, h: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        """(B, L, d) -> (B, L, d): each state reads the barn row it asks for.
+
+        Keys are each row's (fruit, colour) embeddings -- the same tables the
+        words for fruit and colour are grounded in everywhere else -- and values
+        its (quality, stock). A state that has decoded "green pears" from the
+        buyer's words only has to reproduce those two embeddings as its query
+        to read back how many green pears there are and how good they are.
+        """
+        B = obs.shape[0]
+        rows = obs[:, :4 * self.n_cells].reshape(B, self.n_cells, 4)
+        key = self.variety_emb(rows[:, :, 0]) + self.color_emb(rows[:, :, 1])   # (B,C,d)
+        val = self.quality_emb(rows[:, :, 2]) + self.qty_emb(rows[:, :, 3])
+        q = self.lookup_q(h)                                                    # (B,L,d)
+        att = torch.softmax(torch.bmm(q, key.transpose(1, 2)) / math.sqrt(self.d_model),
+                            dim=-1)                                             # (B,L,C)
+        return h + self.lookup_out(torch.bmm(att, val))
 
     # ------------------------------------------------------------------
     def embed(self, obs: torch.Tensor, tokens: torch.Tensor,
@@ -258,7 +300,10 @@ class CommNet(nn.Module):
 
         def run(tok):
             x = self.embed(obs, tok, schema, self_mask, upto=n)
-            return self.norm(self.encoder(x, mask=mask))
+            h = self.norm(self.encoder(x, mask=mask))
+            if self.cfg.model.barn_lookup and self.is_barn(schema):
+                h = self.barn_lookup(h, obs)
+            return h
         # Gradient checkpointing covers embedding, layers and the final norm, so
         # all the backward pass keeps per call is the (soft) tokens that went in.
         # Generation re-encodes the conversation at every symbol step and the
@@ -299,7 +344,7 @@ class CommNet(nn.Module):
         return self.belief_color_head(h)
 
     def candidate_embeddings(self, obs: torch.Tensor) -> torch.Tensor:
-        """(B, K, d) -- each lineup candidate embedded from its own three fields.
+        """(B, K, d) -- each lineup candidate embedded from its own five fields.
 
         Built from the raw observation rather than from hidden states, because the
         encoder is causal: a candidate sits early in the sequence and cannot
@@ -309,23 +354,26 @@ class CommNet(nn.Module):
         managed to be entirely independent of what was said.
         """
         K = self.n_candidates
+        W = N_LOT_FIELDS
+        tables = (self.variety_emb, self.color_emb, self.quality_emb, self.qty_emb,
+                  self.price_emb)
         vecs = []
         for k in range(K):
-            i = 3 * k
-            if i + 2 >= obs.shape[1]:
+            i = W * k
+            if i + W - 1 >= obs.shape[1]:
                 vecs.append(torch.zeros_like(vecs[0]) if vecs else
                             self.empty_emb.weight[0].expand(obs.shape[0], self.d_model))
                 continue
-            # Outside the lineup phase these slots hold trading fields whose
-            # ranges do not match these tables, and the head's output is unused.
+            # Outside the lineup phase these slots hold other fields whose ranges
+            # do not match these tables, and the head's output is unused.
             # Clamping keeps the lookup legal rather than making every call site
             # have to know which phase it is in.
-            # a candidate is (fruit, colour, quality)
-            vecs.append(
-                self.variety_emb(obs[:, i].clamp(0, self.variety_emb.num_embeddings - 1))
-                + self.color_emb(obs[:, i + 1].clamp(0, self.color_emb.num_embeddings - 1))
-                + self.quality_emb(
-                    obs[:, i + 2].clamp(0, self.quality_emb.num_embeddings - 1)))
+            # a candidate is a lot: (fruit, colour, quality, quantity, price)
+            vec = None
+            for j, table in enumerate(tables):
+                e = table(obs[:, i + j].clamp(0, table.num_embeddings - 1))
+                vec = e if vec is None else vec + e
+            vecs.append(vec)
         return torch.stack(vecs, dim=1)
 
     def choice_logits(self, h_last: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:

@@ -23,7 +23,7 @@ import torch
 
 from .config import Config
 from .env import BUYER, FARMER
-from .world import BuyerState, FarmerState, Scenario
+from .world import QUERY_ALL, BuyerState, FarmerState, Scenario, n_cells
 
 
 # ==========================================================================
@@ -43,11 +43,16 @@ class ScenarioBatch:
     held_out: torch.Tensor        # (B,) bool
     n_colors: int = 1
     day: int = 0
+    # The order the barn's cells are laid out in for the farmer's observation
+    # (B, V*C); None means fruit-major. Shuffled per encounter in play, so the
+    # lot the buyer asked about has to be found by content, not position.
+    order: Optional[torch.Tensor] = None
 
     # ---- derived, computed once ---------------------------------------
     def __post_init__(self) -> None:
         n_colors = self.n_colors
-        idx = (self.want_variety * n_colors + self.want_color).unsqueeze(1)
+        self.deal_cell = self.want_variety * n_colors + self.want_color
+        idx = self.deal_cell.unsqueeze(1)
         self.offered_stock = self.stocks.gather(1, idx).squeeze(1)
         self.offered_quality = self.qualities.gather(1, idx).squeeze(1)
         self.offered_color = self.want_color
@@ -66,6 +71,24 @@ class ScenarioBatch:
     def device(self) -> torch.device:
         return self.want_variety.device
 
+    @property
+    def request(self) -> torch.Tensor:
+        """(B, 5) the buyer's request as a lot: fruit, colour, quality, quantity, price."""
+        return torch.stack([self.want_variety, self.want_color, self.min_quality,
+                            self.need_qty, self.max_price], dim=1)
+
+    @property
+    def combo(self) -> torch.Tensor:
+        """(B, 3) the (fruit, colour, quality) combination the request is about."""
+        return self.request[:, :3]
+
+    def layout(self) -> torch.Tensor:
+        """(B, V*C) the cell order of each farmer's observation."""
+        if self.order is not None:
+            return self.order
+        cells = self.stocks.shape[1]
+        return torch.arange(cells, device=self.device).unsqueeze(0).expand(len(self), cells)
+
     def scenario(self, i: int, day: int | None = None) -> Scenario:
         """One episode as a plain :class:`Scenario`, for logging and rendering.
 
@@ -77,7 +100,8 @@ class ScenarioBatch:
                 stocks=tuple(int(x) for x in self.stocks[i]),
                 qualities=tuple(int(x) for x in self.qualities[i]),
                 n_colors=self.n_colors,
-                reservation=int(self.reservation[i])),
+                reservation=int(self.reservation[i]),
+                order=tuple(int(x) for x in self.layout()[i])),
             buyer=BuyerState(
                 want_variety=int(self.want_variety[i]),
                 want_color=int(self.want_color[i]),
@@ -93,12 +117,16 @@ class ScenarioBatch:
         n = n_obs_slots(cfg.world)
         B = len(self)
         if role == FARMER:
-            parts = [self.stocks, self.qualities, self.reservation.unsqueeze(1)]
+            order = self.layout()
+            C = max(1, self.n_colors)
+            rows = torch.stack([torch.div(order, C, rounding_mode="floor"), order % C,
+                                self.qualities.gather(1, order),
+                                self.stocks.gather(1, order)], dim=2)
+            x = torch.cat([rows.reshape(B, -1), self.reservation.unsqueeze(1)], dim=1)
         else:
-            parts = [self.want_variety.unsqueeze(1), self.want_color.unsqueeze(1),
-                     self.need_qty.unsqueeze(1), self.min_quality.unsqueeze(1),
-                     self.max_price.unsqueeze(1)]
-        x = torch.cat(parts, dim=1)
+            x = torch.cat([self.request,
+                           torch.full((B, 1), QUERY_ALL, dtype=torch.long,
+                                      device=self.device)], dim=1)
         if x.shape[1] < n:
             x = torch.cat([x, torch.zeros((B, n - x.shape[1]), dtype=torch.long,
                                           device=x.device)], dim=1)
@@ -161,6 +189,11 @@ class TensorWorld:
 
     def _skew_low(self, lo: int, hi: int, n: int) -> torch.Tensor:
         return torch.minimum(self._randint(lo, hi, n), self._randint(lo, hi, n))
+
+    def layouts(self, n: int) -> torch.Tensor:
+        """(n, V*C) a random cell order per barn."""
+        cells = n_cells(self.cfg.world)
+        return torch.rand((n, cells), device=self.device, generator=self.gen).argsort(dim=1)
 
     # ------------------------------------------------------------------
     def sample(self, n: int, *, held_out: bool = False) -> ScenarioBatch:
@@ -240,7 +273,7 @@ class TensorWorld:
                              min_quality=min_q,
                              max_price=max_p,
                              held_out=self.combo_held[want, want_c, min_q],
-                             n_colors=C, day=self.day)
+                             n_colors=C, day=self.day, order=self.layouts(n))
 
 
 # ==========================================================================
@@ -376,6 +409,8 @@ def resolve_batch(cfg: Config, sb: ScenarioBatch, f_dec: torch.Tensor,
         "agree_variety": agree_v, "agree_qty": agree_q, "agree_price": agree_p,
         "farmer_correct": f_corr, "buyer_correct": b_corr,
         "agreed_variety": agreed_v, "agreed_qty": agreed_q, "agreed_price": agreed_p,
+        # the barn cell a completed trade came out of: (fruit, colour) of the request
+        "deal_cell": sb.deal_cell,
         "traded_qty": traded_qty, "trade_value": trade_value,
         "farmer_profit": torch.where(
             success, (pv - prices[sb.reservation]) * traded_qty.float(),

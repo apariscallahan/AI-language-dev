@@ -2,11 +2,11 @@
 
 Every round is written as the same three lines, whatever the rung:
 
-    [ep 1,234,567] refer | farmer F0/g1 describes, buyer B1/g0 guesses
-      expected : the farmer must name GOLD x3 HIGH so the buyer can pick it out of
-                 1) RED x2 LOW  2) GOLD x3 HIGH  3) GOLD x5 HIGH  4) GREEN x3 MED   (answer: 2)
-      dialogue : farmer: a3-a7 a1
-      outcome  : the buyer picked 2) GOLD x3 HIGH -- CORRECT
+    [ep 1,234,567] name-all | farmer F0/g1 describes, buyer F1/g0 guesses
+      expected : the farmer must name x3 RED APPLE PRIME @2.00 so the buyer can pick it out of
+                 1) x2 RED APPLE PRIME @2.00  2) x3 RED APPLE PRIME @2.00  3) x3 RED PEAR PRIME @2.00   (answer: 2)
+      dialogue : farmer: a3-a7 a1 a12 a4 a9
+      outcome  : the buyer picked 2) x3 RED APPLE PRIME @2.00 -- CORRECT
 
 What is "expected" differs by rung (a lineup, a pair of private meanings, an
 order, a trade), so each rung has its own wording; the dialogue line is always
@@ -25,19 +25,21 @@ from .config import Config
 from .env import BUYER, FARMER, ROLE_NAMES
 
 
-def _tuple(cfg: Config, t) -> str:
-    """A thing, as (fruit, colour, quality).
-
-    The middle field was printed as a quantity -- "PEAR x3 HIGH" -- for as long
-    as the world has had colours, which made a colour round read as three
-    quantities of the same fruit.
-    """
+def _lot(cfg: Config, t) -> str:
+    """A lot, as "x3 RED APPLE PRIME @2.00"; a bare combination as "RED APPLE PRIME"."""
     w = cfg.world
-    v, c, u = int(t[0]), int(t[1]), int(t[2])
+    vals = [int(x) for x in t]
+    v, c, u = vals[0], vals[1], vals[2]
     vn = w.variety_names[v] if 0 <= v < w.n_varieties else "?"
     cn = w.color_names[c] if 0 <= c < w.n_colors else "?"
     un = w.quality_names[u] if 0 <= u < w.n_quality else "?"
-    return "%s %s %s" % (cn, vn, un)
+    s = "%s %s %s" % (cn, vn, un)
+    if len(vals) >= 5:
+        s = "x%d %s @%s" % (vals[3], s, _price(cfg, vals[4]))
+    return s
+
+
+_tuple = _lot
 
 
 def _field_value(cfg: Config, name: str, v: int) -> str:
@@ -47,7 +49,7 @@ def _field_value(cfg: Config, name: str, v: int) -> str:
         return w.variety_names[v] if 0 <= v < w.n_varieties else "?"
     if name == "colour":
         return w.color_names[v] if 0 <= v < w.n_colors else "?"
-    if name == "quality":
+    if name in ("quality", "lot-quality"):
         return w.quality_names[v] if 0 <= v < w.n_quality else "?"
     if name in ("price", "reservation"):
         return _price(cfg, v)
@@ -142,11 +144,11 @@ def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
         br = [int(x) for x in batch.b_dec[i, rep]]
 
         def verdict(fields) -> str:
-            names = ("fruit", "colour", "quality")
-            wrong = [n for n, good in zip(names, fields) if not bool(good)]
+            from .world import LOT_FIELDS
+            wrong = [n for n, good in zip(LOT_FIELDS, fields) if not bool(good)]
             return "right" if not wrong else "%s wrong" % " and ".join(wrong)
-        ffields = batch.res["farmer_fields"][i].tolist() if "farmer_fields" in batch.res else [False] * 3
-        bfields = batch.res["buyer_fields"][i].tolist() if "buyer_fields" in batch.res else [False] * 3
+        ffields = batch.res["farmer_fields"][i].tolist() if "farmer_fields" in batch.res else [False] * 5
+        bfields = batch.res["buyer_fields"][i].tolist() if "buyer_fields" in batch.res else [False] * 5
         return [
             "%s | farmer %s and buyer %s" % (tag, fname, bname),
             "  expected : the farmer holds %s and the buyer holds %s; each must report the other's"
@@ -165,30 +167,32 @@ def format_round(cfg: Config, phase, batch, i: int, *, pop=None,
     fd = [int(x) for x in batch.f_dec[i, :4]]
     bd = [int(x) for x in batch.b_dec[i, :4]]
     if getattr(phase, "order", False):
-        # Whatever this rung asked for, and whatever came back: the fields differ
-        # rung by rung (quantity, then fruit and colour, then price, and in
-        # `offer` the farmer's own lot instead).
-        from .curriculum import request_truth
-        dec = batch.b_dec if phase.reporter == BUYER else batch.f_dec
-        said, heard, wrong = [], [], []
-        for name, head in phase.ask_heads.items():
-            truth = int(request_truth(cfg, batch.sb, name)[i])
-            got = int(dec[i, head])
-            said.append("%s %s" % (name, _field_value(cfg, name, truth)))
-            heard.append("%s %s" % (name, _field_value(cfg, name, got)))
-            if got != truth:
-                wrong.append(name)
-        who = "buyer" if phase.reporter == BUYER else "farmer"
-        teller = "farmer" if phase.reporter == BUYER else "buyer"
+        # Whatever this rung asked each side for, and whatever came back: the
+        # farmer reports the request it heard, the buyer (from `offer` on) the
+        # lot it was told about, and in `judge` both say whether the deal is on.
+        from .curriculum import report_spec
+        spec = report_spec(cfg, phase, batch.sb)
+        expected, outcome = [], []
+        for role, label, dec in ((FARMER, "farmer", batch.f_dec),
+                                 (BUYER, "buyer", batch.b_dec)):
+            rows = spec[role]
+            if not rows:
+                continue
+            said = ", ".join("%s %s" % (n, _field_value(cfg, n, int(t[i])))
+                             for n, _, t in rows)
+            heard = ", ".join("%s %s" % (n, _field_value(cfg, n, int(dec[i, h])))
+                              for n, h, _ in rows)
+            wrong = [n for n, h, t in rows if int(dec[i, h]) != int(t[i])]
+            expected.append("the %s must report %s" % (label, said))
+            outcome.append("%s reported %s (%s)"
+                           % (label, heard, "right" if not wrong
+                              else "%s wrong" % " and ".join(wrong)))
         return [
-            "%s | %s %s tells, %s %s reports" % (
-                tag, teller, bname if teller == "buyer" else fname,
-                who, bname if who == "buyer" else fname),
-            "  expected : %s" % ", ".join(said),
+            "%s | buyer %s asks, farmer %s answers" % (tag, bname, fname),
+            "  expected : %s" % "; ".join(expected),
             "  dialogue : %s" % dialogue,
-            "  outcome  : reported %s -- %s"
-            % (", ".join(heard),
-               "CORRECT" if ok else "WRONG (%s)" % " and ".join(wrong)),
+            "  outcome  : %s -- %s" % ("  |  ".join(outcome),
+                                       "ALL RIGHT" if ok else "ROUND FAILED"),
         ]
 
     f = sc.farmer

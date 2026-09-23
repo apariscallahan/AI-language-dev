@@ -151,7 +151,7 @@ def duality(cfg: Config, sem) -> dict[str, Any]:
     reused = sorted(a for a, meanings in uses.items() if len(meanings) >= 2)
     atom_scores = [r["score"] for r in per_tok.values()]
     word_scores = [r["score"] for r in multi.values()]
-    n_values = w.n_varieties + w.max_qty + w.n_quality
+    n_values = w.n_varieties + w.n_colors + w.n_quality + (w.max_qty + 1) + w.n_price_bins
     return {
         "atoms": c.atomic_vocab,
         "field_values_to_name": n_values,
@@ -208,7 +208,7 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
                      if (r.get("zero_shot") or {}).get("context") == "lineup tuples" else None)
     ts, _ = _latest(rows, lambda r: _num((r.get("compositionality") or {}).get("mean")))
     if zs is None:
-        add("productivity", "success on (variety, quantity, quality) combinations never "
+        add("productivity", "success on (fruit, colour, quality) combinations never "
             "seen in training, relative to seen ones", float("nan"), NOT_REACHED,
             "no lineup checkpoint measured held-out combinations")
     else:
@@ -244,7 +244,7 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
     # ---- decontextualised ------------------------------------------------
     cc, _ = _latest(rows, lambda r: _num((r.get("context_consistency") or {}).get("consistency")))
     if cc is None:
-        add("decontextualised", "buyer's form for a meaning as a lineup describer vs as a "
+        add("decontextualised", "buyer's form for a lot as a lineup describer vs as a "
             "requester in a trade (same-meaning minus different-meaning similarity)",
             float("nan"), NOT_REACHED, "needs a checkpoint at or after the order rung")
     else:
@@ -259,9 +259,9 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
         "an earlier round's item would test this)")
 
     # ---- interchangeable -------------------------------------------------
-    # Which rungs these are comes from the ladder. Hard-coded names ("refer-swap",
-    # "refer-mutual") outlived the rungs themselves, so both properties reported
-    # "not reached" however far a run got.
+    # Which rungs these are comes from the ladder. Hard-coded rung names once
+    # outlived the rungs themselves, so both properties reported "not reached"
+    # however far a run got.
     from .curriculum import ladder
     rungs = ladder(cfg)
     swap_name = next((p.name for p in rungs if p.swaps and p.whole), "")

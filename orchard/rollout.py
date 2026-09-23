@@ -49,8 +49,8 @@ class BatchRollout:
     b_obs: torch.Tensor                  # (B, 4)
     f_idx: torch.Tensor                  # (B,) index into the farmer agent list
     b_idx: torch.Tensor                  # (B,) index into the buyer agent list
-    f_dec: torch.Tensor                  # (B, 8) accept, variety, qty, price,
-    b_dec: torch.Tensor                  # then the four belief fields
+    f_dec: torch.Tensor                  # (B, N_HEADS) accept, variety, qty, price,
+    b_dec: torch.Tensor                  # the belief fields, the lineup choice, colour
     f_reward: torch.Tensor               # (B,)
     b_reward: torch.Tensor               # (B,)
     outcomes: list[Outcome] = field(default_factory=list)
@@ -262,7 +262,7 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     from .batched import ScenarioBatch, resolve_batch
     from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch,
                              ReferentialBatch, ladder, phase_schema,
-                             resolve_mutual, resolve_request, resolve_referential)
+                             resolve_referential, resolve_reports)
     c = cfg.channel
     if phase is None:
         phase = ladder(cfg)[-1]
@@ -376,11 +376,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         res = resolve_referential(cfg, scenarios, decs[phase.guesser][:, H_CHOICE],
                                   f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
-    elif mutual:
-        res = resolve_mutual(cfg, scenarios, decs[FARMER], decs[BUYER], f_len, b_len)
-        f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
-    elif phase.order and tensor_in:
-        res = resolve_request(cfg, phase, scenarios, decs, f_len, b_len)
+    elif phase.reporting and tensor_in:
+        res = resolve_reports(cfg, phase, scenarios, decs, f_len, b_len)
         f_rew, b_rew = res["farmer_reward"], res["buyer_reward"]
     elif tensor_in:
         use_bel = cfg.reward.belief_heads

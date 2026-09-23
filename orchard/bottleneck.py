@@ -26,11 +26,15 @@ Sampling stays proportional to how often each meaning actually came up
 newborn's experience still mirrors the parent generation's.  What changed is that
 it is no longer artificially thin.
 
-Where the squeeze still comes from: the newborn is an apprentice, not a clone.
+Where the squeeze comes from: the newborn is an apprentice, not a clone.
 It sees transcripts, never weights, for a few epochs, and must rebuild the
-parents' code from the forms that actually occur in them. A positive
-``n_samples`` restores a hard cap for the Kirby-style on/off comparison
-(spec 9); the report states which regime a run was in rather than assuming.
+parents' code from the forms that actually occur in them -- and a share of the
+(fruit, colour, quality) *meanings* in the store (``meaning_holdout``) is kept
+from it entirely, so those it has to put together from parts it did see. That
+is the bottleneck of iterated learning: a language transmits intact only if it
+is made of reusable parts. A positive ``n_samples`` restores a hard cap for the
+Kirby-style on/off comparison (spec 9); the report states which regime a run
+was in rather than assuming.
 
 What the newborn learns is standard cross-entropy:
   * its own message tokens, teacher-forced against what the retiring generation
@@ -80,7 +84,7 @@ class StoredEpisode:
     episode: int
     f_generation: int
     b_generation: int
-    meaning: tuple[int, int] = (0, 0)   # (wanted variety, needed quantity)
+    meaning: tuple = (0, 0, 0)          # the (fruit, colour, quality) it was about
     phase: Any = None                   # the curriculum phase it was played in
 
     def obs_for(self, role: int) -> torch.Tensor:
@@ -126,21 +130,26 @@ class TranscriptStore:
     def __len__(self) -> int:
         return len(self._buf)
 
-    def meaning_of(self, batch, i: int) -> tuple[int, int]:
-        """The (variety, quantity) this episode was about."""
+    def meaning_of(self, batch, i: int) -> tuple:
+        """The (fruit, colour, quality) combination this episode was about.
+
+        The combination is the unit the held-out set is drawn over, so it is
+        also the unit a newborn's apprenticeship can withhold
+        (``bottleneck.meaning_holdout``).
+        """
         if isinstance(batch, _HostBatch):
             if batch.meanings is not None:
                 m = batch.meanings[batch.row[0]]
-                return (int(m[0]), int(m[1]))
+                return tuple(int(x) for x in m[:3])
             i = batch.row[1]                 # the episode's index in the full batch
         sb = batch.sb
         if sb is None:
-            sc = batch.scenarios[i]
-            return (sc.buyer.want_variety, sc.buyer.need_qty)
+            b = batch.scenarios[i].buyer
+            return (b.want_variety, b.want_color, b.min_quality)
         if hasattr(sb, "want_variety"):                     # a trading batch
-            return (int(sb.want_variety[i]), int(sb.need_qty[i]))
+            return (int(sb.want_variety[i]), int(sb.want_color[i]), int(sb.min_quality[i]))
         m = sb.true_meaning[i]                              # a lineup / mutual round
-        return (int(m[0]), int(m[1]))
+        return tuple(int(x) for x in m[:3])
 
     def _phase_of(self, batch):
         from .curriculum import ladder
@@ -199,10 +208,10 @@ class TranscriptStore:
             view = _HostBatch(cpu, batch)
             sb = batch.sb
             if sb is not None and hasattr(sb, "want_variety"):
-                view.meanings = torch.stack([sb.want_variety[idx], sb.need_qty[idx]],
-                                            dim=1).cpu().tolist()
+                view.meanings = torch.stack([sb.want_variety[idx], sb.want_color[idx],
+                                             sb.min_quality[idx]], dim=1).cpu().tolist()
             elif sb is not None:
-                view.meanings = sb.true_meaning[idx][:, :2].cpu().tolist()
+                view.meanings = sb.true_meaning[idx][:, :3].cpu().tolist()
             for j, i in enumerate(rows):
                 view.row = (j, i)
                 self._push(view, j, farmers, buyers, episode)
@@ -333,6 +342,21 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     want = (bc.n_samples if bc.n_samples > 0
             else min(bc.max_samples, max(1, int(round(bc.coverage * len(store))))))
     samples = store.sample(want, rng)
+    # The bottleneck proper: a share of the *meanings* in the store is withheld
+    # from this newborn altogether, so it has to reconstruct those from parts
+    # it did see. Seeing every meaning is a near-clone; a language whose forms
+    # only survive when every combination is shown is not a compositional one,
+    # and this is the pressure iterated learning is known to exert.
+    withheld: set = set()
+    if bc.meaning_holdout > 0 and samples:
+        kinds = sorted({s.meaning for s in samples})
+        k = int(round(bc.meaning_holdout * len(kinds)))
+        if 0 < k < len(kinds):
+            withheld = set(rng.sample(kinds, k))
+            samples = [s for s in samples if s.meaning not in withheld]
+    info["withheld_meanings"] = len(withheld)
+    info["withheld_share"] = bc.meaning_holdout if withheld else 0.0
+    info["withheld"] = [list(m) for m in sorted(withheld)][:24]
     if len(samples) < 8:
         info["skipped"] = "not enough successful transcripts yet"
         return info

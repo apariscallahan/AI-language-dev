@@ -35,7 +35,7 @@ python -m orchard.run --smoke
 ```
 
 No learning at all: scripted agents, the chance baseline (0.0000), an oracle
-pair's upper bound (~0.67), and one rendered episode. If this looks wrong,
+pair's upper bound (~0.68), and one rendered episode. If this looks wrong,
 nothing above it will work.
 
 ```bash
@@ -54,6 +54,11 @@ The run. `cloud_run.sh` checks a GPU is visible, writes to
 `runs/<UTC start time>_orchard/`, and auto-resumes from that folder if it is run
 again.
 
+**Start a fresh run.** Snapshots written before the lot layout (anything from
+September 2026 or earlier that has `ask-qty` or `quote` in its ladder) cannot be
+resumed: the observation layout, the query embedding and the atom inventory all
+changed, and the loader stops with a message saying so.
+
 ---
 
 ## 2. Choosing a scale
@@ -65,9 +70,9 @@ run length and how much output there is — and nothing else
 | preset | community | brain | batch | episodes | what it is for |
 |---|---|---|---|---|---|
 | *(none)* | 2 → 6, then 6 + 6 | d48, 2 layers, 55k | 256 | 6M | the reference scale, and the one a CPU can check |
-| `gpu_small` | 2 → 12, then 12 + 12 | d64, 2 layers, 124k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
-| `gpu_community` | 2 → 32, then 32 + 32 | d96, 3 layers, 374k | 4,096 | 100M | the main run: a community big enough that a code has to work for strangers |
-| `gpu_large` | 2 → 64, then 64 + 64 | d128, 4 layers, 849k | 4,096 | 120M | the big one; benchmark before committing to it |
+| `gpu_small` | 2 → 6, then 6 + 6 | d64, 2 layers, 130k | 1,024 | 20M | a cheap GPU run to see a change through the naming rungs |
+| `gpu_community` | 2 → 8, then 8 + 8 | d96, 3 layers, 380k | 4,096 | 100M | the main run: a community big enough that a code has to work for strangers, small enough that a 4090 runs it at a useful pace |
+| `gpu_large` | 2 → 16, then 16 + 16 | d128, 4 layers, 850k | 4,096 | 120M | the big one; benchmark before committing to it |
 
 ```bash
 CONFIG=configs/gpu_community.json bash cloud_run.sh
@@ -85,15 +90,21 @@ The header prints scale and method apart, and the method line should read that
 nothing simulated was changed:
 
 ```
-scale              : pool of 2 growing to 32, then 32 + 32 once trading starts; d=96 x 3 layers, batch 4,096, 100,000,000 episodes
+scale              : pool of 2 growing to 8, then 8 + 8 once trading starts; d=96 x 3 layers, batch 4,096, 100,000,000 episodes
 method             : the one configuration -- size aside, nothing simulated was changed
 ```
 
 Every community is **founded by 2 agents** whatever the preset, and the founders
-take all four naming rungs alone; newcomers start arriving at `mutual`, one every
+take all six naming rungs alone; newcomers start arriving at `mutual`, one every
 40 updates. A rung that is still filling up does not spend its budget and cannot
 pass, so growth never eats a rung's time. The pool stays one pool until
 `haggle`, where each agent is copied into a farmer and a buyer.
+
+Why the communities are the size they are: every agent is a separate forward
+pass per symbol step, so wall time grows with the number of agents. The 4090 ran
+the naming rungs at 2,000–4,000 episodes per second with two founders and
+`mutual` at ~600 with eight. Larger communities wait on batching the agents
+([README §13](README.md#13-performance-and-engineering)).
 
 ---
 
@@ -107,24 +118,27 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 - **two lines at every checkpoint** (every 100 updates):
 
 ```
-[checkpoint 96] rung name-all | success 0.315 (muted 0.345) / 0.375 (muted 0.340) | channel 0.00 of headroom | buyer coverage 0.071 [0.08 0.03 0.11]; farmer coverage 0.081 [0.08 0.06 0.11]
-    coherence farmer 0.278 buyer 0.278 across 0.519 | overlap 0.535 | 107 words, 1.43 atoms/word, 1.73 words/utterance, 0% silent, 0% at buffer end
+[checkpoint 8,601,600] rung name-all | success 0.521 (muted 0.335) / 0.523 (muted 0.339) | channel 0.28 of headroom | held-out 0.50 vs trained 0.52 | buyer coverage 0.227 [0.22 0.14 0.32 0.20 0.18]; farmer coverage 0.256 [0.22 0.19 0.36 0.21 0.19]
+    coherence farmer 0.460 buyer 0.470 across 0.52 | overlap 0.96 | 42 words, 1.03 atoms/word, 3.47 words/utterance, 0% silent, 0% at buffer end
 ```
 
-  (That one is from a 96-update test run, so it is still at chance.) The two
-  success numbers are the two views of a swap rung (each role decoding),
-  each against its own muted baseline. Coverage is per field: **fruit, colour,
-  quality**. `silent` is always 0% — every turn has to open with a word, because
-  silence is what the muted control sounds like — and `at buffer end` should be
-  near 0; if it climbs, agents are babbling into the cap.
+  The two success numbers are the two views of a swap rung (each role decoding),
+  each against its own muted baseline. Coverage is per field, in lot order:
+  **fruit, colour, quality, quantity, price**. `silent` is always 0% — every
+  turn has to open with a word, because silence is what the muted control sounds
+  like — and `at buffer end` should be near 0; if it climbs, agents are babbling
+  into the cap.
 
-  On a request rung the same line also names each field of the order and how
-  often it arrived, which is the number to watch there:
+  On a report rung (`mutual`, `order`, `offer`, `judge`) the same line names each
+  field each role reports and how often it arrived, which is the number to watch
+  there:
 
 ```
-[checkpoint 12,800] rung quote | success 0.120 (muted 0.020) | channel 0.31 of headroom | fruit 0.81, colour 0.77, quantity 0.44, price 0.19 | buyer coverage 0.400 [0.50 0.40 0.30]
+[checkpoint 22,118,400] rung mutual | success 0.364 (muted 0.000) | channel 0.51 of headroom | held-out 0.58 vs trained 0.80 | farmer reads fruit 0.96, colour 0.75, quality 0.76, quantity 0.71, price 0.68; buyer reads fruit 0.97, colour 0.75, quality 0.76, quantity 0.70, price 0.69 | buyer coverage 0.827 [0.97 0.75 0.76 0.72 0.70]
 ```
 - **rung transitions**, with every criterion, passed or not;
+- **`[costs]`**, once, when the first costed rung reaches its floor and the
+  speaker costs start ramping in;
 - **budget stops**, naming exactly what was unmet;
 - the **final verdict** and the report path.
 
@@ -132,19 +146,20 @@ pass, so growth never eats a rung's time. The pool stays one pool until
 
 | rung | what to look for |
 |---|---|
-| `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,000 updates, nothing above it will work. `coherence 0.500` through the naming rungs is expected: the two founders each keep a dialect the other can read, and converge once the community arrives at `mutual`. Here the rolling success on the status line and the checkpoint's success should agree roughly -- both are fruit rounds between two different agents -- so a wide gap means training and measurement are asking different questions. (From `name-color` on, the rolling number also counts the easier rehearsal rounds and runs higher; the checkpoint measures only the new field.) |
-| `name-color`, `name-quality` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. |
-| `name-all` | the hard one: three fields in one utterance. Watch **words per utterance** climb toward 3 and **coverage** toward 0.30 — a run that sticks at ~1.5 words and coverage ~0.15 is naming one field and guessing the rest. The checkpoint line prints `held-out vs trained`; they should stay close (a wide gap is memorisation, and has never been seen here). |
-| `mutual` | both report the other's thing; held-out gated. Newcomers, deaths, hindsight feedback and the convention bonus all switch on here, and the two founders' dialects should start to merge -- **coherence** is the number to watch. The costs for length and new words wait until `offer`. |
-| `ask-qty`, `order`, `quote` | the buyer orders and the farmer fills it, one more field each time: quantity, then fruit and colour, then price. Each prints `<field> arrives` for the field it introduced and `still carries <field>` for the rest -- a rung whose new field climbs while an older one falls to chance is forgetting, not learning. |
-| `offer` | the other direction: the farmer describes the lot it was asked about and the buyer reports it. The speaker costs come on here -- the first rung that invents no new word, so `silent` and `atoms/word` should drop without success dropping with them. The first rung where the farmer says anything about its own barn, and the half of the market dialogue nothing else trains. |
-| `judge` | the buyer decides whether the deal is worth doing. Judged on the gain over silence, not the raw rate: ~68% of rounds are worth doing, so accepting everything scores 0.68 and still fails -- which is exactly how `haggle` used to fail. |
+| `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,500 updates, nothing above it will work. `coherence 0.500` through the single-field rungs is expected: the two founders each keep a dialect the other can read, and converge from `name-all` on. The rolling success on the status line and the checkpoint's success should agree roughly — both are fruit rounds between two different agents — so a wide gap means training and measurement are asking different questions. (From `name-color` on, the rolling number also counts the easier rehearsal rounds and runs higher; the checkpoint measures only the new field.) |
+| `name-color`, `name-quality`, `name-quantity`, `name-price` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` / … check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. Quantity has nine values (0 is "none of that") and price six; a colour round and a quantity round both have three candidates, so chance is 0.333 throughout. |
+| `name-all` | the hard one: five fields in one utterance. Watch **words per utterance** climb toward 5 and **coverage** toward 0.30 on every field — a run that sticks at ~1.5 words and coverage ~0.15 is naming one field and guessing the rest. The checkpoint line prints `held-out vs trained`; they should stay close (a wide gap is memorisation). The convention bonus comes on here, so `coherence` should start to rise from 0.5. |
+| `mutual` | both report the other's lot, all five fields, with the five belief heads `haggle` will use. Newcomers, deaths and hindsight feedback all switch on here, and the founders' dialects should merge — **coherence** is the number to watch. The speaker costs come on partway through, once the rung reaches its floor (`[costs]` in the log), and are ramped in over 200 updates: `atoms/word` and `words/utterance` should settle without success dropping. The held-out gate here is per field: `held-out 0.58 vs trained 0.80` is the mean per-field accuracy on reserved combinations against trained ones. |
+| `order` | the buyer's request is a lot in the naming layout, so the buyer says exactly what it said in `name-all`; what is new is the farmer reporting it while looking at a barn of sixteen rows. Every field is `still carries`; if one falls to chance the farmer is not finding it among the rows. |
+| `offer` | the farmer answers about the lot that was asked for — `stock`, `lot-quality`, `reservation` — and the buyer reports that. This is the first rung where a farmer has to **find a lot in its barn** by the words it heard; `stock arrives` is the number to watch, and stock 0 ("none of that") is a value it has to be able to say. |
+| `judge` | both decide whether the deal is worth doing. Judged on the gain over silence, not the raw rate: ~68% of rounds are worth doing, so accepting everything scores 0.68 and still fails — which is exactly how `haggle` used to fail. |
 | `haggle` | the pool splits into farmers and buyers (the log says so). Channel transfer well above zero, not just success from base rates. Exact price-bin agreement is the likely bottleneck. |
 | throughout | the report's **word classes** row (do separate words specialise to separate fields? — the adjective question), cross-role overlap (should stay high: one pool, one language), and the share of utterances at the buffer end (~0). |
 
 **Expect chance for a while.** The first code forms suddenly and late: the runs
-that worked sat at chance until ~300–600 updates, then climbed past 0.4 within
-about 50. Chance at update 200 is normal; chance at update 1,500 is not.
+that worked sat at chance until ~300–600 updates on the CPU and 525–1,525 on the
+GPU, then climbed past 0.4 within about 50. Chance at update 500 is normal;
+chance at update 2,000 is not.
 
 Run folders are named for their start time in UTC and the preset:
 `runs/2026-09-18_14-03-12UTC_gpu_community`.
@@ -154,7 +169,7 @@ Run folders are named for their start time in UTC and the preset:
 ## 4. Interruptions, snapshots and resuming
 
 A snapshot of the whole community — weights, optimiser state, recent usage, the
-transcript store, the curriculum record — is written to
+transcript store, the curriculum record, the cost ramp — is written to
 `<run>/snapshots/latest.pt` at every checkpoint and to `after-<rung>.pt` at every
 promotion. `cloud_run.sh` resumes automatically when `latest.pt` exists, so on a
 spot or pre-emptible instance, rerun it pointing `RUN` at the same folder:
@@ -165,12 +180,15 @@ RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh
 
 A resumed run picks up whatever code it is started with, so this is also how to
 move a running experiment onto newer code: stop it just after a checkpoint,
-update, resume. Older snapshots load too.
+update, resume. Below the trading rungs the snapshot holds one pool written
+twice; the loader restores it as one pool (an earlier version restored two
+copies, which drifted apart and collapsed `mutual` within a checkpoint — a
+snapshot from that version is repaired on load with a warning).
 
 Branch an experiment off any rung — the header will list what you changed:
 
 ```bash
-python -m orchard.run --out runs/branch --resume runs/<run>/snapshots/after-name-all.pt --set curriculum.order_min_success=0.6
+python -m orchard.run --out runs/branch --resume runs/<run>/snapshots/after-name-all.pt --set curriculum.order_min_success=0.3
 ```
 
 Iterating on one rung with `--resume` and a few hundred updates is the cheapest
@@ -231,25 +249,30 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `--n-farmers`, `--n-buyers` | community size per role (a scale key, like the presets). |
 | `population.founders_farmers/_buyers` | how many agents found the community. 0 = start at full size, which does not work above 2 + 2. |
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
-| `reward.costs_from_rung` | the rung from which the speaker pays for length and for new words (`offer`, the first rung that invents no new word). Earlier, the cheapest way to be short is to say the same short nothing. |
-| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`mutual`, when the community arrives). It cannot punish a new word -- a form only counts once it has 12 recent uses. |
+| `population.turnover_from_rung` | the rung agents start dying of old age in (`mutual`, the same one newcomers arrive in). Earlier, a death costs half of a two-agent pool. |
+| `reward.costs_from_rung` | the rung from which the speaker pays for length and for new words (`mutual`, the first rung that invents no new word). Earlier, the cheapest way to be short is to say the same short nothing. |
+| `reward.costs_ramp_trigger`, `reward.costs_ramp_updates` | within that rung the costs wait until its rolling success reaches this multiple of its promotion floor (1.0), then ramp in over this many updates (200). Fully on at the transition, `mutual` climbed at half the pace. |
+| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, when every word exists). It cannot punish a new word -- a form only counts once it has 12 recent uses. |
+| `reward.convention_contrast_samples` | how many other meanings' conventions a form is contrasted against (16), so one form for everything earns nothing. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
-| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the request rungs included -- they run in both directions. |
-| `curriculum.hard_distractor_frac` | share of all-field rounds built as one-field near misses (0.75), so every field has to be named. |
+| `model.barn_lookup` | one cross-attention step from the farmer's hidden state to its barn rows, keyed on (fruit, colour), valued on (quality, stock); only active on a barn (true). Off, the plain transformer never learned to find the asked-for lot even supervised. |
+| `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the report rungs included -- they run in both directions. |
+| `curriculum.hard_distractor_frac` | share of open lineup rounds built as one-field near misses (0.9), the field drawn uniformly, so every field has to be named. |
 | `world.holdout_combo_frac` | share of (fruit, colour, quality) combinations reserved and never trained on (0.25, a Latin square). |
-| `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones (0.60). The productivity gate. |
+| `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones (0.60): whole-round in the lineup, per field on a report rung. The productivity gate. |
 | `curriculum.min_field_transfer`, `curriculum.min_field_coverage` | every field is checked for every role; coverage is what catches a code that names one field in every slot. |
-| `reward.belief_qty_tol` | how exactly a reported quantity has to match (1). |
-| `reward.atom_cost`, `reward.word_cost` | length is charged per atom after the first in a word (0.03), and much less per word (0.005): short words, not short sentences. |
-| `reward.refer_partial` | what a lineup guess is paid per field it shares with the target (0.45). The staircase from naming one field to naming all three; 0 restores all-or-nothing. |
-| `population.turnover_from_rung` | the rung agents start dying of old age in (`mutual`, the same one newcomers arrive in). Earlier, a death costs half a two-agent pool. |
+| `curriculum.mutual_min_report`, `curriculum.order_min_success` | the floor for reporting the other's whole lot exactly (0.25 for five fields) and for the fields a report rung introduced arriving together (0.25). |
+| `bottleneck.meaning_holdout` | the share of the (fruit, colour, quality) combinations a newborn is not shown at all (0.25): the bottleneck proper. 0 makes a newborn a near-clone. |
+| `bottleneck.coverage` | how much of the rest of the parent generation a newborn sees (1.0 — essentially all of it; lowering it puts *common* forms back at risk). |
+| `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
+| `reward.belief_qty_tol` | how exactly a reported quantity has to match in the trading rungs (1). Report rungs are exact. |
+| `reward.symbol_cost`, `reward.atom_cost`, `reward.word_cost` | per symbol (0.01), per atom after the first in a word (0.03), per word (0.005): short words, not short sentences, and no repeating a word to the buffer end. |
+| `reward.refer_partial` | what a lineup guess is paid per field it shares with the target (0.45). The staircase from naming one field to naming all five; 0 restores all-or-nothing. |
 | `train.anneal_per_rung` | whether the temperature and entropy anneals count updates in the current rung rather than since the run started (true). Off means no exploration past update 1,000. |
-| `channel.atomic_vocab` | how many meaningless atoms words are built from (16). |
-| `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 — a buffer, not a pressure; the length cost sets length) and the number of turns (4). |
+| `channel.atomic_vocab` | how many meaningless atoms words are built from (32: enough for every one of the 27 field values to have an atom, so whether atoms are reused or combined is up to the agents). |
+| `channel.max_symbols`, `channel.n_turns` | the per-turn buffer (24 — a buffer, not a pressure; a five-word request is nine symbols) and the number of turns (4). |
 | `channel.enforce_word_grammar` | atoms and marks alternate, so `a3-a7 a1` is a two-atom word and a one-atom word, exactly as emitted. |
 | `channel.allow_silence` | whether a turn may be empty (false). Silence is what the muted control sounds like, so a speaker may not say it. |
-| `bottleneck.coverage` | how much of the parent generation a newborn sees (1.0 — essentially all of it; lowering it puts *common* forms back at risk). |
-| `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
 | `world.zipf_alpha` | how skewed demand is. **Read §9 before raising it.** |
 | `reward.decode`, `reward.understood` | the two halves of the communication loop. |
 | `--episodes` | run length (a run setting). Generations fall out of it — see §7. |
@@ -273,9 +296,10 @@ often.
 
 Everything that means an amount of learning is counted in **training updates**,
 never episodes: rung budgets, promotion checks (every 25), checkpoints (every
-100), the temperature and entropy anneals (1,000 and 800), growth (every 40),
-lifespans, and how long the population remembers what it has said (80). An early
-GPU run counted lifespans in episodes and every founder died after ~50 updates.
+100), the temperature and entropy anneals (1,000 and 800), the cost ramp (200),
+growth (every 40), lifespans, and how long the population remembers what it has
+said (80). An early GPU run counted lifespans in episodes and every founder died
+after ~50 updates.
 
 ---
 
@@ -354,7 +378,7 @@ already.
 | `report.md` | **yes** — rewritten every checkpoint, so it is readable mid-run |
 | `metrics.jsonl` | **yes** — every checkpoint's full metric suite, small |
 | `promotions.jsonl` | **yes** — every promotion check, passed or not, with its evidence |
-| `births.jsonl` | **yes** — what each newborn was taught and how it fared |
+| `births.jsonl` | **yes** — what each newborn was taught, what it was not shown, and how it fared |
 | `config.json` | **yes** — exactly reproduces the run |
 | `plots/*.svg`, `*.png` | yes, small |
 | `transcripts.txt` | yes — sampled rounds as expected / dialogue / outcome |
@@ -433,10 +457,11 @@ grep -E "rung|PHASE" runs/<run>/run.log | tail -20
 python -m unittest discover -s tests
 ```
 
-182 tests, about two minutes. Worth doing on the GPU box, not just locally:
+216 tests, about four minutes. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
-readable scalar one, and `tests/test_config.py` that there is one configuration
-and no device-specific arithmetic.
+readable scalar one, `tests/test_config.py` that there is one configuration and
+no device-specific arithmetic, and `tests/test_lots.py` that every report rung's
+checkpoint yields the evidence its gate reads.
 
 ---
 
@@ -446,10 +471,13 @@ and no device-specific arithmetic.
 |---|---|
 | `$'\r': command not found` from `cloud_run.sh` | the file was checked out with CRLF. `.gitattributes` pins `*.sh` to LF; re-clone or `dos2unix cloud_run.sh`. |
 | "No CUDA device visible" | `cloud_run.sh` only runs on a GPU. Use `python -m orchard.run` for a CPU run. |
-| success at chance past ~1,000 updates in `name-fruit` | a real failure, not slowness. Check the header: speaker costs and hindsight should be off, the pool should be 2 + 2. |
+| "was written by a version with a different observation layout" on resume | a snapshot from before the lot layout. Start a fresh run; nothing in it can be carried over. |
+| success at chance past ~1,500 updates in `name-fruit` | a real failure, not slowness. Check the header: speaker costs and hindsight should be off, the pool should be 2 + 2. |
 | `silent` above 0% | it cannot be: every turn has to open with a word (`channel.allow_silence`). Check the header's method line for a change to it. |
 | ~1 word per utterance on a rung that is still inventing words | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
 | a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
+| a report rung passes every field but "reports combinations it never trained on" | the listener's heads have learned the training set's joint. The gate is per field and at 0.60 of the headroom; see README §11 before touching it. |
+| `stock arrives` stuck at chance in `offer` while the request fields all carry | the farmer is not finding the asked-for lot among its barn rows. Check `model.barn_lookup` is on in the header; with it the lookup learns in a few hundred supervised steps, so what is missing is the reinforcement signal — look at whether hindsight is on and the buyer's `stock` report is being scored. |
 | a rung stops the run | read the criteria it names in the log and in `promotions.jsonl`. Do not relax them to make it pass — they are the experiment. |
 | out of memory in the first batch | `--set train.grad_checkpoint=true`, then a smaller batch. See §10. |
 | every seed disagrees | expected. See §8. |

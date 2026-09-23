@@ -1,8 +1,8 @@
 {
   "name": "gpu_small",
   "population": {
-    "n_farmers": 12,
-    "n_buyers": 12
+    "n_farmers": 6,
+    "n_buyers": 6
   },
   "model": {
     "d_model": 64,

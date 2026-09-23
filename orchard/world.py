@@ -1,36 +1,56 @@
-"""The apple world: hidden state, scenario sampling, and what makes a deal viable.
+"""The orchard world: hidden state, scenario sampling, and what makes a deal viable.
 
 Spec section 1.2 is the load-bearing part of this file.  The *only* reason
 language is necessary in this simulation is that the Farmer and the Buyer each
 hold private facts the other needs and cannot observe.  This module defines that
 asymmetry; :mod:`orchard.env` enforces it.
 
-  Farmer knows : how much of **each fruit** is in the barn, the colour and
-                 quality of each, and the lowest price they will accept
-  Buyer knows  : which fruit they want, in which colour, how many, the minimum
-                 quality they will take, and the most they can pay
+  Farmer knows : how much of **each lot** is in the barn, the quality of each,
+                 and the lowest price they will accept
+  Buyer knows  : which fruit they want, in which colour, at what minimum quality,
+                 how many, and the most they can pay
 
-Fruit and colour are separate fields, and a lot is a (fruit, colour, quality)
-combination.  A quarter of those combinations are never trained on anywhere in
-the project (see :class:`ComboHoldout`), so a code that fuses the three into one
-name per thing cannot describe them, and one that names the parts can.
+The lot
+-------
+Everything that is ever talked about in this world is a **lot**: a
+(fruit, colour, quality, quantity, price) row, in that order, always
+(``LOT_KINDS``). A buyer's request is a lot -- the fruit and colour it wants,
+the lowest quality it will take, the number it needs, the most it will pay. A
+farmer's barn is a list of lots -- each stocked (fruit, colour) cell with its
+quality and how many are left, all at the farm's one floor price. The naming
+rungs describe lots. So there is one observation layout for "a thing to talk
+about", and the words a population invents for it in the naming game are, slot
+for slot, the words it needs to place an order: nothing has to be relearned
+when trading starts, and no field has to be *invented* under trading conditions.
+(The earlier design named three fields and left quantity and price to be
+invented in the request rungs, where hindsight, the speaker costs and the
+convention bonus were already on -- the exact conditions the naming rungs show
+kill a code before it forms. Quantity never arrived.)
 
-Why farms carry several varieties
----------------------------------
+The barn is laid out as rows in a **random order** per encounter, so the only
+way to find "the lot the buyer asked about" is to match its fruit and colour
+against the words that were heard -- a lookup by content, which is what a
+transformer's attention does well, rather than by an arithmetic cell index.
+
+Held-out combinations
+---------------------
+A quarter of the (fruit, colour, quality) combinations are never trained on
+anywhere in the project (see :class:`ComboHoldout`), so a code that fuses those
+three into one name per thing cannot describe them, and one that names the
+parts can. Quantity and price are never held out: every value of each is
+trained, and what is tested is whether the *combination* generalises.
+
+Why farms carry several lots
+----------------------------
 An earlier version gave each farm one variety and then *coerced* roughly half of
 all encounters to be compatible, so that viable deals were common enough to
 learn from.  The scrambled-channel ablation caught what that did: it made the
 buyer's wanted variety predictable from the farmer's own stock, and the farmer
 could score 0.67 on "which variety do they want" -- against a chance rate of
-0.33 -- without listening to anything.  Worse, with one variety per farm the
-farmer's best answer is always "the one I have", so the variety dimension could
-never reward listening even in principle.
-
-Stocking several varieties removes both problems at once.  The buyer's wanted
-variety is drawn independently and uniformly, so no amount of staring at one's
-own barn predicts it; and the farmer now has a real choice to get right.  Every
-marginal here is independent across the two agents, so nothing about one side's
-private state shifts the odds on the other's.
+0.33 -- without listening to anything.  Stocking several lots removes both
+problems: the buyer's request is drawn independently and uniformly, so no
+amount of staring at one's own barn predicts it, and the farmer has a real
+lookup to get right.  Every marginal here is independent across the two agents.
 """
 from __future__ import annotations
 
@@ -46,24 +66,34 @@ K_EMPTY, K_VARIETY, K_QTY, K_QUALITY, K_PRICE, K_COLOR, K_FIELD = 0, 1, 2, 3, 4,
 KIND_NAMES = {K_EMPTY: "empty", K_VARIETY: "fruit", K_QTY: "quantity",
               K_QUALITY: "quality", K_PRICE: "price", K_COLOR: "colour",
               K_FIELD: "asked-about field"}
-# The three fields a thing is described by, in the order they are held
-# everywhere (observations, meanings, held-out combinations, reports).
+# The three fields a *combination* is made of -- the ones the held-out set is
+# drawn over -- in the order they are held everywhere.
 MEANING_KINDS = (K_VARIETY, K_COLOR, K_QUALITY)
 MEANING_FIELDS = ("fruit", "colour", "quality")
+# The five fields of a lot, in the one order every observation uses.
+LOT_KINDS = (K_VARIETY, K_COLOR, K_QUALITY, K_QTY, K_PRICE)
+LOT_FIELDS = ("fruit", "colour", "quality", "quantity", "price")
+N_LOT_FIELDS = len(LOT_KINDS)
+# The value of the "asked-about field" slot when the whole lot is asked for.
+# 0..4 name one field of the lot (in LOT_FIELDS order).
+QUERY_ALL = N_LOT_FIELDS
 
 
 @dataclass(frozen=True)
 class FarmerState:
-    """Private to the Farmer: the whole barn."""
-    # One lot per (fruit, colour), flattened fruit-major: cell (f, c) is at
-    # f * n_colors + c. A shopper who wants green pears is asking about one cell,
-    # which is why the barn has to be laid out this way -- with a single colour
-    # per fruit, two thirds of shoppers could not be served by anybody and
-    # refusing every deal beat trading.
+    """Private to the Farmer: the whole barn.
+
+    One lot per (fruit, colour) cell, flattened fruit-major: cell (f, c) is at
+    f * n_colors + c in ``stocks`` and ``qualities``. ``order`` is the sequence
+    the cells are laid out in for the observation -- shuffled per encounter, so
+    a row's position says nothing about which lot it is and the lot the buyer
+    asked about has to be found by its fruit and colour.
+    """
     stocks: tuple[int, ...]        # per (fruit, colour); 0 means "none of that"
     qualities: tuple[int, ...]     # per (fruit, colour) (meaningless where stock is 0)
     reservation: int               # price bin: the lowest per-unit price they take
     n_colors: int = 1
+    order: tuple[int, ...] = ()    # cell indices in observation order; () = fruit-major
 
     def cell(self, variety: int, color: int) -> int:
         return variety * self.n_colors + color
@@ -74,34 +104,63 @@ class FarmerState:
     def quality_of(self, variety: int, color: int = 0) -> int:
         return self.qualities[self.cell(variety, color)]
 
+    @property
+    def layout(self) -> tuple[int, ...]:
+        return self.order if self.order else tuple(range(len(self.stocks)))
+
+    def lots(self) -> list[tuple[int, int, int, int]]:
+        """The barn as the farmer sees it: (fruit, colour, quality, stock) rows."""
+        nc = max(1, self.n_colors)
+        return [(cell // nc, cell % nc, self.qualities[cell], self.stocks[cell])
+                for cell in self.layout]
+
     def as_tuple(self) -> tuple[int, ...]:
-        return tuple(self.stocks) + tuple(self.qualities) + (self.reservation,)
+        out: list[int] = []
+        for row in self.lots():
+            out.extend(row)
+        out.append(self.reservation)
+        return tuple(out)
 
 
 @dataclass(frozen=True)
 class BuyerState:
-    """Private to the Buyer: one shopping list."""
+    """Private to the Buyer: one shopping list -- itself a lot."""
     want_variety: int
     want_color: int
     need_qty: int
     min_quality: int
     max_price: int                 # price bin: the most they will pay per unit
 
-    def as_tuple(self) -> tuple[int, ...]:
-        return (self.want_variety, self.want_color, self.need_qty, self.min_quality,
+    def as_lot(self) -> tuple[int, int, int, int, int]:
+        return (self.want_variety, self.want_color, self.min_quality, self.need_qty,
                 self.max_price)
+
+    def as_tuple(self) -> tuple[int, ...]:
+        # The request in the lot layout, then the query slot: the whole lot is
+        # asked for, exactly as the `name-all` describer sees it.
+        return self.as_lot() + (QUERY_ALL,)
 
 
 # --------------------------------------------------------------------------
 # Observation schema
 # --------------------------------------------------------------------------
+def n_cells(cfg: WorldConfig) -> int:
+    return cfg.n_varieties * cfg.n_colors
+
+
 def farmer_schema(cfg: WorldConfig) -> list[int]:
-    cells = cfg.n_varieties * cfg.n_colors
-    return [K_QTY] * cells + [K_QUALITY] * cells + [K_PRICE]
+    """One lot row per cell -- (fruit, colour, quality, stock) -- then the floor price."""
+    return [K_VARIETY, K_COLOR, K_QUALITY, K_QTY] * n_cells(cfg) + [K_PRICE]
 
 
 def buyer_schema(cfg: WorldConfig) -> list[int]:
-    return [K_VARIETY, K_COLOR, K_QTY, K_QUALITY, K_PRICE]
+    """The request as a lot, plus the asked-about-field slot (always 'all of it')."""
+    return list(LOT_KINDS) + [K_FIELD]
+
+
+def lineup_width(n_candidates: int = 3) -> int:
+    """Slots a lineup guesser needs: K lots and the query."""
+    return N_LOT_FIELDS * max(2, n_candidates) + 1
 
 
 def n_obs_slots(cfg: WorldConfig, full: "object | None" = None) -> int:
@@ -110,12 +169,12 @@ def n_obs_slots(cfg: WorldConfig, full: "object | None" = None) -> int:
     One layout serves every role in every phase, with the shorter ones padded.
     That is what lets a population carry its weights across a curriculum
     transition: the architecture does not change, only what is written into it.
-    The lineup game needs the most room -- three fields per candidate.
+    The barn needs the most room.
     """
-    n = max(len(farmer_schema(cfg)), len(buyer_schema(cfg)))
+    k = 3
     if full is not None and getattr(full, "curriculum", None) is not None:
-        n = max(n, 3 * full.curriculum.n_candidates)
-    return n
+        k = full.curriculum.n_candidates
+    return max(len(farmer_schema(cfg)), len(buyer_schema(cfg)), lineup_width(k))
 
 
 def obs_schema(cfg: WorldConfig, role: int, full: "object | None" = None) -> list[int]:
@@ -130,11 +189,14 @@ def field_labels(cfg: WorldConfig, role: int) -> list[str]:
     """Human names for the slots, used by metrics and the report."""
     from .env import FARMER
     if role == FARMER:
-        cells = ["%s_%s" % (c, v) for v in cfg.variety_names for c in cfg.color_names]
-        names = (["stock_" + x for x in cells] + ["quality_" + x for x in cells]
-                 + ["reservation"])
+        names = []
+        for i in range(n_cells(cfg)):
+            names += ["lot%d_fruit" % i, "lot%d_colour" % i, "lot%d_quality" % i,
+                      "lot%d_stock" % i]
+        names.append("reservation")
     else:
-        names = ["want_fruit", "want_colour", "need_qty", "min_quality", "max_price"]
+        names = ["want_fruit", "want_colour", "min_quality", "need_qty", "max_price",
+                 "asked"]
     n = n_obs_slots(cfg)
     return names[:n] + ["-"] * max(0, n - len(names))
 
@@ -144,7 +206,13 @@ def field_spans_by_kind(cfg: WorldConfig) -> dict[int, int]:
     return {K_EMPTY: 1, K_VARIETY: max(cfg.n_varieties - 1, 1),
             K_QTY: max(cfg.max_qty, 1), K_QUALITY: max(cfg.n_quality - 1, 1),
             K_PRICE: max(cfg.n_price_bins - 1, 1),
-            K_COLOR: max(cfg.n_colors - 1, 1), K_FIELD: len(MEANING_KINDS)}
+            K_COLOR: max(cfg.n_colors - 1, 1), K_FIELD: QUERY_ALL}
+
+
+def lot_spans(cfg: WorldConfig) -> tuple[int, int, int, int, int]:
+    """How many values each field of a lot can take (quantity includes 0)."""
+    return (cfg.n_varieties, cfg.n_colors, cfg.n_quality, cfg.max_qty + 1,
+            cfg.n_price_bins)
 
 
 def field_spans(cfg: WorldConfig, role: int) -> list[int]:
@@ -214,7 +282,7 @@ class ComboHoldout:
         self.held = {(f, c, quals[i]) for i, (f, c) in enumerate(cells)}
 
     def __contains__(self, combo) -> bool:
-        return tuple(int(x) for x in combo) in self.held
+        return tuple(int(x) for x in combo)[:3] in self.held
 
     def __len__(self) -> int:
         return len(self.held)
@@ -257,6 +325,10 @@ class Scenario:
     @property
     def offered_color(self) -> int:
         return self.buyer.want_color
+
+    @property
+    def deal_cell(self) -> int:
+        return self.farmer.cell(self.buyer.want_variety, self.buyer.want_color)
 
     @property
     def variety_ok(self) -> bool:
@@ -386,6 +458,12 @@ class World:
         w = self._zipf_weights(self.need_ceiling(), self.cfg.zipf_alpha)
         return w + [0.0] * (self.cfg.max_qty - len(w))
 
+    def shuffled_layout(self) -> tuple[int, ...]:
+        """A random order for the barn's rows, drawn per encounter."""
+        cells = list(range(n_cells(self.cfg)))
+        self.rng.shuffle(cells)
+        return tuple(cells)
+
     def sample_farmer(self) -> FarmerState:
         c, r = self.cfg, self.rng
         stocks, quals = [], []
@@ -414,7 +492,8 @@ class World:
                 quals.append(q)
         return FarmerState(stocks=tuple(stocks), qualities=tuple(quals),
                            n_colors=c.n_colors,
-                           reservation=self._skew_low(0, c.reservation_max_bin))
+                           reservation=self._skew_low(0, c.reservation_max_bin),
+                           order=self.shuffled_layout())
 
     def _shopper_quality(self) -> int:
         c = self.cfg
@@ -480,9 +559,8 @@ class World:
     def sample(self, *, held_out: bool | None = False, max_tries: int = 200) -> Scenario:
         """Draw one encounter.
 
-        ``held_out=False`` (training) rejects scenarios touching a reserved
-        (variety, quantity) combination; ``True`` requires one; ``None`` accepts
-        either.
+        ``held_out=False`` (training) rejects scenarios whose request is a
+        reserved combination; ``True`` requires one; ``None`` accepts either.
         """
         c, r = self.cfg, self.rng
         for _ in range(max_tries):
@@ -529,4 +607,3 @@ class World:
         return "wants %s %s x%d, quality >= %s, cannot pay above %.2f" % (
             c.color_names[b.want_color], c.variety_names[b.want_variety], b.need_qty,
             c.quality_names[b.min_quality], c.price_values[b.max_price])
-

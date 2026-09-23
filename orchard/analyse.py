@@ -1,6 +1,6 @@
 """Measure a saved population after the fact.
 
-    python -m orchard.analyse --snapshot runs/<name>/snapshots/after-refer-mutual.pt
+    python -m orchard.analyse --snapshot runs/<name>/snapshots/after-mutual.pt
 
 Loads a snapshot (weights, recent usage, transcript store, curriculum record),
 runs the full checkpoint metric suite on the rung you choose -- by default the

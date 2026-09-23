@@ -39,12 +39,14 @@ def _pad(cfg: Config, values: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def farmer_obs(scenario: Scenario, cfg: Config) -> tuple[int, ...]:
-    """Stock, colour and quality per fruit, plus the reservation price."""
+    """The barn as lot rows -- (fruit, colour, quality, stock) each, in the
+    scenario's shuffled order -- then the floor price."""
     return _pad(cfg, scenario.farmer.as_tuple())
 
 
 def buyer_obs(scenario: Scenario, cfg: Config) -> tuple[int, ...]:
-    """Wanted fruit and colour, quantity, minimum quality, budget ceiling."""
+    """The request as a lot -- fruit, colour, minimum quality, quantity, budget
+    ceiling -- then the asked-about-field slot (the whole lot)."""
     return _pad(cfg, scenario.buyer.as_tuple())
 
 
@@ -136,6 +138,8 @@ class Outcome:
     traded_qty: int = 0
     traded_price_bin: int = -1
     traded_variety: int = -1
+    traded_color: int = -1
+    traded_cell: int = -1           # the barn cell the sale came out of
     farmer_profit: float = 0.0      # currency, not reward
     buyer_savings: float = 0.0      # currency the buyer kept vs. their ceiling
     trade_value: float = 0.0        # currency, price * qty
@@ -394,6 +398,8 @@ def resolve(cfg: Config, sc: Scenario, fd: Decision, bd: Decision,
         out.traded_qty = agreed_qty
         out.traded_price_bin = agreed_price
         out.traded_variety = agreed_variety
+        out.traded_color = sc.buyer.want_color
+        out.traded_cell = sc.deal_cell
         out.trade_value = pv * agreed_qty
         out.farmer_profit = (pv - prices[sc.farmer.reservation]) * agreed_qty
         out.buyer_savings = (prices[sc.buyer.max_price] - pv) * agreed_qty

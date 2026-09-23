@@ -30,12 +30,14 @@ from orchard import metrics as M
 from orchard.bottleneck import TranscriptStore, train_newborn
 from orchard.config import Config
 from orchard.conventions import PopulationUsage
-from orchard.curriculum import (H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_QTY,
-                                H_REPORT, H_VARIETY, MutualBatch, N_HEADS,
+from orchard.curriculum import (ASK_ALL, H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_CHOICE,
+                                H_QTY, H_REPORT, H_VARIETY, LOT_ANSWER_FIELDS,
+                                MutualBatch, N_HEADS, REQUEST_FIELDS,
                                 ReferentialBatch, ReferentialWorld, evaluate_rung,
                                 hindsight_targets, resolve_referential,
-                                ladder, phase_named, resolve_mutual, resolve_request,
+                                ladder, phase_named, resolve_mutual, resolve_reports,
                                 rung_budget)
+from orchard.world import LOT_FIELDS, N_LOT_FIELDS, lot_spans
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import run_and_update_gumbel
 from orchard.lexicon import cross_role_overlap, live_encoding, word_stats
@@ -187,15 +189,12 @@ class TestMutualRung(unittest.TestCase):
         for i, r in enumerate(reports):
             for k, h in enumerate(H_REPORT):
                 dec[i, h] = int(r[k])
-            # the head the reward used to read, filled with something that would
-            # pass for a colour if anyone read it again
-            dec[i, H_BELIEF[1]] = 8
         return dec
 
     def test_both_must_report_the_other(self):
         cfg = cfg_small()
-        f_m = torch.tensor([[0, 3, 1], [1, 2, 2]])
-        b_m = torch.tensor([[2, 1, 0], [0, 3, 1]])
+        f_m = torch.tensor([[0, 3, 1, 4, 2], [1, 2, 2, 0, 5]])
+        b_m = torch.tensor([[2, 1, 0, 8, 1], [0, 3, 1, 3, 3]])
         mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
         sym = torch.zeros(2)
         res = resolve_mutual(cfg, mb, self._rows(b_m), self._rows(f_m), sym, sym)
@@ -209,20 +208,21 @@ class TestMutualRung(unittest.TestCase):
         self.assertEqual(res["buyer_report_ok"].tolist(), [False, True])
 
     def test_every_field_of_the_report_must_be_right(self):
-        """A thing is (fruit, colour, quality) and all three are reported exactly."""
+        """A lot is (fruit, colour, quality, quantity, price), reported exactly."""
         cfg = cfg_small()
-        f_m, b_m = torch.tensor([[0, 1, 0]]), torch.tensor([[1, 2, 1]])
+        f_m, b_m = torch.tensor([[0, 1, 0, 2, 3]]), torch.tensor([[1, 2, 1, 7, 0]])
         mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
         zero = torch.zeros(1)
         right = resolve_mutual(cfg, mb, self._rows(b_m), self._rows(f_m), zero, zero)
         self.assertTrue(bool(right["success"][0]))
-        for field in range(3):
+        spans = lot_spans(cfg.world)
+        for field in range(N_LOT_FIELDS):
             off = b_m.clone()
-            off[0, field] = (off[0, field] + 1) % 3
+            off[0, field] = (off[0, field] + 1) % spans[field]
             res = resolve_mutual(cfg, mb, self._rows(off), self._rows(f_m), zero, zero)
             self.assertFalse(bool(res["success"][0]),
-                             "a wrong %s still counted as understood"
-                             % ("fruit", "colour", "quality")[field])
+                             "a wrong %s still counted as understood" % LOT_FIELDS[field])
+            self.assertFalse(bool(res["farmer_fields"][0, field]))
 
     def test_the_reward_reads_the_heads_the_rung_scores(self):
         cfg = cfg_small()
@@ -230,7 +230,7 @@ class TestMutualRung(unittest.TestCase):
         self.assertEqual(mutual.active_heads(FARMER, cfg), list(H_REPORT))
         self.assertEqual(mutual.active_heads(BUYER, cfg), list(H_REPORT))
         # a report that is perfect in the scored heads and junk everywhere else
-        f_m, b_m = torch.tensor([[1, 2, 3]]), torch.tensor([[2, 3, 1]])
+        f_m, b_m = torch.tensor([[1, 2, 3, 4, 5]]), torch.tensor([[2, 3, 1, 0, 2]])
         mb = MutualBatch(f_meaning=f_m, b_meaning=b_m)
         f_dec, b_dec = self._rows(b_m), self._rows(f_m)
         junk = [h for h in range(N_HEADS) if h not in H_REPORT]
@@ -244,14 +244,47 @@ class TestMutualRung(unittest.TestCase):
     def test_hindsight_teaches_the_same_heads(self):
         cfg = cfg_small()
         mutual = phase_named(cfg, "mutual")
-        mb = MutualBatch(f_meaning=torch.tensor([[1, 2, 3]]),
-                         b_meaning=torch.tensor([[2, 3, 1]]))
+        mb = MutualBatch(f_meaning=torch.tensor([[1, 2, 3, 4, 5]]),
+                         b_meaning=torch.tensor([[2, 3, 1, 0, 2]]))
         tgt = hindsight_targets(cfg, mutual, mb)
         self.assertEqual(sorted(tgt[FARMER]), sorted(H_REPORT))
         self.assertEqual(sorted(tgt[BUYER]), sorted(H_REPORT))
         # and each head is taught the field it is scored on
         for k, h in enumerate(H_REPORT):
             self.assertEqual(int(tgt[FARMER][h][0]), int(mb.b_meaning[0, k]))
+
+
+def _report_evidence(phase, farmer_ok: bool = True, buyer_ok: bool = True,
+                     holdout: float = 0.9, fields=None) -> dict:
+    """Evidence from a report rung where each role read the other as asked.
+
+    ``fields`` maps a role label to a per-field transfer list, to single one
+    field out; otherwise every field carries.
+    """
+    good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
+    ev = {"chance": 0.0, "success": 0.30 if farmer_ok and buyer_ok else 0.02,
+          "views": [{"success": 0.30, "muted_success": 0.0, "transfer": 0.3}],
+          "speakers": {"farmer": good, "buyer": good},
+          "transfer": 0.6, "topsim": 0.4, "null": 0.0,
+          "holdout_field_ratio": holdout, "holdout_field_success": 0.6,
+          "seen_field_success": 0.7, "holdout_success": 0.2, "seen_success": 0.3}
+    for role, label, ok in ((FARMER, "farmer", farmer_ok), (BUYER, "buyer", buyer_ok)):
+        names = phase.report_names(role)
+        if not names:
+            continue
+        n = len(names)
+        tr = (fields or {}).get(label) or ([0.7] * n if ok else [0.02] * n)
+        ev[label + "_field_names"] = list(names)
+        ev[label + "_fields_intact"] = [0.75 if t > 0.1 else 0.2 for t in tr]
+        ev[label + "_fields_muted"] = [0.2] * n
+        ev[label + "_field_transfer"] = tr
+        ev[label + "_report"] = 0.55 if ok else 0.05
+        ev["muted_" + label + "_report"] = 0.02
+        ev[label + "_report_transfer"] = 0.54 if ok else 0.03
+        ev[label + "_new"] = 0.55 if ok else 0.05
+        ev["muted_" + label + "_new"] = 0.02
+        ev[label + "_new_transfer"] = 0.54 if ok else 0.03
+    return ev
 
 
 def _swap_evidence(farmer_ok: bool, buyer_ok: bool, holdout: float = 0.75) -> dict:
@@ -302,15 +335,14 @@ class TestPerRolePromotion(unittest.TestCase):
     def test_mutual_checks_each_reader(self):
         cfg = cfg_small()
         mutual = phase_named(cfg, "mutual")
-        good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
-        ev = {"chance": 0.005, "success": 0.30, "views": [{"success": 0.30}],
-              "speakers": {"farmer": good, "buyer": good},
-              "farmer_report": 0.60, "muted_farmer_report": 0.06, "farmer_report_transfer": 0.57,
-              "buyer_report": 0.10, "muted_buyer_report": 0.06, "buyer_report_transfer": 0.04}
+        ev = _report_evidence(mutual, farmer_ok=True, buyer_ok=False)
         ok, checks = evaluate_rung(cfg, mutual, ev, rung_budget(cfg, mutual)[0])
         self.assertFalse(ok)
-        self.assertFalse(checks["buyer decodes: reports partner's tuple"]["met"])
-        self.assertTrue(checks["farmer decodes: reports partner's tuple"]["met"])
+        self.assertFalse(checks["buyer decodes: the other's lot arrives"]["met"])
+        self.assertTrue(checks["farmer decodes: the other's lot arrives"]["met"])
+        ok, checks = evaluate_rung(cfg, mutual, _report_evidence(mutual, True, True),
+                                   rung_budget(cfg, mutual)[0])
+        self.assertTrue(ok, [k for k, c in checks.items() if not c["met"]])
 
     def test_every_rung_has_a_budget(self):
         cfg = cfg_small()
@@ -435,10 +467,9 @@ class TestLiveQuantityEncoding(unittest.TestCase):
         toks = torch.full((B, c.dialogue_len), c.pad_id, dtype=torch.long)
         toks[:, 0] = torch.tensor(words)
         toks[:, 1] = c.end_id
-        sb = MutualBatch(f_meaning=torch.stack([torch.zeros(B, dtype=torch.long),
-                                                torch.tensor(qty),
-                                                torch.zeros(B, dtype=torch.long)], 1),
-                         b_meaning=torch.zeros((B, 3), dtype=torch.long))
+        z = torch.zeros(B, dtype=torch.long)
+        sb = MutualBatch(f_meaning=torch.stack([z, z, z, torch.tensor(qty), z], 1),
+                         b_meaning=torch.zeros((B, 5), dtype=torch.long))
         refer = phase_named(cfg, "name-fruit")
         return SimpleNamespace(tokens=toks, sb=sb, phase=refer,
                                own_positions=lambda role: refer.own_positions(cfg, role))
@@ -517,103 +548,120 @@ class TestEveryFieldIsNeeded(unittest.TestCase):
         t = rb.true_meaning
         others = torch.ones(rb.meanings.shape[:2], dtype=torch.bool)
         others[torch.arange(4000), rb.target] = False
-        for field, name in enumerate(("fruit", "colour", "quality")):
-            keep = [f for f in range(3) if f != field]
+        # With three candidates at most two fields can decide a round, so over
+        # five fields no field can decide more than ~40% of them; what must hold
+        # is that every field decides often enough to be worth saying, and that
+        # no field is favoured over another (the near-miss field is drawn
+        # uniformly, not in proportion to how many values the field has).
+        shares = []
+        for field, name in enumerate(LOT_FIELDS):
+            keep = [f for f in range(N_LOT_FIELDS) if f != field]
             same = (rb.meanings[:, :, keep] == t[:, keep].unsqueeze(1)).all(-1) & others
             share = float(same.any(1).float().mean())
-            self.assertGreater(share, 0.25,
+            shares.append(share)
+            self.assertGreater(share, 0.15,
                                "%s is hardly ever the field that decides (%.3f)"
                                % (name, share))
+        self.assertLess(max(shares), 1.6 * min(shares),
+                        "one field decides far more often than another: %s"
+                        % [round(x, 3) for x in shares])
 
     def test_mutual_is_judged_field_by_field(self):
         cfg = cfg_small()
         mutual = phase_named(cfg, "mutual")
-        good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
-        ev = {"chance": 0.005, "success": 0.30, "views": [{"success": 0.30}],
-              "speakers": {"farmer": good, "buyer": good},
-              "farmer_report": 0.60, "farmer_report_transfer": 0.57,
-              "buyer_report": 0.60, "buyer_report_transfer": 0.57,
-              "farmer_field_transfer": [0.9, 0.05, 0.9],      # quantity at chance
-              "buyer_field_transfer": [0.9, 0.6, 0.9]}
+        ev = _report_evidence(mutual, fields={"farmer": [0.9, 0.05, 0.9, 0.9, 0.9]})
         ok, checks = evaluate_rung(cfg, mutual, ev, rung_budget(cfg, mutual)[0])
         self.assertFalse(ok)
-        self.assertFalse(checks["farmer decodes: colour"]["met"])
-        self.assertTrue(checks["buyer decodes: colour"]["met"])
+        self.assertFalse(checks["farmer decodes: colour carries"]["met"])
+        self.assertTrue(checks["buyer decodes: colour carries"]["met"])
 
 
-class TestTheRequestRungs(unittest.TestCase):
-    """The trade half of the ladder adds one field at a time, like the naming half."""
+def _sb(n=3, **kw):
+    """A stand-in ScenarioBatch with just the fields a report rung reads."""
+    base = dict(want_variety=[0, 1, 2], want_color=[1, 1, 1], min_quality=[0, 2, 1],
+                need_qty=[3, 4, 5], max_price=[2, 3, 1], offered_stock=[2, 5, 0],
+                offered_quality=[1, 2, 3], reservation=[0, 1, 2],
+                viable=[True, False, True])
+    base.update(kw)
+    return SimpleNamespace(**{k: torch.tensor(v[:n]) for k, v in base.items()})
 
-    def test_each_request_rung_adds_one_field_and_keeps_the_rest(self):
+
+class TestTheReportRungs(unittest.TestCase):
+    """The trade half of the ladder: every word is inherited, and each rung adds
+    one thing the other side has to *do* with them -- listen with a barn in view,
+    find a lot and describe it, judge the deal."""
+
+    def test_each_report_rung_adds_fields_and_keeps_the_rest(self):
         cfg = cfg_small()
         names = [p.name for p in ladder(cfg)]
         self.assertEqual(names[names.index("mutual"):],
-                         ["mutual", "ask-qty", "order", "quote", "offer",
-                          "judge", "haggle", "bargain", "market"])
-        asked = {n: phase_named(cfg, n).ask for n in ("ask-qty", "order", "quote")}
-        self.assertEqual(asked["ask-qty"], ("quantity",))
-        self.assertEqual(asked["order"], ("fruit", "colour", "quantity"))
-        self.assertEqual(asked["quote"], ("fruit", "colour", "quantity", "price"))
-        for a, b in (("ask-qty", "order"), ("order", "quote")):
-            self.assertTrue(set(asked[a]) < set(asked[b]),
-                            "%s drops a field %s had" % (b, a))
-        # and each one is judged on the field it introduced
-        for n, field in (("ask-qty", "quantity"), ("order", "fruit"),
-                         ("quote", "price"), ("offer", "stock"), ("judge", "deal")):
-            self.assertEqual(phase_named(cfg, n).asks_first, field)
+                         ["mutual", "order", "offer", "judge", "haggle", "bargain", "market"])
+        order, offer, judge = (phase_named(cfg, n) for n in ("order", "offer", "judge"))
+        self.assertEqual(order.report_names(FARMER), REQUEST_FIELDS)
+        self.assertEqual(order.report_names(BUYER), ())
+        self.assertEqual(offer.report_names(FARMER), REQUEST_FIELDS)
+        self.assertEqual(offer.report_names(BUYER), LOT_ANSWER_FIELDS)
+        self.assertEqual(offer.new_names(FARMER), ())
+        self.assertEqual(offer.new_names(BUYER), LOT_ANSWER_FIELDS)
+        self.assertEqual(judge.new_names(FARMER), ("deal",))
+        self.assertEqual(judge.new_names(BUYER), ("deal",))
+        for a, b in ((order, offer), (offer, judge)):
+            for role in (FARMER, BUYER):
+                self.assertTrue(set(a.report_names(role)) <= set(b.report_names(role)),
+                                "%s drops a field %s had" % (b.name, a.name))
 
-    def test_quantity_and_price_are_asked_for_before_they_are_negotiated(self):
-        """The two fields no naming rung teaches get a rung of their own first."""
-        cfg = cfg_small()
-        names = [p.name for p in ladder(cfg)]
-        for field, rung in (("quantity", "ask-qty"), ("price", "quote")):
-            first = next(p.name for p in ladder(cfg)
-                         if p.order and field in p.ask)
-            self.assertEqual(first, rung)
-            self.assertLess(names.index(rung), names.index("haggle"),
-                            "%s is first asked for after haggle needs it" % field)
-
-    def test_the_farmer_fills_the_order_with_its_deal_heads(self):
+    def test_the_farmer_reports_the_request_on_the_heads_mutual_used(self):
+        """Nothing new to learn about *which head*: the request is a lot."""
         cfg = cfg_small()
         order = phase_named(cfg, "order")
-        self.assertEqual(order.active_heads(FARMER, cfg),
-                         [H_VARIETY, H_BELIEF_COLOR, H_QTY])
+        self.assertEqual(order.active_heads(FARMER, cfg), list(H_REPORT))
         self.assertEqual(order.active_heads(BUYER, cfg), [])
         self.assertEqual(order.speaker_of_turn(0), BUYER)
-        sb = SimpleNamespace(want_variety=torch.tensor([0, 1, 2]),
-                             want_color=torch.tensor([1, 1, 1]),
-                             need_qty=torch.tensor([3, 4, 5]))
+        sb = _sb()
         dec = torch.zeros((3, N_HEADS), dtype=torch.long)
-        dec[:, H_VARIETY] = torch.tensor([0, 1, 0])
-        dec[:, H_QTY] = torch.tensor([3, 2, 5])
-        dec[:, H_BELIEF_COLOR] = torch.tensor([1, 1, 0])
+        for k, name in enumerate(REQUEST_FIELDS):
+            dec[:, H_REPORT[k]] = getattr(sb, {"fruit": "want_variety", "colour": "want_color",
+                                               "quality": "min_quality", "quantity": "need_qty",
+                                               "price": "max_price"}[name])
+        dec[1, H_REPORT[3]] = 9                   # wrong quantity
+        dec[2, H_REPORT[0]] = 0                   # wrong fruit
+        dec[2, H_REPORT[1]] = 0                   # and colour
         zero = torch.zeros(3)
-        res = resolve_request(cfg, order, sb, {FARMER: dec, BUYER: dec * 0}, zero, zero)
-        # right; wrong quantity; wrong fruit and colour
+        res = resolve_reports(cfg, order, sb, {FARMER: dec, BUYER: dec * 0}, zero, zero)
         self.assertEqual(res["success"].tolist(), [True, False, False])
-        self.assertEqual(res["order_fields"].tolist(),
-                         [[True, True, True], [True, True, False], [False, False, True]])
+        self.assertEqual(res["farmer_fields"].tolist(),
+                         [[True] * 5, [True, True, True, False, True],
+                          [False, False, True, True, True]])
+        self.assertEqual(res["farmer_field_names"], list(REQUEST_FIELDS))
         self.assertGreater(float(res["farmer_reward"][1]), float(res["farmer_reward"][2]) - 1e-6)
+        # the buyer said it; it is paid for having been read
+        self.assertGreater(float(res["buyer_reward"][0]), float(res["buyer_reward"][2]))
 
     def test_always_accepting_cannot_pass_the_judge_rung(self):
         """The failure `haggle` actually had: accept everything, score the base rate."""
         cfg = Config()
         judge = phase_named(cfg, "judge")
-        self.assertEqual(judge.active_heads(BUYER, cfg), [H_ACCEPT])
-        self.assertEqual(judge.active_heads(FARMER, cfg), [])
+        self.assertIn(H_ACCEPT, judge.active_heads(BUYER, cfg))
+        self.assertIn(H_ACCEPT, judge.active_heads(FARMER, cfg))
         base = 0.68                       # roughly the share of viable rounds
 
         def ev(intact):
-            return {"request_first": intact, "muted_request_first": base,
-                    "request_fields_intact": [intact], "request_fields_muted": [base],
-                    "request_field_transfer": [(intact - base) / (1 - base)],
-                    "success": intact, "chance": base,
-                    "transfer": (intact - base) / (1 - base),
-                    "topsim": 1.0, "null": 0.0}
+            e = _report_evidence(judge)
+            for lbl in ("farmer", "buyer"):
+                e[lbl + "_new"] = intact
+                e["muted_" + lbl + "_new"] = base
+                e[lbl + "_new_transfer"] = (intact - base) / (1 - base)
+                i = e[lbl + "_field_names"].index("deal")
+                e[lbl + "_fields_intact"][i] = intact
+                e[lbl + "_fields_muted"][i] = base
+                e[lbl + "_field_transfer"][i] = (intact - base) / (1 - base)
+            e["transfer"] = (intact - base) / (1 - base)
+            return e
 
         ok, checks = evaluate_rung(cfg, judge, ev(base), 10 ** 6)
         self.assertFalse(ok, "a pair that accepts everything passed `judge`")
-        self.assertFalse(checks["deal arrives"]["met"])
+        self.assertFalse(checks["buyer decodes: deal arrives"]["met"])
+        self.assertFalse(checks["farmer decodes: deal carries"]["met"])
         # and a pair that actually reads the answer does pass
         ok, checks = evaluate_rung(cfg, judge, ev(0.90), 10 ** 6)
         self.assertTrue(ok, [n for n, d in checks.items() if not d["met"]])
@@ -624,34 +672,59 @@ class TestTheRequestRungs(unittest.TestCase):
         cfg = Config()
         self.assertGreater(_headroom_floor(0.68, cfg.curriculum.min_field_transfer), 0.68)
         self.assertLess(_headroom_floor(0.68, cfg.curriculum.min_field_transfer), 1.0)
-        # a field silence rarely gets right keeps the ordinary absolute floor
-        self.assertLess(_headroom_floor(0.15, cfg.curriculum.min_field_transfer),
-                        cfg.curriculum.order_min_success)
+        # a conjunction silence never gets right keeps the ordinary absolute floor
+        self.assertLessEqual(_headroom_floor(0.0, cfg.curriculum.min_field_transfer),
+                             cfg.curriculum.order_min_success)
 
     def test_the_answer_rung_runs_the_other_way(self):
         """In `offer` the farmer says what it holds and the buyer has to report it."""
         cfg = cfg_small()
         offer = phase_named(cfg, "offer")
-        self.assertTrue(offer.answers)
         self.assertEqual(offer.active_heads(BUYER, cfg),
                          [H_BELIEF[1], H_BELIEF[2], H_BELIEF[3]])
-        self.assertEqual(offer.active_heads(FARMER, cfg), [])
+        self.assertEqual(offer.active_heads(FARMER, cfg), list(H_REPORT))
         # the buyer asks first, so the farmer knows which lot to describe
         self.assertEqual(offer.speaker_of_turn(0), BUYER)
         self.assertEqual(offer.speaker_of_turn(1), FARMER)
-        sb = SimpleNamespace(offered_stock=torch.tensor([2, 5, 0]),
-                             offered_quality=torch.tensor([1, 2, 3]),
-                             reservation=torch.tensor([0, 1, 2]))
-        dec = torch.zeros((3, N_HEADS), dtype=torch.long)
-        dec[:, H_BELIEF[1]] = torch.tensor([2, 5, 1])
-        dec[:, H_BELIEF[2]] = torch.tensor([1, 0, 3])
-        dec[:, H_BELIEF[3]] = torch.tensor([0, 1, 2])
+        sb = _sb()
+        f_dec = torch.zeros((3, N_HEADS), dtype=torch.long)
+        for k, attr in enumerate(("want_variety", "want_color", "min_quality", "need_qty",
+                                  "max_price")):
+            f_dec[:, H_REPORT[k]] = getattr(sb, attr)
+        b_dec = torch.zeros((3, N_HEADS), dtype=torch.long)
+        b_dec[:, H_BELIEF[1]] = torch.tensor([2, 5, 1])
+        b_dec[:, H_BELIEF[2]] = torch.tensor([1, 0, 3])
+        b_dec[:, H_BELIEF[3]] = torch.tensor([0, 1, 2])
         zero = torch.zeros(3)
-        res = resolve_request(cfg, offer, sb, {BUYER: dec, FARMER: dec * 0}, zero, zero)
+        res = resolve_reports(cfg, offer, sb, {BUYER: b_dec, FARMER: f_dec}, zero, zero)
         self.assertEqual(res["success"].tolist(), [True, False, False])
-        # the buyer is the one being scored here, so it is the one credited
-        self.assertGreater(float(res["buyer_decode"][0]), 0.0)
-        self.assertEqual(float(res["farmer_decode"][0]), 0.0)
+        self.assertEqual(res["buyer_fields"].tolist(),
+                         [[True, True, True], [True, False, True], [False, True, True]])
+        self.assertEqual(res["buyer_new_ok"].tolist(), [True, False, False])
+        self.assertTrue(bool(res["farmer_new_ok"].all()), "nothing new for the farmer here")
+        # both are paid: the buyer for reading, the farmer for having been read
+        self.assertGreater(float(res["buyer_decode"][0]), float(res["buyer_decode"][1]))
+        self.assertGreater(float(res["farmer_reward"][0]), float(res["farmer_reward"][1]))
+
+    def test_judge_scores_the_deal_for_both(self):
+        cfg = cfg_small()
+        judge = phase_named(cfg, "judge")
+        sb = _sb()
+        dec = torch.zeros((3, N_HEADS), dtype=torch.long)
+        dec[:, H_ACCEPT] = torch.tensor([1, 1, 1])      # accept everything
+        res = resolve_reports(cfg, judge, sb, {FARMER: dec, BUYER: dec},
+                              torch.zeros(3), torch.zeros(3))
+        i = res["farmer_field_names"].index("deal")
+        self.assertEqual(res["farmer_fields"][:, i].tolist(), [True, False, True])
+        self.assertEqual(res["buyer_new_ok"].tolist(), [True, False, True])
+
+    def test_offer_and_judge_hindsight_teach_what_is_scored(self):
+        cfg = cfg_small()
+        for name in ("order", "offer", "judge"):
+            ph = phase_named(cfg, name)
+            tgt = hindsight_targets(cfg, ph, _sb())
+            for role in (FARMER, BUYER):
+                self.assertEqual(sorted(tgt[role]), sorted(ph.active_heads(role, cfg)), name)
 
 
 # ==========================================================================
@@ -676,17 +749,22 @@ class TestEveryRungIsReachable(unittest.TestCase):
             "holdout_success": 1.0, "seen_success": 1.0, "holdout_ratio": 1.0,
             "views": [{"success": 1.0, "transfer": 1.0, "muted_success": 0.0,
                        "guesser": r, "informer": r} for r in roles],
-            "by_kind": {k: {"success": 1.0} for k in range(4)},
-            "request_first": 1.0, "muted_request_first": 0.0,
-            "request_first_transfer": 1.0,
-            "request_fields_intact": [1.0] * 4, "request_fields_muted": [0.0] * 4,
-            "request_field_transfer": [1.0] * 4,
+            "by_kind": {k: {"success": 1.0} for k in range(6)},
+            "holdout_field_ratio": 1.0, "holdout_field_success": 1.0,
+            "seen_field_success": 1.0,
         }
-        for r in roles:
+        for r, role in (("farmer", FARMER), ("buyer", BUYER)):
+            names = list(phase.report_names(role)) or ["x"] * 6
+            ev[r + "_field_names"] = names
             ev[r + "_report"] = 1.0
             ev["muted_" + r + "_report"] = 0.0
             ev[r + "_report_transfer"] = 1.0
-            ev[r + "_field_transfer"] = [1.0, 1.0, 1.0]
+            ev[r + "_fields_intact"] = [1.0] * len(names)
+            ev[r + "_fields_muted"] = [0.0] * len(names)
+            ev[r + "_field_transfer"] = [1.0] * len(names)
+            ev[r + "_new"] = 1.0
+            ev["muted_" + r + "_new"] = 0.0
+            ev[r + "_new_transfer"] = 1.0
         return ev
 
     def test_every_rung_passes_on_perfect_evidence(self):
@@ -829,7 +907,8 @@ class TestLanguageProperties(unittest.TestCase):
         from orchard.properties import duality
         cfg = cfg_small()
         sem = SimpleNamespace(per_word={}, per_token={})
-        self.assertFalse(duality(cfg, sem)["necessary"])        # 16 atoms, 3+8+3 values
+        cfg.channel.atomic_vocab = 40
+        self.assertFalse(duality(cfg, sem)["necessary"])        # 40 atoms, 3+4+4+9+8 values
         cfg.channel.atomic_vocab = 8
         self.assertTrue(duality(cfg, sem)["necessary"])
 
@@ -967,9 +1046,10 @@ class TestTheLineupPaysForGettingClose(unittest.TestCase):
     """
 
     def _round(self, cfg, pick):
-        m = torch.tensor([[[1, 2, 3], [1, 2, 0], [0, 0, 0]]])   # target, near miss, wild
+        # target, a near miss (one field off), a wild miss (every field off)
+        m = torch.tensor([[[1, 2, 3, 4, 5], [1, 2, 3, 4, 0], [0, 0, 0, 0, 1]]])
         rb = ReferentialBatch(meanings=m, target=torch.tensor([0]),
-                              query=torch.tensor([3]),
+                              query=torch.tensor([ASK_ALL]),
                               held_out=torch.tensor([False]), day=0, informer=FARMER)
         zero = torch.zeros(1)
         return resolve_referential(cfg, rb, torch.tensor([pick]), zero, zero)
@@ -980,7 +1060,7 @@ class TestTheLineupPaysForGettingClose(unittest.TestCase):
         near = float(self._round(cfg, 1)["farmer_reward"][0])
         wild = float(self._round(cfg, 2)["farmer_reward"][0])
         self.assertGreater(right, near)
-        self.assertGreater(near, wild, "two fields of three paid the same as none")
+        self.assertGreater(near, wild, "four fields of five paid the same as none")
         self.assertTrue(self._round(cfg, 0)["success"][0])
         self.assertFalse(self._round(cfg, 1)["success"][0],
                          "partial credit must not count as success")
