@@ -2045,3 +2045,86 @@ def _mutual_evidence(cfg, **over):
     }
     ev.update(over)
     return ev
+
+
+import tempfile
+
+
+# ==========================================================================
+class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
+    """The shape-deciding settings have exactly one valid reading on a resume:
+    the one the weights were trained under. Leaving them to the command line
+    turns a forgotten `--config` into sixty `size mismatch` lines that name
+    tensors and never name the setting that is wrong."""
+
+    def _snapshot_at(self, d, d_model, d_ff):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.model.d_model, cfg.model.d_ff = d_model, d_ff
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        tr = Trainer(cfg, d + "/a", quiet=True)
+        tr.episode = 128
+        path = tr.save_snapshot("t")
+        tr.close()
+        return path
+
+    def test_a_wider_snapshot_loads_under_the_narrow_default(self):
+        """The exact failure a resume without its preset produced: a 96-wide
+        run, resumed under the 48-wide default."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()                      # d_model 48, d_ff 96
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.log.plot = False
+            self.assertEqual(cfg.model.d_model, 48)
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.load_snapshot(path)                # must not raise
+            self.assertEqual(tr2.cfg.model.d_model, 96)
+            self.assertEqual(tr2.cfg.model.d_ff, 384)
+            for a in tr2.pop.all_agents():
+                self.assertEqual(a.net.d_model, 96)
+            tr2.close()
+
+    def test_it_leaves_alone_what_a_resume_may_change(self):
+        """Community size and batch size are not architecture: a resume is
+        allowed to shrink a 32-agent run to 8, which is how this one is run."""
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.train.batch_size = 77
+            cfg.log.plot = False
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            tr2.load_snapshot(path)
+            self.assertEqual(tr2.cfg.train.batch_size, 77)
+            tr2.close()
+
+    def test_a_shape_nobody_listed_still_fails_legibly(self):
+        """`_check_shapes` is the backstop for a field missing from ARCH_KEYS:
+        the message has to name the configuration difference, not the tensors."""
+        import orchard.train as T
+        from orchard.train import Trainer
+        with tempfile.TemporaryDirectory() as d:
+            path = self._snapshot_at(d, 96, 384)
+            cfg = cfg_small()
+            cfg.population.n_farmers = cfg.population.n_buyers = 2
+            cfg.train.device = "cpu"
+            cfg.log.plot = False
+            tr2 = Trainer(cfg, d + "/b", quiet=True)
+            was = T.ARCH_KEYS
+            T.ARCH_KEYS = frozenset()        # as if nobody had listed d_model
+            try:
+                with self.assertRaises(RuntimeError) as got:
+                    tr2.load_snapshot(path)
+            finally:
+                T.ARCH_KEYS = was
+            msg = str(got.exception)
+            self.assertIn("model.d_model", msg)
+            self.assertIn("--config", msg)
+            tr2.close()
