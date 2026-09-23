@@ -457,6 +457,23 @@ class Trainer:
         # _play calls sampler(n, held_out); this one is held-out whatever it asks
         return (lambda n, _ho=False, _s=s: _s(n, held_out=True)) if s is not None else None
 
+    def holdout_floor(self, phase):
+        """(reserved, trained) per-field floors for a message-blind guesser.
+
+        The two pools have different field marginals -- the reserved quarter is
+        16 rows and need not be balanced -- so each per-field number is read
+        against its own pool's floor.
+        """
+        rw = self.referential_world
+        if rw is None:
+            return None
+        held = getattr(rw, "held_combos", None)
+        train = getattr(rw, "train_combos", None)
+        if held is None or train is None:
+            return None
+        from .metrics import pool_field_floor
+        return pool_field_floor(held), pool_field_floor(train)
+
     def chance_for(self, phase) -> float:
         """The floor this phase has to clear (NaN: measured, not analytic)."""
         if phase.referential:
@@ -479,6 +496,7 @@ class Trainer:
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
+            holdout_floor_for=self.holdout_floor,
             kind_sampler_for=(None if light else self.kind_sampler),
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
@@ -1617,6 +1635,13 @@ class Trainer:
         if isinstance(held, (int, float)) and held == held:
             zs = " | held-out %s vs trained %s" % (f(held, "%.2f"),
                                                    f(ev.get("seen_success"), "%.2f"))
+        hf = ev.get("holdout_fields")
+        if isinstance(hf, (int, float)) and hf == hf:
+            # The conjunction goes to zero on any per-field shortfall, so on its
+            # own it cannot tell "memorised" from "most of the way there".
+            zs += " (per field %s vs %s = %s of the headroom)" % (
+                f(hf, "%.2f"), f(ev.get("seen_fields"), "%.2f"),
+                f(ev.get("holdout_field_ratio"), "%.2f"))
         per_field = ""
         fields = ev.get("request_fields_intact")
         if fields:
