@@ -460,6 +460,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="continue from a snapshot (runs/<name>/snapshots/*.pt) under "
                         "the configuration given here; rung, weights, usage and the "
                         "transcript store all carry over")
+    p.add_argument("--resume-at", type=str, default=None, metavar="RUNG",
+                   help="with --resume: put the curriculum back on this rung, "
+                        "keeping the weights, the community and the store. "
+                        "`after-<rung>.pt` holds a curriculum already pointing at "
+                        "the rung after, so this is how a rung is run again once "
+                        "something it depends on has changed")
     p.add_argument("--holdout-report", type=str, default=None, metavar="SNAPSHOT",
                    help="score one snapshot on the held-out combinations, field "
                         "by field, and exit -- which of fruit, colour and quality "
@@ -495,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
                       started_utc=time.strftime("%Y-%m-%d %H:%M:%S UTC", now))
     if args.resume:
         trainer.load_snapshot(args.resume)
+        if args.resume_at:
+            trainer.rewind_to(args.resume_at)
+    elif args.resume_at:
+        print("--resume-at needs --resume: it moves the curriculum of a snapshot")
+        return 2
     try:
         final = trainer.run()
         trainer.log("")

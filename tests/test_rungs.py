@@ -2493,3 +2493,117 @@ class TestASettingASnapshotPredatesIsNotDrift(unittest.TestCase):
         b = {"train": {"batch_size": 256}}
         self.assertEqual(config_diff(a, b, both_only=True),
                          {"train.batch_size": (4096, 256)})
+
+
+# ==========================================================================
+class TestWindingACurriculumBackToARung(unittest.TestCase):
+    """`after-<rung>.pt` is written after `cur.advance`, so it holds the weights
+    as they were when the rung passed and a curriculum already pointing at the
+    next one. Resuming it restarts the rung *after* -- right for carrying on,
+    wrong for the other reason to reach for that file: running a rung again
+    because a mechanism it depends on has changed."""
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return Trainer(cfg, d, quiet=True)
+
+    def test_the_promotion_snapshot_points_at_the_next_rung(self):
+        """The premise, so the reason for this flag is not folklore."""
+        src = Path(__file__).resolve().parents[1] / "orchard" / "train.py"
+        text = src.read_text()
+        adv = text.index("nxt = cur.advance(")
+        snap = text.index('self.save_snapshot("after-" + phase.name)')
+        self.assertLess(adv, snap)
+
+    def test_resuming_alone_lands_on_the_rung_after(self):
+        with tempfile.TemporaryDirectory() as d:
+            from orchard.train import Trainer
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")     # as after-mutual holds
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertEqual(tr2.curriculum.phase.name, "ask-qty")
+            tr2.close()
+
+    def test_winding_back_puts_it_on_the_rung_asked_for(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.curriculum.phase.name, "mutual")
+            self.assertEqual(tr2.curriculum.updates_in_phase, 0)
+            self.assertEqual(tr2.curriculum.episodes_in_phase, 0)
+            self.assertEqual(tr2.cost_gate, 0.0)
+            tr2.close()
+
+    def test_it_keeps_the_weights_and_the_community(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            before = [a.net.state_dict() for a in tr.pop.all_agents()]
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            tr2.rewind_to("mutual")
+            self.assertEqual(tr2.episode, 4096)
+            after = [a.net.state_dict() for a in tr2.pop.all_agents()]
+            self.assertEqual(len(before), len(after))
+            for x, y in zip(before, after):
+                for k in x:
+                    self.assertTrue(torch.equal(x[k], y[k].to(x[k].device)), k)
+            tr2.close()
+
+    def test_the_pool_follows_the_rung_it_lands_on(self):
+        """`mutual` is below the split and `market` is above it; winding between
+        them has to move the pool with the curriculum."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            tr.rewind_to("mutual")
+            self.assertTrue(tr.pop.shared)
+            tr.rewind_to("market")
+            self.assertFalse(tr.pop.shared)
+            tr.close()
+
+    def test_a_rung_that_does_not_exist_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            with self.assertRaises(ValueError) as got:
+                tr.rewind_to("name-smell")
+            self.assertIn("name-smell", str(got.exception))
+            self.assertIn("mutual", str(got.exception))     # the ladder, listed
+            tr.close()
+
+    def test_the_header_says_where_the_run_actually_is(self):
+        """`load_snapshot` writes that line before the curriculum moves, and it
+        is the line anyone checks to confirm which rung they restarted on."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d + "/a")
+            names = [p.name for p in tr.curriculum.phases]
+            tr.curriculum.index = names.index("ask-qty")
+            tr.episode = 4096
+            path = tr.save_snapshot("after-mutual")
+            tr.close()
+            tr2 = self._trainer(d + "/b")
+            tr2.load_snapshot(path)
+            self.assertIn("rung ask-qty", tr2.resume_note)
+            tr2.rewind_to("mutual")
+            self.assertIn("rung mutual", tr2.resume_note)
+            self.assertIn("wound back from ask-qty", tr2.resume_note)
+            tr2.close()
