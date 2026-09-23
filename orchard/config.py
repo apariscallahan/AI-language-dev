@@ -650,6 +650,11 @@ class BottleneckConfig:
     batch_size: int = 256
     lr: float = 1e-3
     store_capacity: int = 40_000          # ring buffer of recent successful episodes
+    # What share of the buffer the rungs that are *not* running keep between
+    # them. At 0 one rung's traffic flushes every earlier rung, which is how a
+    # hundred updates of `ask-qty` erased all 22,359 `mutual` transcripts and
+    # left a newborn nothing to learn the naming language from.
+    history_share: float = 0.4
     only_successful: bool = True          # learn from trades that worked
     # How strongly the newborn's sample favours common meanings (addendum 2.3).
     #   1.0 = whatever the parent generation actually did, in proportion

@@ -1187,8 +1187,12 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def on_birth(self, newborn: Agent, ev: BirthEvent) -> None:
+        # Below the split one pool fills both seats, so this newborn will play
+        # every buyer's round as well as every farmer's, whichever seat it was
+        # spawned into. It has to be taught both.
+        seats = ((FARMER, BUYER) if self.pop.shared else (newborn.role,))
         info = train_newborn(self.cfg, newborn, self.store, self.bottleneck_rng,
-                             device=self.device)
+                             device=self.device, roles=seats)
         ev.bottleneck = info
         # Spec 5.5: test the newborn the moment it comes out of the bottleneck,
         # before it has played a single live episode.

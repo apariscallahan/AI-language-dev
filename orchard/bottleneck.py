@@ -64,7 +64,8 @@ from collections import Counter
 
 from .agents import Agent
 from .config import Config
-from .env import BUYER, FARMER, MASKED, grammar_mask_for_positions
+from .env import (BUYER, FARMER, MASKED, ROLE_NAMES,
+                  grammar_mask_for_positions)
 from .rollout import BatchRollout
 
 
@@ -131,6 +132,7 @@ class TranscriptStore:
         self.cfg = cfg
         self.capacity = cfg.bottleneck.store_capacity
         self._buf: list[StoredEpisode] = []
+        self._slots: dict[str, list[int]] = {}
         self._pos = 0
         self.total_added = 0
         self.meaning_counts: Counter = Counter()
@@ -174,16 +176,73 @@ class TranscriptStore:
             phase=self._phase_of(batch),
         )
         if len(self._buf) < self.capacity:
+            self._slots.setdefault(item.phase.name, []).append(len(self._buf))
             self._buf.append(item)
         else:
-            old = self._buf[self._pos]
+            victim = self._evict_slot(item.phase.name)
+            old = self._buf[victim]
             self.meaning_counts[old.meaning] -= 1
             if self.meaning_counts[old.meaning] <= 0:
                 del self.meaning_counts[old.meaning]
-            self._buf[self._pos] = item
+            self._buf[victim] = item
+            self._slots.setdefault(item.phase.name, []).append(victim)
             self._pos = (self._pos + 1) % self.capacity
         self.meaning_counts[item.meaning] += 1
         self.total_added += 1
+
+    def _evict_slot(self, incoming: str) -> int:
+        """Which slot the next episode replaces, once the store is full.
+
+        Plain FIFO lets one rung's traffic flush every earlier rung. At
+        `ask-qty` the store went from 22,359 `mutual` transcripts to none inside
+        a hundred updates, and with them went every example of the language the
+        naming rungs built -- which is what a newborn most needs to be taught,
+        since the later rungs all name fruit, colour and quality and only add to
+        them. A rung with nothing left in the store cannot be transmitted at all.
+
+        So the rungs that are *not* the one now running share
+        ``bottleneck.history_share`` of the buffer between them, and the running
+        rung gets the rest. Only a rung over its share is evicted from; when
+        none is, the running rung trims its own oldest, which is the old
+        behaviour once everything fits.
+        """
+        self._reindex_if_needed()
+        others = [k for k, v in self._slots.items() if k != incoming and v]
+        if others:
+            share = float(self.cfg.bottleneck.history_share)
+            keep = int(self.capacity * max(0.0, min(1.0, share))) // len(others)
+            over = [(len(self._slots[k]) - keep, k) for k in others
+                    if len(self._slots[k]) > keep]
+            if over:
+                _, worst = max(over)
+                return self._slots[worst].pop(0)
+        mine = self._slots.get(incoming)
+        if mine:
+            return mine.pop(0)
+        # Nothing of this rung yet and every other rung within its share: take
+        # the largest, so a first arrival is never turned away.
+        biggest = max(self._slots, key=lambda k: len(self._slots[k]))
+        return self._slots[biggest].pop(0)
+
+    def _reindex_if_needed(self) -> None:
+        """Rebuild the per-rung slot lists when they do not describe the buffer.
+
+        A snapshot stores `buf` and nothing else about this index, and a store
+        restored from one would otherwise evict from an empty map.
+        """
+        if sum(len(v) for v in self._slots.values()) == len(self._buf):
+            return
+        slots: dict[str, list[int]] = {}
+        for i, it in enumerate(self._buf):
+            slots.setdefault(it.phase.name, []).append(i)
+        for v in slots.values():            # oldest first, as eviction expects
+            v.sort(key=lambda i: self._buf[i].episode)
+        self._slots = slots
+
+    def phase_counts(self) -> dict:
+        """{rung name: episodes held}, the mix a newborn would be taught from."""
+        self._reindex_if_needed()
+        return {k: len(v) for k, v in sorted(self._slots.items()) if v}
 
     def to_host(self) -> int:
         """Bring every stored episode back to the host; returns how many moved.
@@ -356,8 +415,23 @@ class TranscriptStore:
 
 
 def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
-                  rng: random.Random, *, device: str = "cpu") -> dict[str, Any]:
-    """Run the newborn's supervised apprenticeship.  Returns a log record."""
+                  rng: random.Random, *, device: str = "cpu",
+                  roles: "tuple[int, ...] | None" = None) -> dict[str, Any]:
+    """Run the newborn's supervised apprenticeship.  Returns a log record.
+
+    ``roles`` is the set of seats this agent will actually fill, and it is not
+    always the one it was spawned into. Below ``curriculum.split_roles_at`` one
+    pool fills both seats, so an agent born to replace a farmer also does every
+    buyer's job -- and `turn_over` walks ``(FARMER, BUYER)`` over what is then
+    the same list, installing the newborn on the farmer pass so the buyer pass
+    finds it already young and skips. Every replacement is therefore born a
+    farmer, and teaching it only what farmers said is fine while both seats
+    speak. At `ask-qty` the farmer speaks nowhere: the newborn learned nothing
+    at all (``0 own tokens``), took the buyer's chair, and had no words for it.
+    Five of eight founders were replaced that way in 175 updates and the
+    language went with them -- coherence 0.625 to 0.346, 44 words to 25, and a
+    scrambled channel costing nothing.
+    """
     bc = cfg.bottleneck
     info: dict[str, Any] = {
         "enabled": bc.enabled,
@@ -397,10 +471,11 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         info["skipped"] = "not enough successful transcripts yet"
         return info
 
-    role = agent.role
+    learn_roles = tuple(roles) if roles else (agent.role,)
+    info["roles"] = [ROLE_NAMES[r] for r in learn_roles]
     gens: dict[int, int] = {}
     for s in samples:
-        g = s.generation_of(role)
+        g = s.generation_of(learn_roles[0])
         gens[g] = gens.get(g, 0) + 1
     info["teacher_generations"] = {str(k): v for k, v in sorted(gens.items())}
     info["n_samples"] = len(samples)
@@ -420,7 +495,8 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         groups.setdefault(s.phase if s.phase is not None else ladder(cfg)[-1], []).append(s)
 
     plans = []
-    for ph, items in groups.items():
+    for role in learn_roles:
+      for ph, items in groups.items():
         own_pos = ph.own_positions(cfg, role)
         heads = ph.active_heads(role, cfg)
         if not own_pos and not heads:
@@ -442,20 +518,32 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         else:
             tgt = m = safe = gram = None
         plans.append({
-            "phase": ph, "obs": obs, "toks": toks, "dec": dec, "heads": heads,
+            "phase": ph, "role": role, "obs": obs, "toks": toks, "dec": dec,
+            "heads": heads,
             "targets": tgt, "mask": m, "safe": safe, "grammar": gram, "n": len(items),
             "read_pos": ph.read_positions(cfg, role, device) if own_pos else None,
             "schema": phase_schema(cfg, role, ph),
             "self_mask": ph.self_mask(cfg, role, device),
         })
-    info["phases_in_curriculum"] = {
-        ("%s/%s-describes" % (p["phase"].name, "farmer" if p["phase"].informer == FARMER
-                              else "buyer") if p["phase"].swaps else p["phase"].name): p["n"]
-        for p in plans}
+
+    def _label(p):
+        name = p["phase"].name
+        if p["phase"].swaps:
+            name += "/%s-describes" % ("farmer" if p["phase"].informer == FARMER
+                                       else "buyer")
+        # One agent learning both seats has two lessons per rung; a label that
+        # merged them would hide which of the two it was short of.
+        return "%s:%s" % (name, ROLE_NAMES[p["role"]]) if len(learn_roles) > 1 else name
+
+    counts: dict[str, int] = {}
+    for p in plans:
+        counts[_label(p)] = counts.get(_label(p), 0) + p["n"]
+    info["phases_in_curriculum"] = counts
     info["own_token_targets"] = int(sum(int(p["mask"].sum()) for p in plans
                                         if p["mask"] is not None))
     if not plans:
-        info["skipped"] = "nothing in the store that this role said or decided"
+        info["skipped"] = ("nothing in the store that %s said or decided"
+                           % " or ".join(ROLE_NAMES[r] for r in learn_roles))
         return info
 
     opt = torch.optim.Adam(agent.net.parameters(), lr=bc.lr)
