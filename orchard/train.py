@@ -25,7 +25,8 @@ import torch
 
 from .agents import Agent, count_parameters
 from .bottleneck import TranscriptStore, train_newborn
-from .config import Config
+from .config import (ARCH_KEYS, Config, config_diff, config_get,
+                     config_set)
 from .economy import Economy
 from .gumbel import run_and_update_gumbel
 from .env import BUYER, FARMER, ROLE_NAMES
@@ -648,6 +649,85 @@ class Trainer:
         os.replace(tmp, path)
         return path
 
+    def _adopt_architecture(self, st: dict) -> None:
+        """Take the shape-deciding settings from the snapshot, not from the CLI.
+
+        A resume has exactly one valid reading of these: the one the weights in
+        the file were trained under. Leaving them to the command line means a
+        forgotten `--config` builds the default 48-wide model, tries to pour a
+        96-wide one into it, and prints sixty `size mismatch` lines naming
+        tensors -- none of which names the setting that is wrong. The snapshot
+        has carried the whole config since version 1; it was simply never read.
+        """
+        old = st.get("config") or {}
+        if not old:
+            return
+        changed = []
+        for key in sorted(ARCH_KEYS):
+            try:
+                was, now = config_get(old, key), config_get(self.cfg, key)
+            except (KeyError, AttributeError, TypeError):
+                continue            # a setting this snapshot predates
+            if was != now:
+                config_set(self.cfg, key, was)
+                changed.append((key, now, was))
+        if changed:
+            self.log.always("  [resume] the snapshot was trained with a different "
+                            "architecture; taking these from the file:")
+            for key, now, was in changed:
+                self.log.always("    %-26s %s -> %s" % (key, now, was))
+        # Everything else is the caller's to decide -- a resume is allowed to
+        # shrink the community or change the batch size. It is not allowed to do
+        # so *by accident*, which is exactly what adopting the architecture
+        # silently would otherwise permit: the forgotten `--config` that used to
+        # stop the run with sixty `size mismatch` lines would instead carry on at
+        # the default batch of 256 where the run had been training at 4096, and
+        # nothing would say so. So say so.
+        rest = {k: v for k, v in config_diff(old, self.cfg.to_dict()).items()
+                if k not in ARCH_KEYS}
+        if rest:
+            self.log.always("  [resume] running under settings this snapshot was "
+                            "not trained with (%d):" % len(rest))
+            for key, (was, now) in sorted(rest.items())[:12]:
+                self.log.always("    %-26s snapshot %r, here %r" % (key, was, now))
+            if len(rest) > 12:
+                self.log.always("    ... and %d more" % (len(rest) - 12))
+
+    def _check_shapes(self, st: dict) -> None:
+        """Refuse a snapshot whose weights do not fit, naming the setting.
+
+        `_adopt_architecture` fixes every difference it knows about, so anything
+        left is a field nobody listed in `ARCH_KEYS`. Printing the configuration
+        difference puts the culprit in front of whoever is resuming instead of
+        leaving them to infer it from tensor widths.
+        """
+        from .agents import make_agent
+        recs = (st.get("farmers") or []) + (st.get("buyers") or [])
+        if not recs:
+            return
+        probe = make_agent(self.cfg, agent_id=-1, role=recs[0]["role"], slot=0,
+                           generation=0, birth_episode=0, lifespan=1, device="cpu")
+        live = {k: tuple(v.shape) for k, v in probe.net.state_dict().items()}
+        saved = {k: tuple(getattr(v, "shape", ())) for k, v in recs[0]["net"].items()}
+        bad = sorted(k for k in set(live) | set(saved) if live.get(k) != saved.get(k))
+        if not bad:
+            return
+        lines = ["this snapshot's weights do not fit the configuration given.",
+                 "  %d of %d parameters differ, e.g. %s" % (
+                     len(bad), len(live),
+                     "; ".join("%s is %s in the file, %s here"
+                               % (k, saved.get(k), live.get(k)) for k in bad[:3]))]
+        diff = config_diff(st.get("config") or {}, self.cfg.to_dict())
+        if diff:
+            lines.append("  the two configurations differ in:")
+            for key, (was, now) in sorted(diff.items())[:20]:
+                lines.append("    %-32s snapshot %r, here %r" % (key, was, now))
+            if len(diff) > 20:
+                lines.append("    ... and %d more" % (len(diff) - 20))
+        lines.append("  resume with the settings the run used, e.g. "
+                     "--config configs/<the preset it started from>.json")
+        raise RuntimeError("\n".join(lines))
+
     def load_snapshot(self, path: str) -> None:
         """Continue from a snapshot, under *this* trainer's configuration."""
         from collections import Counter, defaultdict
@@ -664,6 +744,9 @@ class Trainer:
         # has both. It also loaded every agent's weights and Adam state onto the
         # card at once, which is the largest allocation a resume makes.
         st = torch.load(path, map_location="cpu", weights_only=False)
+        # Before anything reads the config: the file decides the architecture.
+        self._adopt_architecture(st)
+        self._check_shapes(st)
         self.episode = int(st["episode"])
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])

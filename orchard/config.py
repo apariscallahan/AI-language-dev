@@ -918,6 +918,50 @@ SCALE_KEYS = frozenset({
     "log.stability_probes", "log.max_agents_probed", "log.word_analysis_samples",
 })
 
+# The settings that decide the *shape* of an agent's parameters. Unlike
+# SCALE_KEYS, which a resume may legitimately change -- a smaller community, a
+# different batch size -- these have exactly one valid reading on a resume: the
+# one the weights in the file were trained under. Leaving them to the command
+# line means a forgotten ``--config`` prints sixty ``size mismatch`` lines that
+# name tensors, and not one of them names the setting that is wrong.
+ARCH_KEYS = frozenset({
+    "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
+    "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
+    "world.n_varieties", "world.max_qty", "world.n_quality",
+    "world.n_colors", "world.n_price_bins",
+    "curriculum.n_candidates",
+})
+
+
+def config_get(cfg: "Config | dict", path: str):
+    """Read a dotted path out of a Config or out of its ``to_dict`` form."""
+    obj = cfg
+    for part in path.split("."):
+        obj = obj[part] if isinstance(obj, dict) else getattr(obj, part)
+    return obj
+
+
+def config_set(cfg: "Config", path: str, value) -> None:
+    parts = path.split(".")
+    obj = cfg
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    setattr(obj, parts[-1], value)
+
+
+def config_diff(a: dict, b: dict, prefix: str = "") -> dict:
+    """{dotted path: (a's value, b's value)} for every leaf that differs."""
+    out: dict[str, tuple] = {}
+    for k in sorted(set(a) | set(b)):
+        va, vb = a.get(k), b.get(k)
+        path = "%s%s" % (prefix, k)
+        if isinstance(va, dict) and isinstance(vb, dict):
+            out.update(config_diff(va, vb, path + "."))
+        elif va != vb:
+            out[path] = (va, vb)
+    return out
+
+
 # Named experiments in configs/, and the settings each is allowed to change.
 # They are method changes by design, and are reported as such.
 EXPERIMENT_KEYS = {
