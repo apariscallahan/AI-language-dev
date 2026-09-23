@@ -1193,6 +1193,14 @@ class Trainer:
                                   info.get("phases_in_curriculum", {}).items()),
                         info["teacher_generations"], acc(info["token_accuracy"]),
                         info.get("own_token_targets", 0), acc(info["decision_accuracy"])))
+            # The other half of the bottleneck, and the one that selects for a
+            # grammar: a learner shown every meaning can memorise the table as
+            # faithfully as its parents. Whether it fired belongs in the log.
+            if info.get("withheld_meanings"):
+                self.log("          held back %d meanings from this learner "
+                         "(%.0f%% of its curriculum) -- it has to say them anyway"
+                         % (info["withheld_meanings"],
+                            100.0 * float(info.get("withheld_share") or 0.0)))
         else:
             self.log("          bottleneck: %s" % info.get("skipped", "disabled"))
         sr = probe.get("success_rate")
@@ -1725,6 +1733,17 @@ class Trainer:
             zs += " (per field %s vs %s = %s of the headroom)" % (
                 f(hf, "%.2f"), f(ev.get("seen_fields"), "%.2f"),
                 f(ev.get("holdout_field_ratio"), "%.2f"))
+            # Which field, not just how much: the reserved set is a Latin square,
+            # so a held-out round asks for the one quality its (fruit, colour)
+            # pair never showed. One field can sit near zero for that reason
+            # while the other two generalise, and the mean alone cannot say so.
+            acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
+            if acc:
+                names = ("fruit", "colour", "quality")
+                zs += " [" + ", ".join(
+                    "%s %s/%s" % (n, f(a, "%.2f"),
+                                  f(base[i] if base and i < len(base) else None, "%.2f"))
+                    for i, (n, a) in enumerate(zip(names, acc))) + "]"
         per_field = ""
         fields = ev.get("request_fields_intact")
         if fields:

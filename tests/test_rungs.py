@@ -2152,3 +2152,47 @@ class TestASnapshotDecidesItsOwnArchitecture(unittest.TestCase):
             self.assertIn("not trained with", joined)
             self.assertIn("train.batch_size", joined)
             tr2.close()
+
+
+# ==========================================================================
+class TestTheHoldoutAsksForTheOneQualityItRuledOut(unittest.TestCase):
+    """The reserved set is a Latin square: for every (fruit, colour) pair
+    exactly one quality is withheld, and a held-out round asks for precisely
+    that value. A listener that has fit the training distribution has learned
+    that value cannot occur there, so one field can sit near zero for a reason
+    that has nothing to do with whether the code is compositional -- and the
+    mean over three fields cannot say which."""
+
+    def test_every_cell_withholds_exactly_one_quality(self):
+        from collections import defaultdict
+
+        from orchard.world import ComboHoldout
+        w = Config().world
+        h = ComboHoldout(w, w.holdout_combo_frac, w.holdout_seed)
+        cells = defaultdict(list)
+        for (f, c, q) in h.held:
+            cells[(f, c)].append(q)
+        self.assertEqual(len(cells), w.n_varieties * w.n_colors)
+        self.assertTrue(all(len(v) == 1 for v in cells.values()))
+
+    def test_one_dead_field_pulls_the_conjunction_to_zero_not_the_mean(self):
+        """Why the whole-round number cannot be read as a productivity failure:
+        two fields generalising beautifully and one at the floor still scores
+        essentially nothing as a conjunction."""
+        fruit, colour, quality = 0.95, 0.80, 0.02
+        mean = (fruit + colour + quality) / 3
+        joint = (fruit * colour * quality) ** 2      # both sides, three fields
+        self.assertGreater(mean, 0.55)
+        self.assertLess(joint, 0.001)                # prints as 0.000
+
+    def test_the_breakdown_is_carried_out_of_the_evaluation(self):
+        vec = M._report_field_vec({"farmer_report_fields": [0.9, 0.8, 0.0],
+                                   "buyer_report_fields": [1.0, 0.8, 0.1]})
+        self.assertEqual(len(vec), 3)
+        self.assertAlmostEqual(vec[0], 0.95, places=6)
+        self.assertAlmostEqual(vec[1], 0.80, places=6)
+        self.assertAlmostEqual(vec[2], 0.05, places=6)
+
+    def test_a_round_that_reports_no_fields_has_no_breakdown(self):
+        self.assertIsNone(M._report_field_vec({"success_rate": 0.5}))
+        self.assertIsNone(M._report_field_vec(None))
