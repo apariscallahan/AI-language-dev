@@ -1241,7 +1241,11 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             # Headroom over what a message-blind guesser gets, so a memorised
             # code reads 0 rather than the base rate it would score anyway.
             head = out["seen_fields"] - s_floor
-            if head > 1e-9:
+            # A ratio between two numbers that are both at the floor is noise,
+            # and noise reads 1.00 as often as it reads 0.00. Below a real
+            # margin there is nothing to take a ratio of, so the gate is left
+            # to fall back on the whole-round number and fail.
+            if head > 0.05:
                 out["holdout_field_ratio"] = max(0.0, min(
                     1.0, (out["holdout_fields"] - h_floor) / head))
     # Each kind of round in the rung's mixture, scored on its own. A rung that

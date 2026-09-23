@@ -676,6 +676,14 @@ class Trainer:
                             "architecture; taking these from the file:")
             for key, now, was in changed:
                 self.log.always("    %-26s %s -> %s" % (key, now, was))
+            # The world, the batched sampler and the lineup were all built in
+            # `__init__` from the settings this just changed. `model.*` only
+            # shapes the agents, but a different fruit count or price-bin count
+            # means the objects drawing the scenarios are now describing a world
+            # nobody is training in -- including the holdout, which is derived
+            # from the field sizes and is the productivity test.
+            if any(not k.startswith("model.") for k, _, _ in changed):
+                self._rebuild_world()
         # Everything else is the caller's to decide -- a resume is allowed to
         # shrink the community or change the batch size. It is not allowed to do
         # so *by accident*, which is exactly what adopting the architecture
@@ -692,6 +700,25 @@ class Trainer:
                 self.log.always("    %-26s snapshot %r, here %r" % (key, was, now))
             if len(rest) > 12:
                 self.log.always("    ... and %d more" % (len(rest) - 12))
+
+    def _rebuild_world(self) -> None:
+        """Rebuild everything `__init__` derived from the settings just adopted."""
+        from .batched import TensorWorld
+        cfg, dev = self.cfg, self.device
+        self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
+        g = torch.Generator(device=dev)
+        g.manual_seed(cfg.train.seed + 11)
+        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
+        self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
+                               n_farms=cfg.population.n_farmers)
+        self.stability = StabilityTracker(cfg, self.world, cfg.log.stability_probes,
+                                          seed=cfg.train.seed + 4)
+        self.forms = (FormTracker(cfg, self.world)
+                      if cfg.log.track_form_survival else None)
+        if cfg.curriculum.enabled:
+            g = torch.Generator(device=dev)
+            g.manual_seed(cfg.train.seed + 13)
+            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g)
 
     def _check_shapes(self, st: dict) -> None:
         """Refuse a snapshot whose weights do not fit, naming the setting.

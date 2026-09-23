@@ -2196,3 +2196,15 @@ class TestTheHoldoutAsksForTheOneQualityItRuledOut(unittest.TestCase):
     def test_a_round_that_reports_no_fields_has_no_breakdown(self):
         self.assertIsNone(M._report_field_vec({"success_rate": 0.5}))
         self.assertIsNone(M._report_field_vec(None))
+
+    def test_a_ratio_of_two_numbers_at_the_floor_is_not_a_pass(self):
+        """Both at chance is not "generalises perfectly": it is no signal at
+        all, and noise reads 1.00 as readily as 0.00."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        ev = _mutual_evidence(cfg, holdout_fields=0.262, seen_fields=0.259,
+                              holdout_success=0.0, seen_success=0.0,
+                              holdout_field_ratio=float("nan"))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        self.assertFalse(
+            checks["describes combinations it never trained on"]["met"])

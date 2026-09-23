@@ -295,6 +295,82 @@ def compare(paths: list[str], out: str) -> int:
 
 
 # --------------------------------------------------------------------------
+def holdout_report(cfg: Config, path: str) -> int:
+    """Which field generalises to combinations nobody trained on, field by field.
+
+    The promotion gate reports one number -- the mean over (fruit, colour,
+    quality) -- and at `mutual` that mean is systematically pessimistic. The
+    reserved set is a Latin square: exactly one quality is withheld from every
+    (fruit, colour) pair, so a held-out round asks for precisely the quality
+    that pair never showed, and a listener that has fit the training
+    distribution is pushed away from it. That field cannot be got right, and it
+    is averaged in with two that can.
+
+    So this prints the breakdown from a finished snapshot, for a run that has
+    already promoted past the only rungs where the gate is evaluated.
+    """
+    import random as _random
+
+    from .metrics import phase_evidence
+    from .train import Trainer
+
+    # Score it under the settings it was trained with, not under this command
+    # line: the report is about the snapshot, and the holdout is derived from
+    # the world's field sizes.
+    saved = (torch.load(path, map_location="cpu", weights_only=False)
+             .get("config"))
+    if saved:
+        keep = cfg.train.device
+        cfg = Config.from_dict(saved, allow_legacy=True)
+        if keep and keep != "auto":
+            cfg.train.device = keep
+    out = os.path.join(os.path.dirname(os.path.abspath(path)), "_holdout_report")
+    trainer = Trainer(cfg, out, quiet=True)
+    trainer.load_snapshot(path)
+    phase = trainer.curriculum.phase
+    if not getattr(phase, "whole", False):
+        # The gate runs at `name-all` and `mutual` only; a later snapshot has to
+        # be scored on the last rung that measured this.
+        cand = [p for p in trainer.curriculum.phases if getattr(p, "whole", False)]
+        if not cand:
+            print("no rung in this ladder measures held-out combinations")
+            return 1
+        phase = cand[-1]
+        print("this snapshot stopped on a rung that does not measure held-out "
+              "combinations; scoring it on `%s`, the last one that does\n" % phase.name)
+    ev = phase_evidence(
+        cfg, trainer.pop, trainer.world, phase,
+        sampler_for=trainer.phase_sampler, n_eval=cfg.log.zeroshot_episodes,
+        n_topsim=cfg.log.topsim_samples, n_semantics=cfg.log.topsim_samples,
+        chance=trainer.chance_for(phase), device=cfg.train.device,
+        rng=_random.Random(0), holdout_sampler_for=trainer.holdout_sampler,
+        holdout_floor_for=trainer.holdout_floor)
+    acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
+    floors = trainer.holdout_floor(phase) or (float("nan"), float("nan"))
+    print("rung %s, %d held-out combinations of %d"
+          % (phase.name, len(trainer.referential_world.holdout.held),
+             cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
+    print("%-10s %8s %8s   %s" % ("field", "held-out", "trained", "")) 
+    for i, name in enumerate(("fruit", "colour", "quality")):
+        if not acc or i >= len(acc):
+            break
+        b = base[i] if base and i < len(base) else float("nan")
+        note = ""
+        if acc[i] < floors[0]:
+            note = "  <- below the %.2f a message-blind guesser gets" % floors[0]
+        print("%-10s %8.3f %8.3f%s" % (name, acc[i], b, note))
+    print()
+    print("mean       %8.3f %8.3f   = %.3f of the headroom over %.2f/%.2f"
+          % (ev.get("holdout_fields", float("nan")),
+             ev.get("seen_fields", float("nan")),
+             ev.get("holdout_field_ratio", float("nan")), floors[0], floors[1]))
+    print("whole round%8.3f %8.3f   (all three fields, both sides)"
+          % (ev.get("holdout_success", float("nan")),
+             ev.get("seen_success", float("nan"))))
+    trainer.close()
+    return 0
+
+
 def list_snapshots(where: str) -> int:
     """What is in each snapshot, and is it safe to resume from?
 
@@ -369,6 +445,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="continue from a snapshot (runs/<name>/snapshots/*.pt) under "
                         "the configuration given here; rung, weights, usage and the "
                         "transcript store all carry over")
+    p.add_argument("--holdout-report", type=str, default=None, metavar="SNAPSHOT",
+                   help="score one snapshot on the held-out combinations, field "
+                        "by field, and exit -- which of fruit, colour and quality "
+                        "generalises to combinations nobody trained on")
     p.add_argument("--benchmark", nargs="?", type=int, const=12, default=None,
                    metavar="N",
                    help="time N batches on this machine and print what the "
@@ -381,6 +461,8 @@ def main(argv: list[str] | None = None) -> int:
         return list_snapshots(args.snapshots)
 
     cfg = config_from_args(args)
+    if args.holdout_report:
+        return holdout_report(cfg, args.holdout_report)
     if args.smoke:
         return smoke(cfg)
     if args.benchmark:
