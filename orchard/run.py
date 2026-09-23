@@ -327,11 +327,12 @@ def holdout_report(cfg: Config, path: str) -> int:
     out = os.path.join(os.path.dirname(os.path.abspath(path)), "_holdout_report")
     trainer = Trainer(cfg, out, quiet=True)
     trainer.load_snapshot(path)
+    from .curriculum import COMBO_FIELDS, measures_holdout
     phase = trainer.curriculum.phase
-    if not getattr(phase, "whole", False):
-        # The gate runs at `name-all` and `mutual` only; a later snapshot has to
-        # be scored on the last rung that measured this.
-        cand = [p for p in trainer.curriculum.phases if getattr(p, "whole", False)]
+    if not measures_holdout(phase):
+        # The gate runs on the rungs that describe or report a whole lot; a
+        # snapshot from any other has to be scored on the last one that did.
+        cand = [p for p in trainer.curriculum.phases if measures_holdout(p)]
         if not cand:
             print("no rung in this ladder measures held-out combinations")
             return 1
@@ -346,40 +347,52 @@ def holdout_report(cfg: Config, path: str) -> int:
         rng=_random.Random(0), holdout_sampler_for=trainer.holdout_sampler,
         holdout_floor_for=trainer.holdout_floor)
     acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
-    floors = trainer.holdout_floor(phase) or (float("nan"), float("nan"))
+    names = list(ev.get("holdout_field_names") or COMBO_FIELDS)
+    floors = trainer.holdout_floor(phase) or ([], [])
+
+    def floor_at(i, which):
+        row = floors[which]
+        return float(row[i]) if i < len(row) else float("nan")
+
+    def floor_mean(which):
+        row = [float(x) for x in floors[which]]
+        return sum(row) / len(row) if row else float("nan")
     print("rung %s, %d held-out combinations of %d"
           % (phase.name, len(trainer.referential_world.holdout.held),
              cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
     each = ev.get("holdout_field_ratios") or []
     print("%-11s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
     prod_h = prod_s = 1.0
-    for i, name in enumerate(("fruit", "colour", "quality")):
+    for i, name in enumerate(names):
         if not acc or i >= len(acc):
             break
         b = base[i] if base and i < len(base) else float("nan")
         prod_h *= acc[i]
         prod_s *= b
-        r = "%9.3f" % each[i] if i < len(each) else "      n/a"
+        r = ("%9.3f" % each[i] if i < len(each) and each[i] == each[i]
+             else "      n/a")
         note = ""
-        if acc[i] < floors[0]:
-            note = "  <- below the %.2f a message-blind guesser gets" % floors[0]
+        if acc[i] < floor_at(i, 0):
+            note = ("  <- below the %.2f a message-blind guesser gets"
+                    % floor_at(i, 0))
         print("%-11s %8.3f %8.3f%s%s" % (name, acc[i], b, r, note))
     print()
-    print("%-11s %8.3f %8.3f %9.3f   each field once, over %.2f/%.2f"
+    print("%-11s %8.3f %8.3f %9.3f   each field once, over floors of %.2f/%.2f"
           % ("mean", ev.get("holdout_fields", float("nan")),
              ev.get("seen_fields", float("nan")),
-             ev.get("holdout_field_ratio", float("nan")), floors[0], floors[1]))
+             ev.get("holdout_field_ratio", float("nan")),
+             floor_mean(0), floor_mean(1)))
     print()
     # Independent fields would multiply. Where they do not, the code is right
     # about each field on its own and wrong about them together -- which is what
     # a Latin-square holdout produces: get the fruit and the colour right and
     # the training distribution has ruled out the one quality that is the answer.
-    print("%-11s %8.3f %8.3f   (one side, all three at once)"
+    print("%-11s %8.3f %8.3f   (one side, every field at once)"
           % ("conjunction", ev.get("holdout_side", float("nan")),
              ev.get("seen_side", float("nan"))))
-    print("%-11s %8.3f %8.3f   if the three fields were independent"
+    print("%-11s %8.3f %8.3f   if the combination fields were independent"
           % ("  expected", prod_h, prod_s))
-    print("%-11s %8.3f %8.3f   (both sides, all three)"
+    print("%-11s %8.3f %8.3f   (both sides, every field)"
           % ("whole round", ev.get("holdout_success", float("nan")),
              ev.get("seen_success", float("nan"))))
     trainer.close()

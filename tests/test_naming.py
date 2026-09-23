@@ -102,47 +102,31 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
         self.assertTrue(growth_applies(cfg, phase_named(cfg, "mutual")))
         self.assertTrue(costs_apply(cfg, phase_named(cfg, "market")))
 
-<<<<<<< HEAD
-    def test_agreement_arrives_once_every_word_exists(self):
-        """The convention bonus is paid from the last naming rung on.
-
-        The founders keep a dialect each through the single-field rungs, so
-        something has to pay them -- and then the community that arrives at
-        `mutual` -- to settle on one word per meaning. It must not wait for the
-        costs, which are a different pressure and are ramped in later.
-=======
     def test_agreement_arrives_at_the_first_rung_that_invents_no_word(self):
         """The convention bonus follows the same rule as the costs, one rung up.
 
         A pressure to reuse a word is off while the rung still has to invent
-        one, and on at the first rung that only reuses them. For the costs that
-        is `offer`; for agreement it is `name-all`, which invents nothing --
-        fruit, colour and quality were each invented and promoted below it, and
-        its own job is to say three of them at once.
+        one, and on at the first rung that only reuses them. For agreement that
+        is `name-all`, which invents nothing -- every field was invented and
+        promoted below it, and its own job is to say all of them at once. It
+        must not wait for the costs, which are a different pressure and are
+        ramped in a rung later.
 
-        It used to wait for the community at `mutual`, which left four rungs in
-        which nothing paid a speaker for saying the same thing twice. The run
-        that was measured there had two founders sharing no form at all
+        It used to wait for the community at `mutual`, which left the naming
+        rungs with nothing paying a speaker for saying the same thing twice.
+        The run that was measured there had two founders sharing no form at all
         (within-role coherence 0.15-0.17) and a speaker so unsure of its own
         words that sampled play showed 686 of them over a 64-meaning world.
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         """
-        from orchard.curriculum import convention_applies, costs_apply
+        from orchard.curriculum import convention_applies, costs_apply, growth_applies
         cfg = Config()
         first = lambda f: next(p for p in ladder(cfg) if f(cfg, p))
-<<<<<<< HEAD
         self.assertEqual(first(convention_applies).name, "name-all")
         self.assertLessEqual(first(convention_applies).index, first(growth_applies).index)
         self.assertLess(first(convention_applies).index, first(costs_apply).index,
                         "agreement waits for the costs again")
         for p in ladder(cfg):
             if p.referential and not p.whole:
-=======
-        self.assertLess(first(convention_applies).index, first(costs_apply).index,
-                        "agreement waits for the costs again")
-        for p in ladder(cfg):
-            if p.naming and p.primary < 3:
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
                 self.assertFalse(convention_applies(cfg, p),
                                  "%s pays for agreeing on a word it is still "
                                  "inventing" % p.name)
@@ -151,21 +135,20 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
                         "job is to reuse three of them")
 
     def test_the_costs_are_a_per_rung_rule_not_a_threshold(self):
-        """`ask-qty` and `quote` sit above `mutual` and still have a word to
-        invent, so no single threshold gets this right: at `offer` it spares
-        them but also spares `mutual` and `order`, which invent nothing; at
-        `mutual` it charges them while they are still naming quantity and price.
+        """`Phase.invents` decides, with `costs_from_rung` as a floor. With every
+        field named below `mutual` the two agree -- off on the naming rungs, on
+        from `mutual` up -- but the rule is stated per rung, because the earlier
+        ladder had trading rungs (`ask-qty`, `quote`) that still named a field,
+        and no threshold could spare those without sparing `mutual`.
         """
         from orchard.curriculum import costs_apply
         cfg = Config()
-        want = {"name-fruit": False, "name-color": False, "name-quality": False,
-                "name-all": False, "mutual": True, "ask-qty": False,
-                "order": True, "quote": False, "offer": True, "judge": True,
-                "haggle": True, "bargain": True, "market": True}
         for p in ladder(cfg):
-            self.assertEqual(costs_apply(cfg, p), want[p.name],
+            want = not p.referential
+            self.assertEqual(costs_apply(cfg, p), want,
                              "%s: costs %s, expected %s"
-                             % (p.name, costs_apply(cfg, p), want[p.name]))
+                             % (p.name, costs_apply(cfg, p), want))
+            self.assertEqual(p.invents, p.referential)
         # and the floor still holds them off entirely if a run wants that
         cfg.reward.costs_from_rung = "market"
         self.assertFalse(costs_apply(cfg, phase_named(cfg, "mutual")))
@@ -212,9 +195,12 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
         split_3, room_3 = cost_of([[1], [2], [3]])
         self.assertGreaterEqual(room_2, meanings)
         self.assertGreaterEqual(room_3, meanings)
-        self.assertGreater(fused_2, split_2 * 2,
-                           "a fused two-atom label is not meaningfully dearer "
-                           "than two short words (%.4f vs %.4f)" % (fused_2, split_2))
+        # The symbol cost is neutral between `a-b` and `a b` (three symbols
+        # either way) and only dilutes this ratio, so it has to stay small
+        # enough for a fused label to cost at least twice its split form.
+        self.assertGreaterEqual(fused_2, split_2 * 2 - 1e-6,
+                                "a fused two-atom label is not meaningfully dearer "
+                                "than two short words (%.4f vs %.4f)" % (fused_2, split_2))
         self.assertGreater(fused_3, split_3 * 2,
                            "a fused three-atom label is not meaningfully dearer "
                            "than three short words (%.4f vs %.4f)" % (fused_3, split_3))
@@ -474,11 +460,12 @@ class TestTheCostsWaitForTheChannel(unittest.TestCase):
 
     def test_a_rung_that_invents_still_pays_nothing_however_well_it_does(self):
         import tempfile
-        cfg, tr = self._trainer(tempfile.mkdtemp(), rung="quote")
+        cfg, tr = self._trainer(tempfile.mkdtemp(), rung="name-all")
         for _ in range(3):
             self._feed(tr, 1.0)
         self.assertEqual(tr.cost_gate, 0.0,
-                         "`quote` is still naming price and was charged anyway")
+                         "`name-all` is still inventing the whole-lot utterance "
+                         "and was charged anyway")
         tr.close()
 
     def test_the_old_step_gate_is_still_reachable(self):

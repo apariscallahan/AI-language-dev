@@ -219,16 +219,15 @@ class Phase:
         """Does this rung still have a *word* to invent, rather than reuse?
 
         The lineup rungs each invent their field's words, and `name-all` has to
-        find the three-word utterance where one used to do. Of the request
-        rungs, only the two that introduce a field nothing below them names --
-        `ask-qty` and `quote` -- invent anything; the rest recombine what
-        exists. This is what decides whether the speaker pays for length and
-        for novelty (:func:`costs_apply`), because a price on a word is a
-        pressure on a word that exists: charged while one is still being
-        invented, the cheapest way to be brief is to say the same short
-        nothing.
+        find the five-word utterance where one used to do. Every rung from
+        `mutual` up recombines what exists: a lot is described with the words
+        the naming rungs built, whether it is held, asked for or offered. This
+        is what decides whether the speaker pays for length and for novelty
+        (:func:`costs_apply`), because a price on a word is a pressure on a
+        word that exists: charged while one is still being invented, the
+        cheapest way to be brief is to say the same short nothing.
         """
-        return self.referential or (self.order and self.asks_first in ("quantity", "price"))
+        return self.referential
 
     @property
     def whole(self) -> bool:
@@ -449,14 +448,12 @@ def hindsight_applies(cfg: Config, phase: Phase) -> bool:
 def costs_apply(cfg: Config, phase: Phase) -> bool:
     """Does the speaker pay for what it says in this rung?
 
-    Two conditions, because the rule is per-rung and a threshold cannot say it.
-    Not before ``reward.costs_from_rung`` -- a floor, so a run can hold them off
-    entirely -- and not on a rung that still has a word to invent
-    (:attr:`Phase.invents`). Between those, `ask-qty` and `quote` sit above the
-    floor and are still exempt, which a threshold alone would get wrong in one
-    direction or the other: set at `offer` it spares them but also spares
-    `mutual` and `order`, which invent nothing; set at `mutual` it charges them
-    while they are still naming quantity and price.
+    Two conditions, because the rule is per rung and a threshold only happens
+    to say it. Not before ``reward.costs_from_rung`` -- a floor, so a run can
+    hold them off entirely -- and not on a rung that still has a word to invent
+    (:attr:`Phase.invents`). With every field named below `mutual` the two
+    agree; the earlier ladder had trading rungs that still named quantity and
+    price, and no threshold could spare those without sparing `mutual`.
     """
     if phase.index < phase_named(cfg, cfg.reward.costs_from_rung).index:
         return False
@@ -628,6 +625,19 @@ def _describe(names: Sequence[str]) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def measures_holdout(phase: Phase) -> bool:
+    """Does this rung's gate ask about combinations nobody ever trained on?
+
+    The lineup rung that names a whole lot, and every report rung whose reports
+    include the fields a reserved combination is made of (`mutual`, `order`,
+    `offer`, `judge`). A rung that varies one field is not asked: it has not
+    been taught the rest.
+    """
+    if phase.referential:
+        return bool(phase.whole)
+    return any(n in COMBO_FIELDS for r in (FARMER, BUYER) for n in phase.report_names(r))
+
+
 def evaluate_report_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
                          updates_in_phase: int, rule: "Promotion"
                          ) -> tuple[bool, dict[str, Any]]:
@@ -715,14 +725,23 @@ def evaluate_report_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     # The productivity gate, per field: a combination nobody ever trained on has
     # to be reported nearly as well as the trained ones. Measured on the three
     # fields a combination is made of; quantity and price are never held out.
-    if any(n in COMBO_FIELDS for r in (FARMER, BUYER) for n in phase.report_names(r)):
+    # Each field's ratio is taken over the headroom above a message-blind
+    # guesser and the ratios are averaged -- never a ratio of means, which
+    # weights each field by its headroom and lets the one the language learned
+    # best carry two it did not -- and each is named, so the log says which.
+    if measures_holdout(phase):
         ratio = _num(ev.get("holdout_field_ratio"))
-        hs, seen = _num(ev.get("holdout_field_success")), _num(ev.get("seen_field_success"))
-        checks["reports combinations it never trained on"] = (
+        hs = _num(ev.get("holdout_fields", ev.get("holdout_field_success")))
+        seen = _num(ev.get("seen_fields", ev.get("seen_field_success")))
+        each = ev.get("holdout_field_ratios") or []
+        names = tuple(ev.get("holdout_field_names") or COMBO_FIELDS)
+        per = (" [" + ", ".join("%s %s" % (n, _fmt(_num(r))) for n, r in zip(names, each))
+               + "]") if each else ""
+        checks["describes combinations it never trained on"] = (
             ratio == ratio and ratio >= c.min_holdout_ratio,
-            "held-out %s vs seen %s per field = %s of the headroom, need %.2f "
+            "held-out %s vs seen %s per field = %s of the headroom%s, need %.2f "
             "(the whole round: %s vs %s)"
-            % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
+            % (_fmt(hs), _fmt(seen), _fmt(ratio), per, c.min_holdout_ratio,
                _fmt(_num(ev.get("holdout_success"))), _fmt(_num(ev.get("seen_success")))))
 
     passed = all(v[0] for v in checks.values())
@@ -828,9 +847,12 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         chance = _num(ev.get("chance"))
         above_chance = chance != chance or (hs == hs and hs >= k * chance)
         # Where the rung scores a round as a conjunction, judge the ratio on the
-        # fields, not on the conjunction. `mutual` needs three fields right on
-        # each of two novel meanings, so per-field accuracy enters this number
-        # to the sixth power: a code generalising at 0.73 per field against 0.80
+        # fields, not on the conjunction (the report rungs do, in
+        # `evaluate_report_rung`; a lineup rung scores one K-way choice and has
+        # no exponent to remove, so this branch is normally the joint one).
+        # `mutual` needed three fields right on each of two novel meanings, so
+        # per-field accuracy entered this number to the sixth power -- five
+        # fields make it the tenth: a code generalising at 0.73 per field against 0.80
         # trained -- a per-field ratio of 0.91, plainly productive -- scores
         # 0.15 against 0.26 as a whole round, a joint ratio of 0.58 that fails
         # a bar it should clear; and 0.60 per field reads 0.05/0.26 = 0.18,
@@ -844,8 +866,8 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
             # Per field, named: one field carrying two weak ones is exactly what
             # this gate must not let through, and an average cannot show it.
             each = ev.get("holdout_field_ratios") or []
-            names = ("fruit", "colour", "quality")
-            per = (" [" + ", ".join("%s %s" % (n, _fmt(r))
+            names = tuple(ev.get("holdout_field_names") or COMBO_FIELDS)
+            per = (" [" + ", ".join("%s %s" % (n, _fmt(_num(r)))
                                     for n, r in zip(names, each)) + "]") if each else ""
             checks["describes combinations it never trained on"] = (
                 f_ratio >= c.min_holdout_ratio,

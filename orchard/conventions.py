@@ -235,27 +235,13 @@ class PopulationUsage:
         return firsts, words
 
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
-<<<<<<< HEAD
-        """One convention per (kind of meaning, the meaning, what was asked about).
+        """(meaning kind, what was asked, what it is about) per episode.
 
         A lot asked about for its colour alone is not the same meaning as the
         whole lot: the population's form for the first is one word and for the
         second is several, so the two must not be folded into one modal form.
-        A buyer's request in the market carries "the whole lot" in the same slot,
-        so it shares a convention with the `name-all` describer's lot.
-        """
-        from .curriculum import phase_schema
-        n = n_real_fields(self.cfg, role, phase)
-        kind = phase.meaning_kind(role)
-        schema = phase_schema(self.cfg, role, phase)
-        q_at = next((i for i, k in enumerate(schema) if k == K_FIELD), None)
-        rows = obs[:, :n].tolist()
-        if q_at is None:
-            return [(kind,) + tuple(r) for r in rows]
-        qs = obs[:, q_at].tolist()
-        return [(kind,) + tuple(r) + (int(q),) for r, q in zip(rows, qs)]
-=======
-        """(meaning kind, what was asked, what it is about) per episode.
+        A buyer's request in the market carries "the whole lot" in the same
+        slot, so it shares a convention with the `name-all` describer's lot.
 
         One gather and one transfer: ``obs`` is on the training device, and
         bringing the query slots across separately would be a second
@@ -264,11 +250,10 @@ class PopulationUsage:
         kind = phase.meaning_kind(role)
         n = n_real_fields(self.cfg, role, phase)
         q = query_slots(self.cfg, role, phase)
-        # A slice is a view; gathering columns copies. The trading rungs have no
-        # query slot, so they keep the slice and stay exactly as they were.
+        # A slice is a view; gathering columns copies. The farmer's barn has no
+        # query slot, so it keeps the slice.
         sel = obs[:, :n] if not q else obs[:, q + list(range(n))]
         return [(kind,) + tuple(r) for r in sel.tolist()]
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
@@ -323,12 +308,8 @@ class PopulationUsage:
                 kind = phase.meaning_kind(role)
                 need = R.convention_min_support / max(self.scale, 1e-12)
                 est = [k for k, v in self.form_total.items() if k[0] == kind and v >= need]
-<<<<<<< HEAD
-                others = self._rng.sample(est, min(R.convention_contrast_samples, len(est)))
-=======
                 n_contrast = max(1, int(R.convention_contrast_samples))
                 others = self._rng.sample(est, min(n_contrast, len(est)))
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
                 other_modal = [(k, self.modal(k)) for k in others]
                 other_modal = [(k, m) for k, m in other_modal if m]
                 other_keys = {ko: mo for ko, mo in other_modal}

@@ -37,7 +37,7 @@ from orchard.curriculum import (ASK_ALL, H_ACCEPT, H_BELIEF, H_BELIEF_COLOR, H_C
                                 hindsight_targets, resolve_referential,
                                 ladder, phase_named, resolve_mutual, resolve_reports,
                                 rung_budget)
-from orchard.world import LOT_FIELDS, N_LOT_FIELDS, lot_spans
+from orchard.world import LOT_FIELDS, N_LOT_FIELDS, lot_spans, n_obs_slots
 from orchard.env import BUYER, FARMER
 from orchard.gumbel import run_and_update_gumbel
 from orchard.lexicon import cross_role_overlap, live_encoding, word_stats
@@ -1715,10 +1715,12 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
     the only rung judged on message structure, and it is also the rung that
     mixes queries most -- 70% whole things, 30% single fields -- so 30% of its
     probes asked a perfect describer for one field and then scored its one-word
-    answer against all three. A flawless, fully compositional, noise-free
+    answer against all five. A flawless, fully compositional, noise-free
     speaker measured that way reached field coverage 0.33-0.49 against a 0.30
-    bar and topsim 0.32 against its own shuffled null. A real run cannot beat
-    a perfect one, so the rung could not be left.
+    bar and topsim 0.32 against its own shuffled null -- and once a lot had
+    five fields, whole-message coverage read 0.00 at 100 probes however the
+    probes were asked, because every lot had its own message. A real run
+    cannot beat a perfect one, so the rung could not be left.
     """
 
     def _cfg(self):
@@ -1730,14 +1732,20 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
         """Name exactly the field(s) asked for, one short word each."""
         from orchard.curriculum import ASK_ALL
         sp = cfg.channel.space_id
-        block = [0, cfg.world.n_varieties,
-                 cfg.world.n_varieties + cfg.world.n_colors]
+        spans = lot_spans(cfg.world)
+        block = [sum(spans[:i]) for i in range(N_LOT_FIELDS)]
+        assert sum(spans) <= cfg.channel.atomic_vocab, "one atom per field value"
 
         def speak(m):
-            query = m[3]
+            query = m[N_LOT_FIELDS]
             if query != ASK_ALL:
                 return [block[query] + m[query]]
-            return [block[0] + m[0], sp, block[1] + m[1], sp, block[2] + m[2]]
+            out = []
+            for i in range(N_LOT_FIELDS):
+                if i:
+                    out.append(sp)
+                out.append(block[i] + m[i])
+            return out
         return speak
 
     def _measure(self, cfg, phase, n):
@@ -1779,11 +1787,13 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
                     % (phase.name, gap, n, c.min_topsim_over_null))
 
     def test_the_bars_do_not_move_with_the_probe_count(self):
-        """Coverage is a plug-in estimate; its *ceiling* must not follow the sample.
+        """Coverage's *ceiling* must not follow the sample.
 
-        Normalised by H(field) it did: the same perfect code read 0.50 over 100
-        probes and 0.93 over 800, so the light promotion check (half the probes)
-        was strictly harder to pass than the checkpoint one.
+        As whole-message information it did: the same perfect code read 0.50
+        over 100 probes and 0.93 over 800 on the three-field world, and on the
+        five-field one 0.00 at 100 and 0.84 at 400, so the light promotion
+        check (half the probes) was strictly harder to pass than the checkpoint
+        one. Read off the pieces of a message, cross-validated, it is steady.
         """
         cfg = self._cfg()
         phase = phase_named(cfg, "name-all")
@@ -1823,7 +1833,8 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
             if phase.referential:
                 self.assertEqual(q, phase.primary,
                                  "%s probes a kind it is not promoted on" % phase.name)
-            asked = {m[3] for m in M.tuple_meanings(cfg, 40, seed=1, phase=view, query=q)}
+            asked = {m[N_LOT_FIELDS]
+                     for m in M.tuple_meanings(cfg, 40, seed=1, phase=view, query=q)}
             self.assertEqual(asked, {q},
                              "%s probed a mixture: %s" % (phase.name, sorted(asked)))
         self.assertEqual(M.probe_query(phase_named(cfg, "name-all").views()[0]), ASK_ALL)
@@ -1847,11 +1858,11 @@ class TestAPerfectSpeakerPasses(unittest.TestCase):
                     cfg, view.informer)
             probe = M.tuple_meanings(cfg, 8, seed=2, phase=view,
                                      query=M.probe_query(view))
-            played = set(real[:, 3].tolist())
-            self.assertIn(probe[0][3], played,
+            played = set(real[:, N_LOT_FIELDS].tolist())
+            self.assertIn(probe[0][N_LOT_FIELDS], played,
                           "%s probes with query slot %d, which the rung never "
                           "puts there (it plays %s)"
-                          % (phase.name, probe[0][3], sorted(played)))
+                          % (phase.name, probe[0][N_LOT_FIELDS], sorted(played)))
 
 
 class TestTheConventionTermCanAffordToRun(unittest.TestCase):
@@ -1966,9 +1977,9 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
         c = cfg.channel
         u = PopulationUsage(cfg)
         phase = phase_named(cfg, "name-all")
-        thing = [1, 2, 0]
-        whole = torch.tensor([thing + [3] + [0] * 8])      # ASK_ALL
-        fruit = torch.tensor([thing + [0] + [0] * 8])      # just the fruit
+        thing = [1, 2, 0, 4, 1]
+        whole = torch.tensor([thing + [ASK_ALL] + [0] * 8])      # the whole lot
+        fruit = torch.tensor([thing + [0] + [0] * 8])            # just the fruit
         keys_whole = u._keys(phase, FARMER, whole)
         keys_fruit = u._keys(phase, FARMER, fruit)
         self.assertNotEqual(keys_whole, keys_fruit,
@@ -1987,8 +1998,9 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
         cfg = cfg_small()
         u = PopulationUsage(cfg)
         phase = phase_named(cfg, "name-all")
-        obs = torch.tensor([[1, 2, 0, 3] + [0] * 8])
-        self.assertEqual(u._keys(phase, FARMER, obs)[0], ("tuple", 3, 1, 2, 0))
+        obs = torch.tensor([[1, 2, 0, 4, 1, ASK_ALL] + [0] * 8])
+        self.assertEqual(u._keys(phase, FARMER, obs)[0],
+                         ("tuple", ASK_ALL, 1, 2, 0, 4, 1))
 
     def test_a_resumed_run_forgets_conventions_in_the_older_key_format(self):
         """Snapshots written before the key carried the question are shorter.
@@ -1999,8 +2011,8 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
         """
         cfg = cfg_small()
         u = PopulationUsage(cfg)
-        old_key = ("tuple", 1, 2, 0)            # no question in it
-        new_key = ("tuple", 3, 1, 2, 0)
+        old_key = ("tuple", 1, 2, 0)            # three fields, no question in it
+        new_key = ("tuple", ASK_ALL, 1, 2, 0, 4, 1)
         for k in (old_key, new_key):
             u.forms[k][(4,)] = 20.0
             u.form_total[k] = 20.0
@@ -2023,7 +2035,7 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
                 for role in (FARMER, BUYER):
                     if not view.speaks(cfg, role):
                         continue
-                    obs = torch.zeros((1, 40), dtype=torch.long)
+                    obs = torch.zeros((1, n_obs_slots(cfg.world, cfg)), dtype=torch.long)
                     key = u._keys(view, role, obs)[0]
                     self.assertEqual(len(key), want[key[0]],
                                      "%s/%s writes a %r key of length %d, not %d"
@@ -2295,7 +2307,7 @@ class TestTheHoldoutAsksForTheOneQualityItRuledOut(unittest.TestCase):
 # ==========================================================================
 class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
     """Below the split one pool fills both seats, so an agent spawned to replace
-    a farmer also does every buyer's job. `ask-qty` is the first rung where the
+    a farmer also does every buyer's job. `order` is the first rung where the
     farmer speaks nowhere, and a newborn taught only the farmer's side came out
     of the bottleneck with nothing to say and took the buyer's chair anyway."""
 
@@ -2320,10 +2332,10 @@ class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
         cfg.bottleneck.epochs = 1
         return Trainer(cfg, d, quiet=True)
 
-    def test_at_ask_qty_the_farmer_speaks_nowhere(self):
+    def test_at_order_the_farmer_speaks_nowhere(self):
         """The precondition, straight from the curriculum."""
         cfg = Config()
-        ph = phase_named(cfg, "ask-qty")
+        ph = phase_named(cfg, "order")
         self.assertEqual(ph.own_positions(cfg, FARMER), [])
         self.assertTrue(ph.own_positions(cfg, BUYER))
 
@@ -2342,12 +2354,12 @@ class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
         self.assertTrue(events)
         self.assertTrue(all(e.role == FARMER for e in events))
 
-    def test_taught_one_seat_it_learns_no_words_at_ask_qty(self):
+    def test_taught_one_seat_it_learns_no_words_at_order(self):
         """The failure as it happened: `token acc n/a over 0 own tokens`."""
         from orchard.bottleneck import train_newborn
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d)
-            self._store_at(tr, "ask-qty")
+            self._store_at(tr, "order")
             born = tr.pop.farmers[0]
             info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
                                  roles=(FARMER,))
@@ -2359,7 +2371,7 @@ class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
         from orchard.bottleneck import train_newborn
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d)
-            self._store_at(tr, "ask-qty")
+            self._store_at(tr, "order")
             born = tr.pop.farmers[0]
             info = train_newborn(tr.cfg, born, tr.store, random.Random(0),
                                  roles=(FARMER, BUYER))
@@ -2371,7 +2383,7 @@ class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
     def test_the_birth_hook_asks_for_both_while_the_pool_is_shared(self):
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d)
-            self._store_at(tr, "ask-qty")
+            self._store_at(tr, "order")
             self.assertTrue(tr.pop.shared)
             seen = {}
             import orchard.train as T
@@ -2400,7 +2412,7 @@ class TestANewbornLearnsEverySeatItWillFill(unittest.TestCase):
 
 # ==========================================================================
 class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
-    """A hundred updates of `ask-qty` took the store from 22,359 `mutual`
+    """A hundred updates of `order` took the store from 22,359 `mutual`
     transcripts to none. Every later rung names fruit, colour and quality and
     only adds to them, so a rung with nothing left in the store is a rung whose
     language can no longer be transmitted to anybody born after it."""
@@ -2417,14 +2429,15 @@ class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
         batch = SimpleNamespace(
             f_obs=z, b_obs=z, tokens=z, active=torch.zeros((1, 1), dtype=torch.bool),
             f_dec=z, b_dec=z, f_idx=[0], b_idx=[0], phase=phase,
-            sb=SimpleNamespace(want_variety=[0], need_qty=[0]))
+            sb=SimpleNamespace(want_variety=[0], want_color=[0], min_quality=[0],
+                               need_qty=[0]))
         who = [SimpleNamespace(generation=0)]
         for i in range(n):
             store._push(batch, 0, who, who, episode + i)
 
     def test_the_earlier_rung_keeps_its_share(self):
         cfg = cfg_small()
-        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "order")
         store = self._store(capacity=100, share=0.4)
         self._fill(store, first, 100)
         self.assertEqual(store.phase_counts(), {"mutual": 100})
@@ -2432,20 +2445,20 @@ class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
         counts = store.phase_counts()
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(counts["mutual"], 40)           # its 40% floor
-        self.assertEqual(counts["ask-qty"], 60)
+        self.assertEqual(counts["order"], 60)
 
     def test_without_the_floor_it_is_flushed_entirely(self):
         """What the run did: history_share 0 is the old ring buffer."""
         cfg = cfg_small()
-        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "order")
         store = self._store(capacity=100, share=0.0)
         self._fill(store, first, 100)
         self._fill(store, second, 500, episode=1000)
-        self.assertEqual(store.phase_counts(), {"ask-qty": 100})
+        self.assertEqual(store.phase_counts(), {"order": 100})
 
     def test_three_rungs_split_the_reserve_between_them(self):
         cfg = cfg_small()
-        a, b, c = (phase_named(cfg, n) for n in ("name-all", "mutual", "ask-qty"))
+        a, b, c = (phase_named(cfg, n) for n in ("name-all", "mutual", "order"))
         store = self._store(capacity=120, share=0.5)
         self._fill(store, a, 60)
         self._fill(store, b, 60, episode=100)
@@ -2455,7 +2468,7 @@ class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
         # 50% of 120 reserved, split between the two that are not running
         self.assertEqual(counts["name-all"], 30)
         self.assertEqual(counts["mutual"], 30)
-        self.assertEqual(counts["ask-qty"], 60)
+        self.assertEqual(counts["order"], 60)
 
     def test_one_rung_alone_still_trims_its_own_oldest(self):
         cfg = cfg_small()
@@ -2469,14 +2482,14 @@ class TestOneRungCannotFlushEveryEarlierRung(unittest.TestCase):
     def test_a_restored_store_rebuilds_its_index(self):
         """A snapshot carries `buf` and nothing about the per-rung index."""
         cfg = cfg_small()
-        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "ask-qty")
+        first, second = phase_named(cfg, "mutual"), phase_named(cfg, "order")
         store = self._store(capacity=100)
         self._fill(store, first, 50)
         self._fill(store, second, 50, episode=1000)
         revived = self._store(capacity=100)
         revived._buf = list(store._buf)                  # as `load_snapshot` does
         self.assertEqual(revived._slots, {})
-        self.assertEqual(revived.phase_counts(), {"ask-qty": 50, "mutual": 50})
+        self.assertEqual(revived.phase_counts(), {"order": 50, "mutual": 50})
 
 
 # ==========================================================================
@@ -2604,20 +2617,20 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
             from orchard.train import Trainer
             tr = self._trainer(d + "/a")
             names = [p.name for p in tr.curriculum.phases]
-            tr.curriculum.index = names.index("ask-qty")     # as after-mutual holds
+            tr.curriculum.index = names.index("order")     # as after-mutual holds
             tr.episode = 4096
             path = tr.save_snapshot("after-mutual")
             tr.close()
             tr2 = self._trainer(d + "/b")
             tr2.load_snapshot(path)
-            self.assertEqual(tr2.curriculum.phase.name, "ask-qty")
+            self.assertEqual(tr2.curriculum.phase.name, "order")
             tr2.close()
 
     def test_winding_back_puts_it_on_the_rung_asked_for(self):
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d + "/a")
             names = [p.name for p in tr.curriculum.phases]
-            tr.curriculum.index = names.index("ask-qty")
+            tr.curriculum.index = names.index("order")
             tr.episode = 4096
             path = tr.save_snapshot("after-mutual")
             tr.close()
@@ -2634,7 +2647,7 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d + "/a")
             names = [p.name for p in tr.curriculum.phases]
-            tr.curriculum.index = names.index("ask-qty")
+            tr.curriculum.index = names.index("order")
             tr.episode = 4096
             path = tr.save_snapshot("after-mutual")
             before = [a.net.state_dict() for a in tr.pop.all_agents()]
@@ -2676,14 +2689,14 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tr = self._trainer(d + "/a")
             names = [p.name for p in tr.curriculum.phases]
-            tr.curriculum.index = names.index("ask-qty")
+            tr.curriculum.index = names.index("order")
             tr.episode = 4096
             path = tr.save_snapshot("after-mutual")
             tr.close()
             tr2 = self._trainer(d + "/b")
             tr2.load_snapshot(path)
-            self.assertIn("rung ask-qty", tr2.resume_note)
+            self.assertIn("rung order", tr2.resume_note)
             tr2.rewind_to("mutual")
             self.assertIn("rung mutual", tr2.resume_note)
-            self.assertIn("wound back from ask-qty", tr2.resume_note)
+            self.assertIn("wound back from order", tr2.resume_note)
             tr2.close()

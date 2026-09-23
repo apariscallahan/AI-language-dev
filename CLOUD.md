@@ -118,13 +118,8 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
 - **two lines at every checkpoint** (every 100 updates):
 
 ```
-<<<<<<< HEAD
 [checkpoint 8,601,600] rung name-all | success 0.521 (muted 0.335) / 0.523 (muted 0.339) | channel 0.28 of headroom | held-out 0.50 vs trained 0.52 | buyer coverage 0.227 [0.22 0.14 0.32 0.20 0.18]; farmer coverage 0.256 [0.22 0.19 0.36 0.21 0.19]
-    coherence farmer 0.460 buyer 0.470 across 0.52 | overlap 0.96 | 42 words, 1.03 atoms/word, 3.47 words/utterance, 0% silent, 0% at buffer end
-=======
-[checkpoint 96] rung name-all | success 0.315 (muted 0.345) / 0.375 (muted 0.340) | channel 0.00 of headroom | buyer coverage 0.071 [0.08 0.03 0.11]; farmer coverage 0.081 [0.08 0.06 0.11]
-    coherence farmer 0.278 buyer 0.278 across 0.278 | overlap n/a | 107 words sampled, 9 said, 1.43 atoms/word, 1.73 words/utterance, 0% silent, 0% at buffer end
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+    coherence farmer 0.460 buyer 0.470 across 0.52 | overlap n/a | 42 words sampled, 31 said, 1.03 atoms/word, 3.47 words/utterance, 0% silent, 0% at buffer end
 ```
 
   The two success numbers are the two views of a swap rung (each role decoding),
@@ -134,11 +129,6 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
   like — and `at buffer end` should be near 0; if it climbs, agents are babbling
   into the cap.
 
-<<<<<<< HEAD
-  On a report rung (`mutual`, `order`, `offer`, `judge`) the same line names each
-  field each role reports and how often it arrived, which is the number to watch
-  there:
-=======
   The two word counts are different questions. **`words sampled`** is every
   form the speakers' policies emitted in evaluation play, so it counts variants
   as well as words — a flawless 12-word code emitted at 98% per-symbol accuracy
@@ -149,15 +139,17 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
   codes to compare; `across` is cross-role coherence with those self-pairs
   excluded, so on a shared pool it is simply the honest between-agent number.
 
-  On a request rung the same line also names each field of the order and how
-  often it arrived, which is the number to watch there:
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+  On a report rung (`mutual`, `order`, `offer`, `judge`) the same line names each
+  field each role reports and how often it arrived, which is the number to watch
+  there, and the held-out figure is given per field beside the whole round —
+  the whole round is a conjunction of every field on both sides and reads 0.00
+  long after each field generalises:
 
 ```
-[checkpoint 22,118,400] rung mutual | success 0.364 (muted 0.000) | channel 0.51 of headroom | held-out 0.58 vs trained 0.80 | farmer reads fruit 0.96, colour 0.75, quality 0.76, quantity 0.71, price 0.68; buyer reads fruit 0.97, colour 0.75, quality 0.76, quantity 0.70, price 0.69 | buyer coverage 0.827 [0.97 0.75 0.76 0.72 0.70]
+[checkpoint 22,118,400] rung mutual | success 0.364 (muted 0.000) | channel 0.51 of headroom | held-out 0.03 vs trained 0.32 (per field 0.58 vs 0.80 = 0.61 of the headroom) [fruit 0.89/0.97, colour 0.43/0.70, quality 0.45/0.73] | farmer reads fruit 0.96, colour 0.75, quality 0.76, quantity 0.71, price 0.68; buyer reads fruit 0.97, colour 0.75, quality 0.76, quantity 0.70, price 0.69 | buyer coverage 0.827 [0.97 0.75 0.76 0.72 0.70]
 ```
 - **rung transitions**, with every criterion, passed or not;
-- **`[costs]`**, once, when the first costed rung reaches its floor and the
+- **`[costs]`**, once per costed rung, when the rung reaches its floor and the
   speaker costs start ramping in;
 - **budget stops**, naming exactly what was unmet;
 - the **final verdict** and the report path.
@@ -207,27 +199,21 @@ python -m orchard.run --snapshots                     # everything under runs/
 python -m orchard.run --snapshots runs/<run folder>   # or one run
 ```
 
-To see what there is to resume from before choosing -- which rung each snapshot
-stopped on, how far in, how big the community was, and whether its two seats are
-still one pool:
-
-```bash
-python -m orchard.run --snapshots                     # everything under runs/
-python -m orchard.run --snapshots runs/<run folder>   # or one run
-```
-
 A resumed run picks up whatever code it is started with, so this is also how to
 move a running experiment onto newer code: stop it just after a checkpoint,
-<<<<<<< HEAD
-update, resume. Below the trading rungs the snapshot holds one pool written
-twice; the loader restores it as one pool (an earlier version restored two
-copies, which drifted apart and collapsed `mutual` within a checkpoint — a
-snapshot from that version is repaired on load with a warning).
-=======
-update, resume. Older snapshots load too. What carries over is the population
-and its history; the *rules* are whatever the new code and config say, so a
-resumed run re-measures the rung it is on under the new measurements and applies
-whatever speaker pressures the new schedule turns on. One thing does not carry
+update, resume. Older snapshots of this layout load too (one with `ask-qty` or
+`quote` in its ladder cannot, see §1). What carries over is the population and
+its history; the *rules* are whatever the new code and config say, so a resumed
+run re-measures the rung it is on under the new measurements and applies
+whatever speaker pressures the new schedule turns on. Two things are taken from
+the file rather than the command line. The **architecture** (`ARCH_KEYS` in
+`config.py`: model width and depth, the atom inventory, the turns, the world's
+field sizes) has exactly one valid reading — the one the weights were trained
+under — so a forgotten `--config` no longer ends in sixty `size mismatch` lines
+that name tensors; the `[resume]` line says what it took from the file. And every
+*other* setting that differs from the snapshot's is listed under `[resume]` too,
+without being changed, so a resume that shrinks the community or changes the
+batch size does so on purpose and never by accident. One thing does not carry
 over: the recent-usage record is keyed by meaning, and when the key changed to
 carry *what was asked* the old keys stopped matching. They are dropped on load
 and the resume line says how many; they rebuild within one update, and the word
@@ -235,16 +221,31 @@ counts (keyed by the word) are untouched.
 
 Below `curriculum.split_roles_at` the two seats are **one list**, and a resume
 has to put it back that way. Restoring the two saved lists separately made two
-copies of every founder -- same id, same weights, then their own gradients from
-the next update on -- so a resumed run below the split trained twice the
+copies of every founder — same id, same weights, then their own gradients from
+the next update on — so a resumed run below the split trained twice the
 population it reported and had two languages where the rung exists to build one.
 It surfaced a rung later as an `IndexError` in the rollout: the first newcomer
 appended to the farmer list alone, and pairing, which uses the farmer count for
 both seats when the pool is shared, handed out a buyer index the buyer list did
-not have. Fixed; a snapshot written by an affected run is detected on load (the
-two lists hold the same ids but drifted weights), the farmer copies are kept and
-the resume line says so.
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+not have. Whether the pool is shared is now decided by the rung being resumed
+into; a snapshot written by an affected run is detected on load (the two lists
+hold the same ids but drifted weights), the farmer copies are kept and the
+resume line says so. The transcript store is read to the host whatever device
+the run trains on, because a newborn's apprenticeship stacks what it sampled on
+the host first — mapping the whole file onto the GPU left the store half on each
+side and the first birth after a mid-rung resume died on it.
+
+To run a rung *again* — because a mechanism it depends on has changed — pass
+`--resume-at <rung>` with `--resume`. `after-<rung>.pt` is written after the
+curriculum has advanced, so resuming it alone restarts the rung *after*;
+`--resume-at` puts the curriculum back on the rung named, resets that rung's
+clocks (time in the rung, the rolling success the cost ramp keys off, the ramp)
+and keeps the weights, the community, the usage counts and the store:
+
+```bash
+python -m orchard.run --config configs/gpu_community.json \
+    --resume runs/<run>/snapshots/after-mutual.pt --resume-at mutual
+```
 
 Branch an experiment off any rung — the header will list what you changed:
 
@@ -270,6 +271,25 @@ intentionality, decontextualised, displaced, interchangeable, generic,
 perspectives, cultural transmission, duality of patterning), each with how it is
 measured, its value, and present / partial / absent / untestable. No training
 happens, so this runs on a laptop against a snapshot copied down from the box.
+
+To ask one question of a snapshot — which field generalises to combinations
+nobody trained on — without the whole suite:
+
+```bash
+python -m orchard.run --holdout-report runs/<run>/snapshots/after-mutual.pt
+```
+
+It scores the snapshot under the config stored in it (the holdout is derived from
+the world's field sizes) and prints, per field, held-out against trained
+accuracy and how much of the headroom over a message-blind guesser transfers;
+then the one-sided conjunction beside what independent fields would predict, and
+the whole round. On the run that first promoted out of `mutual` the three
+transferred 0.89, 0.41 and 0.41 of their headroom while the whole round read
+0.000: independence would have predicted about sixty successes in 2,048, and
+there was under one, because a Latin-square holdout asks for exactly the quality
+that a correctly-read (fruit, colour) pair never showed in training. A snapshot
+from a rung that does not measure held-out combinations is scored on the last
+one that does.
 
 ---
 
@@ -310,19 +330,13 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `--n-farmers`, `--n-buyers` | community size per role (a scale key, like the presets). |
 | `population.founders_farmers/_buyers` | how many agents found the community. 0 = start at full size, which does not work above 2 + 2. |
 | `population.grow_from_rung` | the rung from which newcomers start arriving (`mutual`). Earlier, every newborn apprentices on a code that is about to be replaced. |
-<<<<<<< HEAD
 | `population.turnover_from_rung` | the rung agents start dying of old age in (`mutual`, the same one newcomers arrive in). Earlier, a death costs half of a two-agent pool. |
-| `reward.costs_from_rung` | the rung from which the speaker pays for length and for new words (`mutual`, the first rung that invents no new word). Earlier, the cheapest way to be short is to say the same short nothing. |
-| `reward.costs_ramp_trigger`, `reward.costs_ramp_updates` | within that rung the costs wait until its rolling success reaches this multiple of its promotion floor (1.0), then ramp in over this many updates (200). Fully on at the transition, `mutual` climbed at half the pace. |
-| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, when every word exists). It cannot punish a new word -- a form only counts once it has 12 recent uses. |
-| `reward.convention_contrast_samples` | how many other meanings' conventions a form is contrasted against (16), so one form for everything earns nothing. |
-=======
-| `reward.costs_from_rung` | a *floor* on where the speaker starts paying for length and for new words (`mutual`). The rung-by-rung rule is `Phase.invents`: costs apply wherever a rung only reuses words, so they are on for `mutual`, `order` and `offer` up, and off for the naming rungs and for `ask-qty` and `quote`, which still have a field to name. Charged while a word is still being invented, the cheapest way to be short is to say the same short nothing. |
-| `reward.costs_ramp_trigger`, `reward.costs_ramp_updates` | within a rung the costs wait until its own rolling success reaches this multiple of its promotion floor (1.0), then ramp in over this many updates (200). Switching them on at a rung's first update throttled the channel: the hyphen went unused, ~51 messages had to carry 48 meanings, and success was 0.023 against 0.142 with them off. Trigger 0 restores the old step gate. |
-| `bottleneck.meaning_holdout` | share of the meaning space withheld from each newborn's apprenticeship (0.25), drawn fresh per newborn so nothing is lost to the population. This is the half of iterated learning that `coverage` cannot give: a learner shown every meaning memorises the table as faithfully as its parents. 0 restores the old behaviour. |
-| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, the first rung that invents no word of its own -- it only has to say three that already exist). It cannot punish a new word -- a form only counts once it has 12 recent uses -- and it cannot collapse the language, because it is contrastive. Waiting for `mutual` left four rungs in which nothing paid a speaker for repeating itself: two founders with no form in common (coherence 0.15-0.17) and 686 distinct words over sampled play for a 64-thing world. |
-| `reward.convention_contrast_samples` | how many other meanings' forms each utterance is contrasted with (4). This is the whole cost of the convention bonus, and it is host-side Python while the device waits: at batch 4,096 it is 0.29 s per update at 4 and 0.75 s at 16 (the old hardcoded value), against a ~2.7 s update. Lower it if the GPU is being starved. |
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+| `reward.costs_from_rung` | a *floor* on where the speaker starts paying for length and for new words (`mutual`). The rung-by-rung rule is `Phase.invents`: costs are off on every rung that still has a word to invent — the six naming rungs — and on from `mutual` up, where every rung only reuses them. Charged while a word is still being invented, the cheapest way to be short is to say the same short nothing. |
+| `reward.costs_ramp_trigger`, `reward.costs_ramp_updates` | within each costed rung the costs wait until the rung's own rolling success reaches this multiple of its promotion floor (1.0), then ramp in over this many updates (200); a later rung re-earns them, since it starts a new job near zero. Switching them on at a rung's first update throttled the channel: the hyphen went unused, ~51 messages had to carry 48 meanings, and success was 0.023 against 0.142 with them off. Trigger 0 restores the old step gate. |
+| `bottleneck.meaning_holdout` | share of the (fruit, colour, quality) combinations withheld from each newborn's apprenticeship (0.25), drawn fresh per newborn so nothing is lost to the population. This is the half of iterated learning that `coverage` cannot give: a learner shown every meaning memorises the table as faithfully as its parents. 0 restores the old behaviour. |
+| `bottleneck.history_share` | the share of the transcript store that the rungs *not* now running keep between them (0.4). At 0 one rung's traffic flushes every earlier rung: a hundred updates of the rung after `mutual` erased all 22,359 `mutual` transcripts and left a newborn nothing to learn the naming language from. |
+| `reward.convention_from_rung` | the rung from which the speaker is paid for using the community's word (`name-all`, the first rung that invents no word of its own — it only has to say five that already exist). It cannot punish a new word — a form only counts once it has 12 recent uses — and it cannot collapse the language, because it is contrastive. Waiting for `mutual` left the naming rungs with nothing paying a speaker for repeating itself: two founders with no form in common (coherence 0.15–0.17) and 686 distinct words over sampled play for a 64-thing world. |
+| `reward.convention_contrast_samples` | how many other meanings' forms each utterance is contrasted with (16), taking the *closest* rather than the average: a collapsed code earns exactly nothing at 16 and starts earning again below 8, so this is not where to buy speed. It is the whole cost of the term — host-side edit distances while the device waits, 0.75 s per update at batch 4,096 against a ~2.7 s update. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
 | `model.barn_lookup` | one cross-attention step from the farmer's hidden state to its barn rows, keyed on (fruit, colour), valued on (quality, stock); only active on a barn (true). Off, the plain transformer never learned to find the asked-for lot even supervised. |
 | `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the report rungs included -- they run in both directions. |
@@ -335,7 +349,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `bottleneck.coverage` | how much of the rest of the parent generation a newborn sees (1.0 — essentially all of it; lowering it puts *common* forms back at risk). |
 | `bottleneck.frequency_skew` | how strongly a newborn's lessons favour common trades. |
 | `reward.belief_qty_tol` | how exactly a reported quantity has to match in the trading rungs (1). Report rungs are exact. |
-| `reward.symbol_cost`, `reward.atom_cost`, `reward.word_cost` | per symbol (0.01), per atom after the first in a word (0.03), per word (0.005): short words, not short sentences, and no repeating a word to the buffer end. |
+| `reward.symbol_cost`, `reward.atom_cost`, `reward.word_cost` | per symbol (0.005), per atom after the first in a word (0.03), per word (0.005): short words, not short sentences, and no repeating a word to the buffer end. The symbol charge is kept small because it is neutral between `a-b` and `a b` and only dilutes the fused-versus-split ratio the other two exist for. |
 | `reward.refer_partial` | what a lineup guess is paid per field it shares with the target (0.45). The staircase from naming one field to naming all five; 0 restores all-or-nothing. |
 | `train.anneal_per_rung` | whether the temperature and entropy anneals count updates in the current rung rather than since the run started (true). Off means no exploration past update 1,000. |
 | `channel.atomic_vocab` | how many meaningless atoms words are built from (32: enough for every one of the 27 field values to have an atom, so whether atoms are reused or combined is up to the agents). |
@@ -545,7 +559,7 @@ checkpoint yields the evidence its gate reads.
 | `silent` above 0% | it cannot be: every turn has to open with a word (`channel.allow_silence`). Check the header's method line for a change to it. |
 | ~1 word per utterance on a rung that is still inventing words | the speaker costs came on too early — check `reward.costs_from_rung` in the header. |
 | a big "words sampled" count next to a small "said" count | not a large vocabulary: the first is over sampled play and counts every variant the policy emits, the second is the greedy lexicon. A wide gap is a speaker unsure of its own words — check that the convention bonus is on (the header's speaker-pressures line). |
-| `name-all` flat at ~0.8 with everything else passing | it was the structure bars, twice over: the probes followed the rung's 70/30 mixture of questions while the metrics ignore which was asked, and field coverage was normalised by `H(field)` rather than by its own headroom. A perfect describer scored 0.33-0.49 coverage against a 0.30 bar. Both are fixed; `tests/test_rungs.py::TestAPerfectSpeakerPasses` holds them. |
+| `name-all` flat at ~0.8 with everything else passing | it was the structure bars, twice over: the probes followed the rung's 70/30 mixture of questions while the metrics ignore which was asked, and field coverage was a whole-message statistic that sits at its ceiling once every lot has its own message — a perfect describer scored 0.33-0.49 on the three-field world and 0.00 at 100 probes on the five-field one, against a 0.30 bar. Both are fixed (the probes ask the rung's own kind; coverage is read off the pieces of a message, cross-validated); `tests/test_rungs.py::TestAPerfectSpeakerPasses` holds them. |
 | `coherence across` or `cross-role overlap` looking healthy in a naming rung | below `curriculum.split_roles_at` one pool fills both seats, so those compare agents with themselves. Cross-role coherence now skips self-pairs and overlap reads `n/a`; the number to read is the per-role coherence. |
 | a rehearsed kind falling to chance | forgetting. The mixture weights (`Phase.mix` in `curriculum.py`) are the dial. |
 | a report rung passes every field but "reports combinations it never trained on" | the listener's heads have learned the training set's joint. The gate is per field and at 0.60 of the headroom; see README §11 before touching it. |

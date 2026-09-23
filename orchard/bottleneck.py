@@ -202,12 +202,13 @@ class TranscriptStore:
     def _evict_slot(self, incoming: str) -> int:
         """Which slot the next episode replaces, once the store is full.
 
-        Plain FIFO lets one rung's traffic flush every earlier rung. At
-        `ask-qty` the store went from 22,359 `mutual` transcripts to none inside
-        a hundred updates, and with them went every example of the language the
-        naming rungs built -- which is what a newborn most needs to be taught,
-        since the later rungs all name fruit, colour and quality and only add to
-        them. A rung with nothing left in the store cannot be transmitted at all.
+        Plain FIFO lets one rung's traffic flush every earlier rung. On the rung
+        after `mutual` the store went from 22,359 `mutual` transcripts to none
+        inside a hundred updates, and with them went every example of the
+        language the naming rungs built -- which is what a newborn most needs to
+        be taught, since the later rungs all describe the same lots and only add
+        to them. A rung with nothing left in the store cannot be transmitted at
+        all.
 
         So the rungs that are *not* the one now running share
         ``bottleneck.history_share`` of the buffer between them, and the running
@@ -435,8 +436,9 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     the same list, installing the newborn on the farmer pass so the buyer pass
     finds it already young and skips. Every replacement is therefore born a
     farmer, and teaching it only what farmers said is fine while both seats
-    speak. At `ask-qty` the farmer speaks nowhere: the newborn learned nothing
-    at all (``0 own tokens``), took the buyer's chair, and had no words for it.
+    speak. On the first rung where the farmer speaks nowhere (`order`: the buyer
+    asks, the farmer answers with its heads) the newborn learned nothing at all
+    (``0 own tokens``), took the buyer's chair, and had no words for it.
     Five of eight founders were replaced that way in 175 updates and the
     language went with them -- coherence 0.625 to 0.346, 44 words to 25, and a
     scrambled channel costing nothing.
@@ -464,24 +466,16 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     want = (bc.n_samples if bc.n_samples > 0
             else min(bc.max_samples, max(1, int(round(bc.coverage * len(store))))))
     samples = store.sample(want, rng)
-<<<<<<< HEAD
     # The bottleneck proper: a share of the *meanings* in the store is withheld
     # from this newborn altogether, so it has to reconstruct those from parts
     # it did see. Seeing every meaning is a near-clone; a language whose forms
     # only survive when every combination is shown is not a compositional one,
-    # and this is the pressure iterated learning is known to exert.
-    withheld: set = set()
-    if bc.meaning_holdout > 0 and samples:
-        kinds = sorted({s.meaning for s in samples})
-        k = int(round(bc.meaning_holdout * len(kinds)))
-        if 0 < k < len(kinds):
-            withheld = set(rng.sample(kinds, k))
-            samples = [s for s in samples if s.meaning not in withheld]
-    info["withheld_meanings"] = len(withheld)
-    info["withheld_share"] = bc.meaning_holdout if withheld else 0.0
-    info["withheld"] = [list(m) for m in sorted(withheld)][:24]
-=======
-    # The meanings this newborn is not taught, and has to work out for itself.
+    # and this is the pressure iterated learning is known to exert. The slice
+    # is drawn fresh per newborn (:meth:`TranscriptStore.withhold_meanings`),
+    # so no meaning is lost to the population -- each learner has its own gap.
+    info["withheld_meanings"] = 0
+    info["withheld_share"] = 0.0
+    info["withheld"] = []
     withheld = store.withhold_meanings(rng)
     if withheld:
         kept = [s for s in samples if s.meaning not in withheld]
@@ -490,10 +484,10 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         if len(kept) >= 8:
             info["withheld_meanings"] = len(withheld)
             info["withheld_share"] = round(1 - len(kept) / max(1, len(samples)), 3)
+            info["withheld"] = [list(m) for m in sorted(withheld)][:24]
             samples = kept
         else:
             withheld = set()
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     if len(samples) < 8:
         info["skipped"] = "not enough successful transcripts yet"
         return info

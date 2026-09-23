@@ -370,11 +370,16 @@ class RewardConfig:
     # A small flat charge on top of the two above, because the cheapest way to
     # repeat a word is with spaces, and a speaker with the word cost alone
     # repeated one word twelve times to the buffer end ("a1 a1 a1 ...": 0.06
-    # under the word cost, 0.29 with this). It is also part of the Zipf
+    # under the word cost, 0.175 with this). It is also part of the Zipf
     # mechanism (2.2): paid once per episode, so meanings that come up often pay
-    # it far more often and feel far more pressure to shorten. A five-word
-    # request costs 0.09 under it, against a task reward above 1.
-    symbol_cost: float = 0.01
+    # it far more often and feel far more pressure to shorten. Kept small
+    # because it is neutral between fusing and splitting -- `a-b` and `a b` are
+    # three symbols either way -- so every unit of it dilutes the one ratio the
+    # costs exist for: with it a fused two-atom label costs 2.0x two short words
+    # (0.050 against 0.025) and a three-atom one 2.25x (0.090 against 0.040);
+    # at 0.01 those fell to 1.6x. A five-word request costs 0.07 under it,
+    # against a task reward above 1.
+    symbol_cost: float = 0.005
     economics: float = 0.25         # farmer margin / buyer surplus (zero-sum in price)
 
     qty_tol: int = 0                # tolerance when comparing believed quantities
@@ -426,27 +431,6 @@ class RewardConfig:
     # chance -- a population that size needs founding small (see
     # population.founders_*), after which the bonus is fully on anyway.
     convention_gated: bool = True
-<<<<<<< HEAD
-    # The rung from which the speaker pays for length, rarity and coining, and is
-    # paid for agreeing. Off below it. Measured: with the costs on from the
-    # second rung, the population collapsed onto one one-atom word (coherence
-    # 1.000, 1.0 atoms per word, 17 distinct words among 15 speakers) and colour
-    # never left chance -- the cheapest way to agree, before a word for colour
-    # exists, is for everyone to say the same short nothing.
-    # The rule that follows: the costs stay off while a rung still has to
-    # *invent* a word, and come on at the first rung that only reuses them.
-    # Every field now has a naming rung, so that is `mutual` -- and even there
-    # they wait for the rung to be working (`costs_ramp_trigger`) and are ramped
-    # in (`costs_ramp_updates`): switched fully on at the transition, the mutual
-    # rung climbed at half the pace of one with them off.
-    costs_from_rung: str = "mutual"
-    # Within the rung named above, the costs come on only once the rung's
-    # rolling success has reached this multiple of its promotion floor, and then
-    # rise linearly from 0 to full over `costs_ramp_updates` updates; from the
-    # next rung on they are simply on. 0 turns the trigger off (on at once).
-    costs_ramp_trigger: float = 1.0
-    costs_ramp_updates: int = 200
-=======
     # A floor on where the speaker starts paying for length and novelty; the
     # rung-by-rung rule is `Phase.invents`, and `curriculum.costs_apply` needs
     # both. Measured: with the costs on from the second rung, the population
@@ -455,11 +439,12 @@ class RewardConfig:
     # cheapest way to agree, before a word for colour exists, is for everyone to
     # say the same short nothing. The rule that follows: the costs stay off
     # while a rung still has to *invent* a word, and come on where a rung only
-    # reuses them.
+    # reuses them. Every field of a lot now has a naming rung below `mutual`,
+    # so that is `mutual` and everything above it -- a lot is described with the
+    # same words whether it is held, asked for or offered.
     #
-    # This was `offer`, read as "the first rung above every rung that invents".
-    # That is true but too blunt: it also spared `mutual` and `order`, which
-    # invent nothing, and `mutual` turned out to need the pressure badly. It is
+    # This was `offer`, read as "the first rung above every rung that invents",
+    # and it spared `mutual`, which turned out to need the pressure badly. It is
     # the first rung with no lineup -- no candidates, no near misses -- so
     # nothing there forces a message to decompose, and a run duly settled on a
     # lookup table: 48 memorised labels, coverage 0.84, and held-out
@@ -474,7 +459,9 @@ class RewardConfig:
     # The costs do not arrive at full strength the moment a rung starts. They
     # wait until that rung's own channel is working -- rolling success at this
     # multiple of the rung's promotion floor -- and then ramp in over
-    # `costs_ramp_updates`. 0 for the trigger restores the old step gate.
+    # `costs_ramp_updates`. Every costed rung re-earns them, because every rung
+    # starts with a new job and a success near zero. 0 for the trigger restores
+    # the old step gate.
     #
     # Turning them on at the first update of `mutual` was measured, and it
     # throttled the channel instead of shaping it: the atom cost drove words to
@@ -492,47 +479,32 @@ class RewardConfig:
     # applied across rungs; this applies it inside one.
     costs_ramp_trigger: float = 1.0      # x the rung's own success floor
     costs_ramp_updates: int = 200        # 0 -> 1 over this many updates after that
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     # The rung from which the convention bonus pays a speaker for using the
     # community's word for a meaning -- separately from the costs above, because
     # it is a pressure to *agree*, not to economise, and it cannot punish
     # inventing: a form only counts once it has `convention_min_support` recent
-<<<<<<< HEAD
-    # uses behind it. It comes on at the last naming rung, when every word
-    # exists: the founders keep a dialect each through the single-field rungs
-    # (nobody dies there), and something has to pay the two of them, and then
-    # the community that arrives at `mutual`, to settle on one word per meaning.
-    # The rarity cost stays with the costs: it charges a *new* word.
-    convention_from_rung: str = "name-all"
-    # How many other meanings' conventions a form is contrasted against when the
-    # bonus is computed (a fixed sample per batch): the bonus pays similarity to
-    # this meaning's modal form *minus* similarity to theirs, so one form for
-    # everything earns nothing. More is a steadier baseline at more cost.
-    convention_contrast_samples: int = 16
-=======
     # uses behind it. The rarity cost stays with the costs: it charges a *new*
-    # word, which `ask-qty` and `quote` need.
+    # word, which a rung that introduced a field would need.
     #
     # It used to wait for the community at `mutual`, on the reasoning that this
     # is a pressure to agree and two founders are not a community. What that
-    # left was four rungs in which nothing at all paid a speaker for saying the
-    # same thing twice -- not to its partner, and not to itself. Measured on the
-    # run this was changed for, at `name-all`: within-role coherence 0.15-0.17,
-    # so the two founders shared no form; and 686 distinct words over sampled
-    # play for a meaning space of 64 things, which is not a large vocabulary but
-    # a speaker unsure of its own (a flawless 12-word code emitted at 98%
-    # per-symbol accuracy already reads as ~170).
+    # left was every naming rung running with nothing at all paying a speaker
+    # for saying the same thing twice -- not to its partner, and not to itself.
+    # Measured on the run this was changed for, at `name-all`: within-role
+    # coherence 0.15-0.17, so the two founders shared no form; and 686 distinct
+    # words over sampled play for a meaning space of 64 things, which is not a
+    # large vocabulary but a speaker unsure of its own (a flawless 12-word code
+    # emitted at 98% per-symbol accuracy already reads as ~170).
     #
     # `name-all` is where it belongs by the same rule the costs follow -- off
     # while a rung still has to invent a word, on at the first rung that only
-    # reuses them. Fruit, colour and quality were each invented and promoted
-    # below it; its own job is to say three of them at once. And the documented
-    # collapse (everyone on one short form) is not available to this term: it is
-    # contrastive, so a form that fits every meaning scores its similarity to
-    # this meaning's convention minus its similarity to every other meaning's,
-    # which is zero.
+    # reuses them. Every field was invented and promoted below it; its own job
+    # is to say all of them at once. And the documented collapse (everyone on
+    # one short form) is not available to this term: it is contrastive, so a
+    # form that fits every meaning scores its similarity to this meaning's
+    # convention minus its similarity to the closest other meaning's, which is
+    # zero.
     convention_from_rung: str = "name-all"
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -621,9 +593,9 @@ class CurriculumConfig:
     # the lineup; at the split each agent is copied into a farmer and a buyer,
     # so both roles start out fluent in the same language.
     # The rung where the one pool becomes farmers and buyers. Everything below
-    # it is one language in two seats -- the request rungs included, since they
-    # run in both directions (`quote` has the buyer saying prices, `offer` the
-    # farmer) and one pool learns both from the same words. The split exists so
+    # it is one language in two seats -- the report rungs included, since they
+    # run in both directions (`order` has the buyer describing a lot, `offer`
+    # the farmer) and one pool learns both from the same words. The split exists so
     # the two sides can diverge in *strategy*, which only starts to matter where
     # selling and buying pay differently: `haggle`.
     split_roles_at: str = "haggle"
@@ -634,8 +606,10 @@ class CurriculumConfig:
     # at least this often (five of them exactly, in `order`), on top of the
     # per-field bars and a real gain over silence.
     order_min_success: float = 0.25
-    # swap and mutual: mean over fields of I(message; field) / H(field), chance-
-    # corrected, for each describing role
+    # swap and mutual, for each describing role: mean over fields of how much
+    # of the field a one-piece reader recovers from the message (the best
+    # symbol slot, word position or bag of words, cross-validated over the
+    # probes; see `properties.field_coverage`)
     min_field_coverage: float = 0.30
     # Share of open lineup rounds that are "hard": one anchor plus near misses of
     # it, each differing in one field (a different field each), target uniform
@@ -718,8 +692,8 @@ class BottleneckConfig:
     store_capacity: int = 40_000          # ring buffer of recent successful episodes
     # What share of the buffer the rungs that are *not* running keep between
     # them. At 0 one rung's traffic flushes every earlier rung, which is how a
-    # hundred updates of `ask-qty` erased all 22,359 `mutual` transcripts and
-    # left a newborn nothing to learn the naming language from.
+    # hundred updates of the rung after `mutual` erased all 22,359 `mutual`
+    # transcripts and left a newborn nothing to learn the naming language from.
     history_share: float = 0.4
     only_successful: bool = True          # learn from trades that worked
     # How strongly the newborn's sample favours common meanings (addendum 2.3).
@@ -730,13 +704,6 @@ class BottleneckConfig:
     # This is the lever for vocabulary loss and regularisation across
     # generations, so it is a first-class knob rather than a constant.
     frequency_skew: float = 1.0
-<<<<<<< HEAD
-    # The share of the (fruit, colour, quality) combinations in its sample that a
-    # newborn is *not* shown at all. It has to name those from the parts it did
-    # see, which is what makes the bottleneck a pressure towards a language
-    # built from reusable parts rather than one name per thing. 0 shows a
-    # newborn every combination the store holds (a near-clone).
-=======
     # Share of *meanings* withheld from each newborn's apprenticeship. Not
     # transcripts -- meanings: a random slice of the meaning space, different
     # for every newborn, whose utterances it is never shown and must work out
@@ -756,7 +723,6 @@ class BottleneckConfig:
     # that scored 0.36 on trained combinations and 0.01 on held-out ones -- a
     # productivity ratio of 0.03 against the 0.60 bar. 48 memorised labels,
     # transmitted perfectly.
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     meaning_holdout: float = 0.25
     token_loss_weight: float = 1.0
     decision_loss_weight: float = 1.0
@@ -779,7 +745,7 @@ class TrainConfig:
     # rung* rather than since the run began. They ran once, globally, and the
     # ladder has since grown to thirteen rungs: everything was at its floor by
     # update 1,000, so `name-all` -- which starts around 2,000 and has to find
-    # three-word utterances where one used to do -- explored nothing at all. On
+    # five-word utterances where one used to do -- explored nothing at all. On
     # the run that stalled there, the only new forms came from newborns, and
     # success rose each time one settled and decayed in between.
     anneal_per_rung: bool = True        # temperature reaches its final value here
@@ -1008,6 +974,7 @@ SCALE_KEYS = frozenset({
 # name tensors, and not one of them names the setting that is wrong.
 ARCH_KEYS = frozenset({
     "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
+    "model.barn_lookup",
     "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
     "world.n_varieties", "world.max_qty", "world.n_quality",
     "world.n_colors", "world.n_price_bins",

@@ -99,7 +99,7 @@ class TestReportRungCheckpoints(unittest.TestCase):
         self.assertTrue(last.get("checks"), "no promotion check was run")
         self.assertTrue(any("carries" in k for k in last["checks"]),
                         list(last["checks"]))
-        self.assertIn("reports combinations it never trained on", last["checks"])
+        self.assertIn("describes combinations it never trained on", last["checks"])
 
     def test_mutual(self):
         row, last = self._checkpoint("mutual")
@@ -241,21 +241,21 @@ class TestTheCostsWaitThenRamp(unittest.TestCase):
         cfg.reward.costs_ramp_updates = 4
         return Trainer(cfg, d, quiet=True)
 
-    def test_off_in_the_naming_rungs_waiting_in_mutual_on_after(self):
+    def test_off_in_the_naming_rungs_waiting_in_every_costed_rung(self):
         with tempfile.TemporaryDirectory() as d:
             t = self._trainer(d, "name-all")
             t.update_cost_gate()
             self.assertEqual(t.cost_gate, 0.0)
             t.close()
         with tempfile.TemporaryDirectory() as d:
-            t = self._trainer(d, "mutual")
+            t = self._trainer(d + "/a", "mutual")
             t.update_cost_gate()
             self.assertEqual(t.cost_gate, 0.0, "charged before the rung works")
             # the rung starts working: rolling success clears the floor
-            t.rung_success.extend([1.0] * 300)
+            t.rung_success.extend([1.0] * 1200)
             t.updates = 100
             t.update_cost_gate()
-            self.assertEqual(t._costs_ramp_start, 100)
+            self.assertEqual(t._costs_ramp_from, 100)
             self.assertEqual(t.cost_gate, 0.0)
             t.updates = 102
             t.update_cost_gate()
@@ -263,15 +263,25 @@ class TestTheCostsWaitThenRamp(unittest.TestCase):
             t.updates = 110
             t.update_cost_gate()
             self.assertEqual(t.cost_gate, 1.0)
-            # and the state survives a snapshot
+            # and the state survives a snapshot, so a resume mid-ramp carries on
             path = t.save_snapshot("t")
             st = torch.load(path, map_location="cpu", weights_only=False)
-            self.assertEqual(st["costs_ramp_start"], 100)
+            self.assertEqual(st["costs_ramp_from"], 100)
             t.close()
+            t2 = self._trainer(d + "/b", "mutual")
+            t2.load_snapshot(path)
+            self.assertEqual(t2._costs_ramp_from, 100)
+            self.assertEqual(t2.cost_gate, 1.0, "the ramp restarted on resume")
+            t2.close()
         with tempfile.TemporaryDirectory() as d:
+            # every costed rung re-earns them: a new job starts near zero
             t = self._trainer(d, "order")
             t.update_cost_gate()
-            self.assertEqual(t.cost_gate, 1.0, "a later rung has the costs on")
+            self.assertEqual(t.cost_gate, 0.0, "a later rung charged before it works")
+            t.rung_success.extend([1.0] * 1200)
+            t.updates = 7
+            t.update_cost_gate()
+            self.assertEqual(t._costs_ramp_from, 7)
             t.close()
 
 
@@ -367,12 +377,13 @@ class TestConventionsKeyOnWhatWasAsked(unittest.TestCase):
         whole = rw.sample(8)
         k1 = u._keys(phase_named(cfg, "name-color"), FARMER, colour.obs(cfg, FARMER))
         k2 = u._keys(phase_named(cfg, "name-all"), FARMER, whole.obs(cfg, FARMER))
-        self.assertTrue(all(k[-1] == 1 for k in k1))
-        self.assertTrue(all(k[-1] == QUERY_ALL for k in k2))
+        # the key reads (kind, what was asked, the lot)
+        self.assertTrue(all(k[1] == 1 for k in k1))
+        self.assertTrue(all(k[1] == QUERY_ALL for k in k2))
         # a buyer's request in the market shares the whole-lot convention
         tw = TensorWorld(cfg, generator=torch.Generator().manual_seed(0))
         k3 = u._keys(phase_named(cfg, "order"), BUYER, tw.sample(8).obs(cfg, BUYER))
-        self.assertTrue(all(k[0] == "tuple" and k[-1] == QUERY_ALL for k in k3))
+        self.assertTrue(all(k[0] == "tuple" and k[1] == QUERY_ALL for k in k3))
         self.assertEqual(len(k3[0]), len(k2[0]))
 
 

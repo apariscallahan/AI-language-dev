@@ -94,49 +94,133 @@ def disentanglement(meanings: Sequence[Sequence[int]], messages: Sequence[Sequen
             "bosdis": sum(bos) / len(bos) if bos else float("nan")}
 
 
+def _message_units(messages: Sequence[Sequence[int]], *, space: Optional[int],
+                    hyphen: Optional[int], end: Optional[int], max_len: int
+                    ) -> list[tuple[str, list]]:
+    """The pieces of a message a one-piece reader could read a field off.
+
+    Every symbol slot, every word position (a word keeps its hyphens, so a
+    two-atom word is one value), and the bag of words. ``None`` for a slot or
+    position the message does not reach.
+    """
+    msgs = [list(m) for m in messages]
+    units: list[tuple[str, list]] = []
+    for k in range(max_len):
+        units.append(("symbol %d" % k, [m[k] if k < len(m) else None for m in msgs]))
+    words: list[list[tuple]] = []
+    for m in msgs:
+        ws, cur = [], []
+        for s in m:
+            if s == end:
+                break
+            if s == space:
+                if cur:
+                    ws.append(tuple(cur))
+                cur = []
+            else:
+                cur.append(s)
+        if cur:
+            ws.append(tuple(cur))
+        words.append(ws)
+    for k in range(max((len(w) for w in words), default=0)):
+        units.append(("word %d" % k, [w[k] if k < len(w) else None for w in words]))
+    units.append(("bag", [frozenset(w) for w in words]))
+    return units
+
+
+def _lookup_accuracy(xs: list, ys: list, train: list, test: list) -> float:
+    """Predict ``ys`` from ``xs`` with a table fitted on ``train``, scored on
+    ``test`` as the share of the headroom above always guessing the majority."""
+    table: dict = {}
+    for i in train:
+        x = xs[i]
+        if isinstance(x, frozenset):          # a bag: one entry per word in it
+            for w in x:
+                table.setdefault(w, Counter())[ys[i]] += 1
+        else:
+            table.setdefault(x, Counter())[ys[i]] += 1
+    majority = Counter(ys[i] for i in train).most_common(1)[0][0]
+    base = sum(ys[i] == majority for i in test) / len(test)
+    hit = 0
+    for i in test:
+        x = xs[i]
+        if isinstance(x, frozenset):
+            # A bag of words: read the field off the word that predicts it
+            # most purely, whichever position it sits in.
+            best, guess = -1.0, majority
+            for w in x:
+                c = table.get(w)
+                if not c:
+                    continue
+                v, k = c.most_common(1)[0]
+                purity = k / sum(c.values())
+                if purity > best or (purity == best and k > 0):
+                    best, guess = purity, v
+        else:
+            c = table.get(x)
+            guess = c.most_common(1)[0][0] if c else majority
+        hit += guess == ys[i]
+    acc = hit / len(test)
+    return (acc - base) / (1.0 - base) if base < 1.0 else 0.0
+
+
 def field_coverage(meanings: Sequence[Sequence[int]], messages: Sequence[Sequence[int]],
-                   fields: Sequence[int], rng=None, n_shuffles: int = 3) -> dict[str, Any]:
-    """How much of each field the whole message carries, chance-corrected.
+                   fields: Sequence[int], rng=None, *, space: Optional[int] = None,
+                   hyphen: Optional[int] = None, end: Optional[int] = None,
+                   max_len: Optional[int] = None) -> dict[str, Any]:
+    """How much of each field a one-piece reader recovers from the message.
 
-    Per field: I(message; field) minus the same with the field shuffled, over
-    the headroom that subtraction leaves -- ``H(field) - null`` -- clipped to
-    [0, 1]; ``coverage`` is the mean over fields. A code that repeats the
-    variety in every slot covers one field of three.
+    Per field: the best, over every symbol slot, every word position and the
+    bag of words, of how well that piece alone predicts the field on probes it
+    was not fitted on -- a lookup table fitted on half the probes, scored on
+    the other half (both ways round, averaged), as the share of the headroom
+    above always guessing the commonest value, clipped to [0, 1]. ``coverage``
+    is the mean over fields. A code that repeats the fruit in every slot covers
+    one field of five; a fused label that names nothing twice covers none.
 
-    The denominator is the headroom rather than ``H(field)`` because the numbers
-    are plug-in estimates over a few hundred probes, and the plug-in estimate of
-    I(message; field) is inflated by however many distinct messages there are:
-    in the limit where every probe gets its own message it reaches ``H(field)``
-    whatever the message means, which is why the shuffled null is subtracted at
-    all. But the same bias is in the numerator's ceiling, so dividing by
-    ``H(field)`` left a metric whose maximum moved with the sample: the *same
-    flawless compositional code* read 0.50 over 100 probes, 0.71 over 200 and
-    0.93 over 800, while a 0.30 bar sat still. Against the headroom it reads
-    1.00 at every one of them, and a code carrying three-quarters of each field
-    reads 0.56-0.58 at every one of them.
+    It reads the message in pieces because a whole-message statistic has
+    nothing to say about a five-field lot at any affordable probe count. A
+    whole lot takes 3,456 values and a compositional code gives each its own
+    message, so over a few hundred probes nearly every message is unique and
+    the plug-in I(message; field) sits at H(field) whatever the message means;
+    the shuffled null sits there too, and the difference is noise over a
+    vanishing headroom. Measured on a flawless describer, whole-message MI over
+    its own null read 0.00 at 100 probes, 0.34 at 200 and 0.84 at 400. The
+    per-piece reading is 1.00 at every one of them, a code that gets each field
+    right three times in four reads 0.78 at every one of them, a holistic code
+    (one arbitrary word per lot) 0.04, and a random message 0.03-0.05. Cross-
+    validation is what keeps the max over pieces honest: a piece that only
+    fits the probes it was fitted on predicts nothing on the rest.
     """
     import random as _r
     rng = rng or _r.Random(0)
-    msgs = [tuple(m) for m in messages]
-    per = []
+    n = len(messages)
+    if n < 4 or not fields:
+        return {"coverage": float("nan"), "per_field": [float("nan")] * len(fields),
+                "units": [None] * len(fields)}
+    L = max_len if max_len is not None else max((len(m) for m in messages), default=0)
+    units = _message_units(messages, space=space, hyphen=hyphen, end=end, max_len=L)
+    idx = list(range(n))
+    rng.shuffle(idx)
+    folds = (idx[:n // 2], idx[n // 2:])
+    per, best_unit = [], []
     for f in fields:
         ys = [m[f] for m in meanings]
-        h = _entropy(ys)
-        if h <= 1e-9:
+        if len(set(ys)) < 2:
             per.append(0.0)
+            best_unit.append(None)
             continue
-        real = _mi(msgs, ys)
-        null = 0.0
-        for _ in range(n_shuffles):
-            s = list(ys)
-            rng.shuffle(s)
-            null += _mi(msgs, s) / n_shuffles
-        # Floor the headroom: when the messages are so nearly all distinct that
-        # the shuffled null already reaches H(field), there is nothing left to
-        # measure and the answer is "we cannot tell", which reads as ~0 here
-        # because the numerator has gone to zero with it.
-        per.append(max(0.0, min(1.0, (real - null) / max(h - null, 0.05 * h))))
-    return {"coverage": sum(per) / len(per) if per else float("nan"), "per_field": per}
+        best, name = 0.0, None
+        for label, xs in units:
+            if all(x is None for x in xs):
+                continue
+            acc = (_lookup_accuracy(xs, ys, folds[0], folds[1])
+                   + _lookup_accuracy(xs, ys, folds[1], folds[0])) / 2
+            if acc > best:
+                best, name = acc, label
+        per.append(max(0.0, min(1.0, best)))
+        best_unit.append(name)
+    return {"coverage": sum(per) / len(per), "per_field": per, "units": best_unit}
 
 
 # ==========================================================================

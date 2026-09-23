@@ -36,16 +36,10 @@ from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
                       vocab_stats, zero_shot)
 from .conventions import PopulationUsage
-<<<<<<< HEAD
-from .curriculum import (CurriculumState, ReferentialWorld, costs_apply,
-                         convention_applies, evaluate_rung, growth_applies,
-                         ladder, phase_named, promotion_for, rung_budget,
-                         turnover_applies)
-=======
 from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
                          costs_apply, evaluate_rung, growth_applies, ladder,
-                         pooled_at, promotion_for, rung_budget, turnover_applies)
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+                         phase_named, pooled_at, promotion_for, rung_budget,
+                         turnover_applies)
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -183,13 +177,11 @@ class Trainer:
         self.convention_gate = 0.0 if cfg.curriculum.enabled else 1.0
         # Set once, when the first death is allowed; see `restagger`.
         self._turnover_started = False
-        # The update at which the speaker costs started ramping in, in the first
-        # rung that charges them (`reward.costs_ramp_trigger`); None until then.
-        self._costs_ramp_start: Optional[int] = None
         self.rung_success = RollingStat(window=2000)
-        # The update at which this rung's costs began ramping in; None until its
-        # channel has shown it works. Reset with the rung.
-        self._costs_ramp_from: "int | None" = None
+        # The update at which this rung's costs began ramping in
+        # (`reward.costs_ramp_trigger`); None until its channel has shown it
+        # works. Reset with the rung, and written to the snapshot.
+        self._costs_ramp_from: Optional[int] = None
         # Training updates so far: one per batch. Budgets, promotion checks,
         # checkpoints, anneals, growth and lifespans all count these.
         self.updates = 0
@@ -475,9 +467,9 @@ class Trainer:
     def holdout_floor(self, phase):
         """(reserved, trained) per-field floors for a message-blind guesser.
 
-        The two pools have different field marginals -- the reserved quarter is
-        16 rows and need not be balanced -- so each per-field number is read
-        against its own pool's floor.
+        Two lists in ``COMBO_FIELDS`` order. The two pools have different field
+        marginals -- the reserved quarter is 16 rows and need not be balanced --
+        so each per-field number is read against its own pool's floor.
         """
         rw = self.referential_world
         if rw is None:
@@ -486,8 +478,8 @@ class Trainer:
         train = getattr(rw, "train_combos", None)
         if held is None or train is None:
             return None
-        from .metrics import pool_field_floor
-        return pool_field_floor(held), pool_field_floor(train)
+        from .metrics import pool_field_floors
+        return pool_field_floors(held), pool_field_floors(train)
 
     def chance_for(self, phase) -> float:
         """The floor this phase has to clear (NaN: measured, not analytic)."""
@@ -504,10 +496,10 @@ class Trainer:
         n_eval = lg.ablation_episodes // (2 if light else 1)
         # The light check halves the episode and topsim budgets, which only adds
         # noise to the estimates. It used to move the *bar* as well: field
-        # coverage was normalised by H(field), so its ceiling rose with the
-        # probe count and the frequent check was strictly harder to pass than
-        # the checkpoint one. `properties.field_coverage` now divides by the
-        # headroom its own shuffled null leaves, which is steady in the sample.
+        # coverage was a whole-message statistic whose ceiling rose with the
+        # probe count, so the frequent check was strictly harder to pass than
+        # the checkpoint one. `properties.field_coverage` now reads the message
+        # in pieces, cross-validated, which is steady in the sample.
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
@@ -640,7 +632,7 @@ class Trainer:
                            "transitions": self.curriculum.transitions,
                            "checks_run": self.curriculum.checks_run},
             "cost_gate": self.cost_gate, "updates": self.updates,
-            "costs_ramp_start": self._costs_ramp_start,
+            "costs_ramp_from": self._costs_ramp_from,
             # One pool fills both seats below the trading rungs; the two lists
             # below are then the same agents written twice, and must be restored
             # as one pool, not as two copies that drift apart.
@@ -849,10 +841,12 @@ class Trainer:
         cur.transitions = list(st["curriculum"]["transitions"])
         cur.checks_run = int(st["curriculum"]["checks_run"])
         self.cost_gate = float(st["cost_gate"])
-        self._costs_ramp_start = st.get("costs_ramp_start")
+        # Where this rung's ramp had got to. A snapshot from before it was
+        # written re-earns the trigger, which costs a few updates at most.
+        self._costs_ramp_from = st.get("costs_ramp_from")
         self._turnover_started = bool(st.get("turnover_started", False))
-        self.update_cost_gate()
         self.updates = int(st.get("updates", st.get("batch_no", 0)))
+        self.update_cost_gate()
         cur.updates_in_phase = int(st["curriculum"].get(
             "updates_in_phase", cur.episodes_in_phase // max(1, old_batch)))
         if "updates" in st:
@@ -881,26 +875,6 @@ class Trainer:
                 setattr(a, k, rec[k])
             a.updates = int(rec.get("updates", 0))
             return a
-<<<<<<< HEAD
-        f_ids = [r["agent_id"] for r in st["farmers"]]
-        b_ids = [r["agent_id"] for r in st["buyers"]]
-        if self.pop.shared and f_ids == b_ids:
-            # One pool, written twice. Restoring the two lists separately made two
-            # populations out of one -- the same agent ids, two sets of weights --
-            # and they drifted apart from the first update; a run resumed like
-            # that collapsed to fruit-only messages within a checkpoint.
-            pool = [restore(r) for r in st["farmers"]]
-            self.pop.farmers = pool
-            self.pop.buyers = pool
-            if st.get("shared", None) is False:
-                self.log.always("  [resume] the snapshot held two copies of the pool "
-                                "(the old split-on-resume bug); keeping the farmer "
-                                "copies as the one pool -- expect a short re-settle")
-        else:
-            self.pop.farmers = [restore(r) for r in st["farmers"]]
-            self.pop.buyers = [restore(r) for r in st["buyers"]]
-            self.pop.shared = False
-=======
         # One pool fills both seats below `curriculum.split_roles_at`, and the
         # two lists are then *the same list*. Restoring each of them separately
         # quietly made two copies of every founder -- same agent_id, same
@@ -937,7 +911,6 @@ class Trainer:
             self.pop.buyers = self.pop.farmers
         else:
             self.pop.buyers = [restore(r) for r in st["buyers"]]
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         self.pop._next_id = int(st["next_id"])
         self.pop.deaths = int(st["deaths"])
         self.pop.births = [BirthEvent(**b) for b in st["births"]]
@@ -954,7 +927,6 @@ class Trainer:
         # denote, and they rebuild within one update, so they go.
         self._stale_forms = u.drop_stale_forms()
         so = st["store"]
-<<<<<<< HEAD
         # Stored transcripts remember the rung they were played in as a Phase
         # object; re-bind each to this ladder's rung of the same name, and drop
         # any from a rung this ladder does not have.
@@ -968,16 +940,16 @@ class Trainer:
                 it.phase = phase_named(self.cfg, ph.name).with_informer(
                     getattr(ph, "informer", FARMER))
             kept.append(it)
+        if len(kept) < len(so["buf"]):
+            self.log.always("  [resume] dropped %d stored transcripts from rungs this "
+                            "ladder does not have" % (len(so["buf"]) - len(kept)))
         self.store._buf = kept[:self.store.capacity]
-=======
-        self.store._buf = list(so["buf"])[:self.store.capacity]
         # Belt and braces, and it repairs a snapshot written by a run that had
         # already pulled its store onto the device.
         stray = self.store.to_host()
         if stray:
             self.log.always("  [resume] brought %d stored transcripts back to the host"
                             % stray)
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
         self.store.total_added = int(so["total_added"])
         self.store.meaning_counts = Counter(so["meaning_counts"])
@@ -987,9 +959,6 @@ class Trainer:
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
         self._episode_at_start = self.episode
         self._beat = (time.time(), self.episode)
-        # The ramp is a property of how far *this* rung has got, and the rolling
-        # success it keys off starts empty, so it re-earns its trigger.
-        self._costs_ramp_from = None
         self.maybe_split_roles(cur.phase, log=lambda *_: None)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
@@ -1075,17 +1044,6 @@ class Trainer:
                 and growth_applies(self.cfg, self.curriculum.phase))
 
     def update_cost_gate(self, succ: torch.Tensor = None) -> None:
-<<<<<<< HEAD
-        """Speaker costs: off until ``reward.costs_from_rung``, ramped in there.
-
-        Nothing is charged for while the words are still being invented. Making
-        a word short, rare-free and shared is a pressure on a word that exists;
-        applied earlier it is a pressure to say as little as possible, which the
-        population can satisfy completely without naming anything. In the first
-        rung that charges them, the costs wait until the rung's rolling success
-        has reached ``costs_ramp_trigger`` times its promotion floor, then rise
-        from 0 to full over ``costs_ramp_updates``; every later rung has them on.
-=======
         """Speaker costs: which rung, and how far into it the channel has got.
 
         Nothing is charged for while the words are still being invented, which
@@ -1102,38 +1060,11 @@ class Trainer:
         over `reward.costs_ramp_updates`. A language has to exist before it can
         be economised; this is that rule applied inside a rung rather than
         across them.
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
         """
         if not self.cfg.curriculum.enabled:
             self.cost_gate = self.convention_gate = 1.0
             return
         phase = self.curriculum.phase
-<<<<<<< HEAD
-        R = self.cfg.reward
-        self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
-        if not costs_apply(self.cfg, phase):
-            self.cost_gate = 0.0
-            return
-        first = phase_named(self.cfg, R.costs_from_rung)
-        if phase.index > first.index or R.costs_ramp_trigger <= 0:
-            self.cost_gate = 1.0
-            return
-        if self._costs_ramp_start is None:
-            floor = promotion_for(self.cfg, phase).min_success
-            need = R.costs_ramp_trigger * floor
-            if len(self.rung_success) >= 200 and self.rung_success.mean >= need:
-                self._costs_ramp_start = self.updates
-                self.log.always(
-                    "  [costs] %s reached %.3f (%.1fx its %.2f floor): the speaker "
-                    "starts paying for length and novelty, ramped in over %d updates"
-                    % (phase.name, self.rung_success.mean, R.costs_ramp_trigger, floor,
-                       R.costs_ramp_updates))
-            else:
-                self.cost_gate = 0.0
-                return
-        n = max(1, int(R.costs_ramp_updates))
-        self.cost_gate = min(1.0, max(0.0, (self.updates - self._costs_ramp_start) / n))
-=======
         self.convention_gate = 1.0 if convention_applies(self.cfg, phase) else 0.0
         if not costs_apply(self.cfg, phase):
             self.cost_gate = 0.0
@@ -1163,7 +1094,6 @@ class Trainer:
         over = max(0, int(r.costs_ramp_updates))
         done = self.updates - self._costs_ramp_from
         self.cost_gate = 1.0 if over <= 0 else min(1.0, max(0.0, done / over))
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
 
     def maybe_check_promotion(self) -> None:
         """The light, frequent check -- so a rung that has worked is left promptly."""
@@ -1442,14 +1372,9 @@ class Trainer:
                                 sampler_for=self.phase_sampler)
         # ---- addendum section 3 ------------------------------------------
         words = word_stats(cfg, batches)
-<<<<<<< HEAD
-        overlap = cross_role_overlap(cfg, batches)
-        qty_live = live_encoding(cfg, batches, field=3, given=0)
-=======
         overlap = cross_role_overlap(cfg, batches,
                                      shared_pool=getattr(self.pop, "shared", False))
-        qty_live = live_encoding(cfg, batches, field=1, given=0)
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+        qty_live = live_encoding(cfg, batches, field=3, given=0)
         lenfreq = length_frequency(cfg, self.pop, self.world, device=self.device,
                                    phase=phase)
         buckets = bucketed_analysis(cfg, self.pop, self.world, device=self.device,
@@ -1932,7 +1857,7 @@ class Trainer:
             # while the other two generalise, and the mean alone cannot say so.
             acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
             if acc:
-                names = ("fruit", "colour", "quality")
+                names = tuple(ev.get("holdout_field_names") or ("fruit", "colour", "quality"))
                 zs += " [" + ", ".join(
                     "%s %s/%s" % (n, f(a, "%.2f"),
                                   f(base[i] if base and i < len(base) else None, "%.2f"))

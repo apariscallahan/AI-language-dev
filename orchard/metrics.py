@@ -302,15 +302,10 @@ def phase_labels(cfg: Config, role: int, phase=None) -> list[str]:
 
 
 def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
-<<<<<<< HEAD
-                   held_out: bool = False) -> list[tuple[int, ...]]:
-    """Lots to describe -- (fruit, colour, quality, quantity, price) -- plus the
-    field being asked about.
-=======
                    held_out: bool = False, query: Optional[int] = None
                    ) -> list[tuple[int, ...]]:
-    """(fruit, colour, quality) things to describe, plus the field being asked about.
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+    """Lots to describe -- (fruit, colour, quality, quantity, price) -- plus the
+    field being asked about.
 
     The describer's observation in a naming rung is the lot *and* the query, so
     a probe that left the query out would be asking about the wrong rung: in
@@ -334,26 +329,16 @@ def tuple_meanings(cfg: Config, n: int, seed: int = 0, phase=None,
     rw = ReferentialWorld(cfg, device="cpu", generator=g)
     rows = rw._draw(n, held_out=held_out).tolist()
     width = n_obs_slots(cfg.world, cfg)
-<<<<<<< HEAD
-    mix = getattr(phase, "mix", None) or ((0.0,) * (N_KINDS - 1) + (1.0,))
-    total = float(sum(mix)) or 1.0
-    # The probe asks the fields the rung asks, as often as the rung asks them.
-    asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
-    asks = (asks + [ASK_ALL] * n)[:n]
-    perm = torch.randperm(n, generator=g).tolist()
-    asks = [asks[i] for i in perm]
-=======
     if query is not None:
         asks = [int(query)] * n
     else:
-        mix = getattr(phase, "mix", None) or (0.0, 0.0, 0.0, 1.0)
+        mix = getattr(phase, "mix", None) or ((0.0,) * (N_KINDS - 1) + (1.0,))
         total = float(sum(mix)) or 1.0
         # The probe asks the fields the rung asks, as often as the rung asks them.
         asks = [k for k, w in enumerate(mix) for _ in range(int(round(n * w / total)))]
         asks = (asks + [ASK_ALL] * n)[:n]
         perm = torch.randperm(n, generator=g).tolist()
         asks = [asks[i] for i in perm]
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
     out = []
     for i, r in enumerate(rows):
         row = tuple(r) + (asks[i],)
@@ -368,21 +353,22 @@ def probe_query(phase) -> Optional[int]:
     else about it is rehearsal -- so its describer's code is measured on that
     kind too, and the probe asks ``phase.primary``.
 
-    ``mutual`` has the same observation *schema* (a tuple and a query slot) but
-    never fills the query in: :meth:`MutualBatch.obs` pads it with zeros,
-    because both sides simply hold a thing and nobody is asked about a field.
-    The probes were writing ASK_ALL there, which is a value that slot never
-    takes in training, and ``K_FIELD`` has its own embedding table -- so every
-    structure number on ``mutual`` was read off an observation the speaker had
-    never been trained on. The probe feeds what the rung feeds.
+    ``mutual`` has the same observation *schema* (a lot and a query slot) and
+    :meth:`MutualBatch.obs` fills the query with ``ASK_ALL`` -- both sides hold
+    a whole lot and nobody is asked about one field of it. ``K_FIELD`` has its
+    own embedding table, so a probe that wrote any other value there would be
+    measuring a speaker on an observation it was never trained on (which is
+    what happened when the probes wrote a value the rung never used). The
+    probe feeds what the rung feeds.
 
     ``None`` outside the tuple rungs, where there is no query slot at all.
     """
+    from .curriculum import ASK_ALL
     if phase is None or not getattr(phase, "tuples", False):
         return None
     if getattr(phase, "mutual", False):
-        return 0
-    return int(getattr(phase, "primary", 3))
+        return int(ASK_ALL)
+    return int(getattr(phase, "primary", ASK_ALL))
 
 
 def sample_meanings(cfg: Config, world: World, role: int, n: int,
@@ -527,7 +513,9 @@ def compositionality(cfg: Config, pop: Population, world: World, *,
                                           n_null=0, rng=rng, kinds=kinds)
             dis = disentanglement(meanings, msgs, real, cfg.channel.max_msg_len)
             from .properties import field_coverage
-            cov = field_coverage(meanings, msgs, real, rng=rng)
+            cov = field_coverage(meanings, msgs, real, rng=rng,
+                                 space=cfg.channel.space_id, hyphen=cfg.channel.hyphen_id,
+                                 end=cfg.channel.end_id, max_len=cfg.channel.max_msg_len)
             mine = {tuple(w) for m in msgs for w in parse_words(cfg, m)}
             lexicon |= mine
             per_agent.append({"agent": agent.name, "generation": agent.generation,
@@ -1104,7 +1092,7 @@ def _report_fields(res) -> float:
 
 
 def _report_side(res) -> float:
-    """How often ONE side got all three fields at once, averaged over the roles.
+    """How often ONE side got every field at once, averaged over the roles.
 
     Sits between the per-field numbers and the whole round, and the gap between
     it and the product of the per-field rates is the whole story on held-out
@@ -1134,7 +1122,7 @@ def _report_field_vec(res) -> "list[float] | None":
     return [sum(float(r[i]) for r in rows) / len(rows) for i in range(n)]
 
 
-def pool_field_floor(pool) -> float:
+def pool_field_floors(pool) -> list[float]:
     """Per field, the best a listener that hears nothing can do on this pool.
 
     Combinations are drawn uniformly from a pool, but a *pool* need not have
@@ -1142,19 +1130,57 @@ def pool_field_floor(pool) -> float:
     fruit can easily be six of them. A guesser that ignores the message and
     always says the commonest value scores that share, so it is the floor a
     per-field number has to be read against -- exactly as ``round_chance`` is
-    the floor for a lineup. Returns the mean of that share over the three
-    fields.
+    the floor for a lineup. One number per column of the pool, in its order,
+    which for the combination pools is ``COMBO_FIELDS``.
     """
     try:
         n = int(pool.shape[0])
     except Exception:
-        return float("nan")
+        return []
     if n <= 0:
-        return float("nan")
+        return []
     shares = []
     for col in range(int(pool.shape[1])):
         counts = torch.bincount(pool[:, col].reshape(-1).long())
         shares.append(float(counts.max()) / n)
+    return shares
+
+
+def _floor_of(floors, name: str) -> float:
+    """One field's message-blind floor, from whatever ``holdout_floor_for`` gave.
+
+    A dict by field name, a list in ``COMBO_FIELDS`` order, one number for
+    every field, or nothing at all (0.0).
+    """
+    from .curriculum import COMBO_FIELDS
+    if floors is None:
+        return 0.0
+    if isinstance(floors, dict):
+        v = floors.get(name)
+    elif isinstance(floors, (list, tuple)):
+        names = list(COMBO_FIELDS)
+        i = names.index(name) if name in names else -1
+        v = floors[i] if 0 <= i < len(floors) else None
+    else:
+        v = floors
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if v != v else v
+
+
+def pool_field_floor(pool) -> float:
+    """The mean of :func:`pool_field_floors` over the pool's fields.
+
+    Combinations are drawn uniformly from a pool, but a *pool* need not have
+    uniform field marginals: the reserved quarter is 16 rows of 64, and one
+    fruit can easily be six of them. A guesser that ignores the message and
+    always says the commonest value scores that share, so it is the floor a
+    per-field number has to be read against -- exactly as ``round_chance`` is
+    the floor for a lineup.
+    """
+    shares = pool_field_floors(pool)
     return sum(shares) / len(shares) if shares else float("nan")
 
 
@@ -1235,10 +1261,16 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["seen_side"] = float("nan")
     out["holdout_field_ratio"] = float("nan")
     if holdout_sampler_for is not None:
+        from .curriculum import COMBO_FIELDS
         hs, seen = [], []
-        hf, sf = [], []
-        hv, sv = [], []
         hd, sd = [], []
+        # Per field, by name, on the fields a held-out combination is made of.
+        # Quantity and price are never held out, so their held-out accuracy is
+        # their trained accuracy and would only pad the ratio; and the two roles
+        # need not report the same fields (in `offer` the buyer reports the
+        # lot's stock, quality and price), so nothing is averaged by position.
+        acc_h: dict[str, list[float]] = {}
+        acc_s: dict[str, list[float]] = {}
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1258,21 +1290,19 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                 seen.append(s["success_rate"])
                 # Where a round is scored as a conjunction, the conjunction is a
                 # terrible estimator of whether the code generalises: `mutual`
-                # wants three fields right on each of two novel meanings, so a
-                # per-field shortfall is raised to the sixth power. Per-field
+                # wants five fields right on each of two novel lots, so a
+                # per-field shortfall is raised to the tenth power. Per-field
                 # accuracy on the same rounds answers the same question without
-                # the exponent -- the argument the request rungs already make
+                # the exponent -- the argument the report rungs already make
                 # ("which field arrived, not the conjunction").
-                a, b = _report_fields(h), _report_fields(s)
-                if a == a:
-                    hf.append(a)
-                if b == b:
-                    sf.append(b)
-                va, vb = _report_field_vec(h), _report_field_vec(s)
-                if va:
-                    hv.append(va)
-                if vb:
-                    sv.append(vb)
+                for label in ("farmer", "buyer"):
+                    names = h.get("%s_field_names" % label) or []
+                    hv = h.get("%s_report_fields" % label) or []
+                    sv = s.get("%s_report_fields" % label) or []
+                    for name, a, b in zip(names, hv, sv):
+                        if name in COMBO_FIELDS:
+                            acc_h.setdefault(name, []).append(float(a))
+                            acc_s.setdefault(name, []).append(float(b))
                 da, db = _report_side(h), _report_side(s)
                 if da == da:
                     hd.append(da)
@@ -1284,66 +1314,31 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
-<<<<<<< HEAD
-        if phase.reporting and last_abl:
-            # Per field, for the report rungs: a listener whose heads have learned
-            # the training set's joint puts no mass on a reserved combination
-            # however compositional the *language* is, so the whole-round ratio
-            # sits near zero. What the gate can fairly ask is that each field of
-            # a held-out combination is read nearly as well as of a trained one,
-            # as a share of the headroom over a muted channel.
-            from .curriculum import COMBO_FIELDS
-            hs_f, seen_f, ratios = [], [], []
-            for v in phase.views():
-                sam = holdout_sampler_for(v)
-                plain = sampler_for(v)
-                if sam is None:
-                    continue
-                try:
-                    h = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
-                                         device=device, rng=rng, phase=v, sampler=sam)
-                    s = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
-                                         device=device, rng=rng, phase=v,
-                                         sampler=lambda n, _ho=False, _p=plain: _p(n, held_out=False))
-                except Exception:
-                    continue
-                for label in ("farmer", "buyer"):
-                    names = h.get("%s_field_names" % label) or []
-                    hv = h.get("%s_report_fields" % label) or []
-                    sv = s.get("%s_report_fields" % label) or []
-                    mv = last_abl.get("%s_fields_muted" % label) or []
-                    for name, a, b, m in zip(names, hv, sv, mv):
-                        if name not in COMBO_FIELDS:
-                            continue
-                        hs_f.append(a)
-                        seen_f.append(b)
-                        room = b - m
-                        if room > 0.02:
-                            ratios.append(max(0.0, (a - m) / room))
-            out["holdout_field_success"] = sum(hs_f) / len(hs_f) if hs_f else float("nan")
-            out["seen_field_success"] = sum(seen_f) / len(seen_f) if seen_f else float("nan")
-            out["holdout_field_ratio"] = sum(ratios) / len(ratios) if ratios else float("nan")
-=======
-        for key, rows in (("holdout_field_acc", hv), ("seen_field_acc", sv)):
-            if rows:
-                n = min(len(r) for r in rows)
-                out[key] = [sum(r[i] for r in rows) / len(rows) for i in range(n)]
         if hd:
             out["holdout_side"] = sum(hd) / len(hd)
         if sd:
             out["seen_side"] = sum(sd) / len(sd)
-        if hf and sf:
-            out["holdout_fields"] = sum(hf) / len(hf)
-            out["seen_fields"] = sum(sf) / len(sf)
-            h_floor = s_floor = 0.0
+        fields = [n for n in COMBO_FIELDS if acc_h.get(n) and acc_s.get(n)]
+        if fields:
+            def mean(xs):
+                return sum(xs) / len(xs)
+            ha = [mean(acc_h[n]) for n in fields]
+            sa = [mean(acc_s[n]) for n in fields]
+            out["holdout_field_names"] = list(fields)
+            out["holdout_field_acc"] = ha
+            out["seen_field_acc"] = sa
+            out["holdout_fields"] = out["holdout_field_success"] = mean(ha)
+            out["seen_fields"] = out["seen_field_success"] = mean(sa)
+            # The floor is what a message-blind guesser gets on the pool being
+            # scored -- the commonest value's share, per field and per pool,
+            # because the reserved quarter is 16 rows of 64 and need not be
+            # balanced. A memorised code then reads 0 rather than the base rate
+            # it would score anyway.
+            h_floor = s_floor = None
             if holdout_floor_for is not None:
                 got = holdout_floor_for(phase)
                 if got is not None:
                     h_floor, s_floor = got
-                    h_floor = 0.0 if h_floor != h_floor else h_floor
-                    s_floor = 0.0 if s_floor != s_floor else s_floor
-            # Headroom over what a message-blind guesser gets, so a memorised
-            # code reads 0 rather than the base rate it would score anyway.
             # Per field, then averaged -- not a ratio of the two means. The
             # ratio of means weights each field by its headroom, so the field
             # the language learned best also counts most towards whether the
@@ -1355,25 +1350,21 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             # same masking the per-role and per-kind gates already refuse --
             # "a pooled average would let a fluent farmer carry a buyer that
             # never learned to speak".
-            ha = out.get("holdout_field_acc") or []
-            sa = out.get("seen_field_acc") or []
             ratios = []
-            for i in range(min(len(ha), len(sa))):
+            for i, name in enumerate(fields):
+                lo_h = _floor_of(h_floor, name)
+                lo_s = _floor_of(s_floor, name)
                 # A ratio between two numbers both at the floor is noise, and
                 # noise reads 1.00 as readily as 0.00. A field the language
                 # never learned has nothing to say about generalising, so it is
                 # left out rather than counted as a pass or a failure.
-                if sa[i] - s_floor > 0.05:
-                    ratios.append(max(0.0, min(1.0, (ha[i] - h_floor)
-                                               / (sa[i] - s_floor))))
-            if ratios:
-                out["holdout_field_ratios"] = ratios
-                out["holdout_field_ratio"] = sum(ratios) / len(ratios)
-            elif out["seen_fields"] - s_floor > 0.05:
-                out["holdout_field_ratio"] = max(0.0, min(
-                    1.0, (out["holdout_fields"] - h_floor)
-                    / (out["seen_fields"] - s_floor)))
->>>>>>> 002db8418e36616681864e1a1f7a7b4dc78519ac
+                if sa[i] - lo_s > 0.05:
+                    ratios.append(max(0.0, min(1.0, (ha[i] - lo_h) / (sa[i] - lo_s))))
+                else:
+                    ratios.append(float("nan"))
+            good = [r for r in ratios if r == r]
+            out["holdout_field_ratios"] = ratios
+            out["holdout_field_ratio"] = sum(good) / len(good) if good else float("nan")
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.
