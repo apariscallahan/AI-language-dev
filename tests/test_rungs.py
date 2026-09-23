@@ -1949,3 +1949,99 @@ class TestConventionsKnowWhatWasAsked(unittest.TestCase):
                                      "%s/%s writes a %r key of length %d, not %d"
                                      % (phase.name, role, key[0], len(key),
                                         want[key[0]]))
+
+
+# ==========================================================================
+class TestProductivityIsJudgedOnFieldsNotTheConjunction(unittest.TestCase):
+    """`mutual` scores a round only when three fields land on each of two novel
+    meanings. Per-field accuracy therefore enters the held-out number to the
+    sixth power, and the ratio the gate reads is no longer a measure of whether
+    the code generalises -- it is that measure raised to a power that crushes
+    every partial result into the noise around zero."""
+
+    def test_the_conjunction_hides_a_plainly_productive_code(self):
+        # What the exponent does to a code that generalises at 0.73 per field
+        # when it manages 0.80 on what it trained on.
+        per_field_ratio = 0.73 / 0.80
+        joint_ratio = (0.73 ** 6) / (0.80 ** 6)
+        self.assertGreater(per_field_ratio, 0.90)
+        self.assertLess(joint_ratio, 0.60)      # fails the bar it should clear
+
+    def test_the_gate_reads_the_fields_when_they_are_there(self):
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        self.assertTrue(phase.whole)
+        ev = _mutual_evidence(cfg, holdout_fields=0.73, seen_fields=0.80,
+                              holdout_success=0.73 ** 6, seen_success=0.80 ** 6,
+                              holdout_field_ratio=(0.73 - 0.28) / (0.80 - 0.25))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        check = checks["describes combinations it never trained on"]
+        self.assertTrue(check["met"], check["detail"])
+        self.assertIn("per field", check["detail"])
+
+    def test_a_memorised_code_still_fails(self):
+        """The fix must not be a lower bar: a code sitting at the floor for
+        meanings it never saw reads 0.00, not the base rate it scores anyway."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "mutual")
+        ev = _mutual_evidence(cfg, holdout_fields=0.28, seen_fields=0.80,
+                              holdout_success=0.0, seen_success=0.80 ** 6,
+                              holdout_field_ratio=0.0)
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        self.assertFalse(
+            checks["describes combinations it never trained on"]["met"])
+
+    def test_a_rung_without_field_reports_keeps_the_old_check(self):
+        """Lineup rungs score one K-way choice, so there is no exponent to
+        remove and the joint ratio is still the right number."""
+        cfg = cfg_small()
+        phase = phase_named(cfg, "name-all")
+        ev = _mutual_evidence(cfg, holdout_fields=float("nan"),
+                              seen_fields=float("nan"), holdout_success=0.80,
+                              seen_success=0.85, holdout_field_ratio=float("nan"))
+        _, checks = evaluate_rung(cfg, phase, ev, updates_in_phase=10 ** 6)
+        detail = checks["describes combinations it never trained on"]["detail"]
+        self.assertNotIn("per field", detail)
+
+
+class TestTheFloorComesFromThePoolBeingScored(unittest.TestCase):
+    """A quarter of 64 combinations is 16 rows, and 16 rows need not be balanced.
+    Scoring a per-field number against 1/4 would credit a message-blind guesser
+    with whatever skew the reserved pool happens to have."""
+
+    def test_a_skewed_pool_has_a_higher_floor(self):
+        # fruit is 0 in six of eight rows; colour and quality are balanced.
+        pool = torch.tensor([[0, 0, 0], [0, 1, 1], [0, 2, 2], [0, 3, 3],
+                             [0, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, 0]])
+        floor = M.pool_field_floor(pool)
+        # fruit 6/8, colour 2/8, quality 2/8
+        self.assertAlmostEqual(floor, (0.75 + 0.25 + 0.25) / 3, places=6)
+        self.assertGreater(floor, 0.25)
+
+    def test_a_balanced_pool_sits_at_one_over_the_span(self):
+        pool = torch.tensor([[f, c, q] for f in range(4)
+                             for c in range(4) for q in range(4)])
+        self.assertAlmostEqual(M.pool_field_floor(pool), 0.25, places=6)
+
+    def test_an_empty_pool_is_not_a_crash(self):
+        self.assertNotEqual(M.pool_field_floor(torch.zeros((0, 3), dtype=torch.long)),
+                            M.pool_field_floor(torch.zeros((0, 3), dtype=torch.long)))
+
+
+def _mutual_evidence(cfg, **over):
+    """A `phase_evidence` row that passes every check but the productivity one."""
+    role = {"field_coverage": 1.0, "per_field_coverage": [1.0, 1.0, 1.0],
+            "topsim": 0.9, "topsim_null": 0.1, "topsim_over_null": 0.9,
+            "positional_structure": 0.9, "report": 0.9}
+    ev = {
+        "success": 0.9, "chance": float("nan"), "transfer": 1.0,
+        "holdout_ratio": (over.get("holdout_success", 0.0)
+                          / max(1e-9, over.get("seen_success", 1.0))),
+        "per_role_structure": {"farmer": dict(role), "buyer": dict(role)},
+        "speakers": {"farmer": dict(role), "buyer": dict(role)},
+        "views": [{"success": 0.9, "transfer": 1.0}],
+        "mutual_report": 0.9, "farmer_report": 0.9, "buyer_report": 0.9,
+        "muted_success": 0.05, "by_kind": {},
+    }
+    ev.update(over)
+    return ev

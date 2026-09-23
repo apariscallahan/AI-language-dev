@@ -755,11 +755,32 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         ratio = _num(ev.get("holdout_ratio"))
         chance = _num(ev.get("chance"))
         above_chance = chance != chance or (hs == hs and hs >= k * chance)
-        checks["describes combinations it never trained on"] = (
-            ratio == ratio and ratio >= c.min_holdout_ratio and above_chance,
-            "held-out %s vs seen %s = %s of it, need %.2f%s"
-            % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
-               "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance))))
+        # Where the rung scores a round as a conjunction, judge the ratio on the
+        # fields, not on the conjunction. `mutual` needs three fields right on
+        # each of two novel meanings, so per-field accuracy enters this number
+        # to the sixth power: a code generalising at 0.73 per field against 0.80
+        # trained -- a per-field ratio of 0.91, plainly productive -- scores
+        # 0.15 against 0.26 as a whole round, a joint ratio of 0.58 that fails
+        # a bar it should clear; and 0.60 per field reads 0.05/0.26 = 0.18,
+        # which is not distinguishable from a code that generalises not at all.
+        # The per-field ratio is the same question with the exponent removed,
+        # normalised by the headroom over a message-blind guesser so a memorised
+        # code reads 0.00 rather than the base rate it scores anyway.
+        f_ratio = _num(ev.get("holdout_field_ratio"))
+        if f_ratio == f_ratio:
+            hf, sf = _num(ev.get("holdout_fields")), _num(ev.get("seen_fields"))
+            checks["describes combinations it never trained on"] = (
+                f_ratio >= c.min_holdout_ratio,
+                "held-out %s vs seen %s per field = %s of the headroom, need "
+                "%.2f (the whole round: %s vs %s)"
+                % (_fmt(hf), _fmt(sf), _fmt(f_ratio), c.min_holdout_ratio,
+                   _fmt(hs), _fmt(seen)))
+        else:
+            checks["describes combinations it never trained on"] = (
+                ratio == ratio and ratio >= c.min_holdout_ratio and above_chance,
+                "held-out %s vs seen %s = %s of it, need %.2f%s"
+                % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
+                   "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance))))
     passed = all(v[0] for v in checks.values())
     return passed, {name: {"met": v[0], "detail": v[1]} for name, v in checks.items()}
 

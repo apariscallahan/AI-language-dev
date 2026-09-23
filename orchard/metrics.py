@@ -1058,12 +1058,47 @@ def context_consistency(cfg: Config, pop: Population, *, n: int = 45,
     return {"n": len(same), "same_meaning": s, "different_meaning": d, "consistency": s - d}
 
 
+def _report_fields(res) -> float:
+    """Mean per-field report accuracy over both roles, or NaN if not a mutual round."""
+    vals = []
+    for k in ("farmer_report_fields", "buyer_report_fields"):
+        v = (res or {}).get(k)
+        if v:
+            vals.extend(float(x) for x in v)
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def pool_field_floor(pool) -> float:
+    """Per field, the best a listener that hears nothing can do on this pool.
+
+    Combinations are drawn uniformly from a pool, but a *pool* need not have
+    uniform field marginals: the reserved quarter is 16 rows of 64, and one
+    fruit can easily be six of them. A guesser that ignores the message and
+    always says the commonest value scores that share, so it is the floor a
+    per-field number has to be read against -- exactly as ``round_chance`` is
+    the floor for a lineup. Returns the mean of that share over the three
+    fields.
+    """
+    try:
+        n = int(pool.shape[0])
+    except Exception:
+        return float("nan")
+    if n <= 0:
+        return float("nan")
+    shares = []
+    for col in range(int(pool.shape[1])):
+        counts = torch.bincount(pool[:, col].reshape(-1).long())
+        shares.append(float(counts.max()) / n)
+    return sum(shares) / len(shares) if shares else float("nan")
+
+
 # ---- the evidence a curriculum rung is judged on ---------------------------
 def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    sampler_for, n_eval: int, n_topsim: int, n_semantics: int,
                    chance: float, device: str = "cpu",
                    rng: Optional[random.Random] = None,
                    holdout_sampler_for=None,
+                   holdout_floor_for=None,
                    kind_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
@@ -1121,8 +1156,12 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     # Held-out combinations, played exactly like the rung itself.
     out["holdout_success"] = float("nan")
     out["holdout_ratio"] = float("nan")
+    out["holdout_fields"] = float("nan")
+    out["seen_fields"] = float("nan")
+    out["holdout_field_ratio"] = float("nan")
     if holdout_sampler_for is not None:
         hs, seen = [], []
+        hf, sf = [], []
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1140,12 +1179,40 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             if h.get("n"):
                 hs.append(h["success_rate"])
                 seen.append(s["success_rate"])
+                # Where a round is scored as a conjunction, the conjunction is a
+                # terrible estimator of whether the code generalises: `mutual`
+                # wants three fields right on each of two novel meanings, so a
+                # per-field shortfall is raised to the sixth power. Per-field
+                # accuracy on the same rounds answers the same question without
+                # the exponent -- the argument the request rungs already make
+                # ("which field arrived, not the conjunction").
+                a, b = _report_fields(h), _report_fields(s)
+                if a == a:
+                    hf.append(a)
+                if b == b:
+                    sf.append(b)
         if hs:
             out["holdout_success"] = sum(hs) / len(hs)
             base = sum(seen) / len(seen) if seen else float("nan")
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
+        if hf and sf:
+            out["holdout_fields"] = sum(hf) / len(hf)
+            out["seen_fields"] = sum(sf) / len(sf)
+            h_floor = s_floor = 0.0
+            if holdout_floor_for is not None:
+                got = holdout_floor_for(phase)
+                if got is not None:
+                    h_floor, s_floor = got
+                    h_floor = 0.0 if h_floor != h_floor else h_floor
+                    s_floor = 0.0 if s_floor != s_floor else s_floor
+            # Headroom over what a message-blind guesser gets, so a memorised
+            # code reads 0 rather than the base rate it would score anyway.
+            head = out["seen_fields"] - s_floor
+            if head > 1e-9:
+                out["holdout_field_ratio"] = max(0.0, min(
+                    1.0, (out["holdout_fields"] - h_floor) / head))
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.
