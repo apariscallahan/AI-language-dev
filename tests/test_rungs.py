@@ -2607,3 +2607,79 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
             self.assertIn("rung mutual", tr2.resume_note)
             self.assertIn("wound back from ask-qty", tr2.resume_note)
             tr2.close()
+
+
+# ==========================================================================
+class TestALineupRungCanBeAskedAboutOneFieldToo(unittest.TestCase):
+    """`mutual` is measured per field because each side reports three fields.
+    A lineup rung scores one K-way choice, so it has no per-field report -- but
+    it has single-field rounds (`name-all` spends a tenth of its rounds on
+    each), and held-out success on those asks the same question: does *this
+    field* generalise. Without it the only rung with a productivity gate below
+    `mutual` is judged on a pooled number with no field-by-field view at all."""
+
+    def _trainer(self, d):
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.world.n_varieties = 4
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.train.device = "cpu"
+        cfg.log.plot = False
+        return Trainer(cfg, d, quiet=True)
+
+    def test_the_kind_sampler_can_draw_held_out_rounds(self):
+        """The contract the whole measurement rests on."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            ph = phase_named(tr.cfg, "name-all")
+            sam = tr.kind_sampler(ph, 1)                 # colour rounds
+            self.assertIsNotNone(sam)
+            held = sam(64, held_out=True)
+            rw = tr.referential_world
+            self.assertTrue(bool(rw.is_held_out(
+                held.meanings.gather(1, held.target.view(-1, 1, 1)
+                                     .expand(-1, 1, 3)).reshape(-1, 3)).all()))
+            seen = sam(64, held_out=False)
+            self.assertFalse(bool(rw.is_held_out(
+                seen.meanings.reshape(-1, 3)).any()))
+            tr.close()
+
+    def test_a_single_field_holdout_round_is_not_a_clean_test(self):
+        """And why the report marks it. A colour round holds fruit and quality
+        fixed and varies colour; the reserved set keeps exactly one colour for
+        each such cell, so the target is the ONLY reserved candidate and can be
+        told from the rest without understanding a word. The whole-thing round
+        reserves every candidate, which is what `_open_round` exists to do."""
+        with tempfile.TemporaryDirectory() as d:
+            tr = self._trainer(d)
+            ph = phase_named(tr.cfg, "name-all")
+            rw = tr.referential_world
+            counts = {}
+            for kind in (1, 2, 3):
+                b = tr.kind_sampler(ph, kind)(256, held_out=True)
+                m = b.meanings
+                res = rw.is_held_out(m.reshape(-1, 3)).view(m.shape[0], m.shape[1])
+                counts[kind] = float(res.float().sum(1).mean())
+            self.assertAlmostEqual(counts[1], 1.0, places=2)      # colour
+            self.assertAlmostEqual(counts[2], 1.0, places=2)      # quality
+            self.assertAlmostEqual(counts[3], 3.0, places=2)      # whole thing
+            tr.close()
+
+    def test_name_all_keeps_single_field_rounds_and_mutual_does_not(self):
+        """The asymmetry the whole diagnosis turns on: `name-all` spends a tenth
+        of its rounds on each field alone, `mutual` spends none."""
+        cfg = Config()
+        na, mu = phase_named(cfg, "name-all"), phase_named(cfg, "mutual")
+        self.assertEqual(len(na.kinds), 4)
+        self.assertEqual(mu.kinds, (3,))
+        self.assertIn("single-field rounds still mixed in", na.blurb)
+
+    def test_no_headroom_reports_no_answer(self):
+        """A round at chance on trained combinations has nothing to say about
+        generalising, so `transfers` is NaN rather than a number."""
+        ch, trained, held = 0.333, 0.34, 0.35
+        head = trained - ch
+        self.assertLessEqual(head, 0.05)
+        ratio = (max(0.0, min(1.0, (held - ch) / head))
+                 if head > 0.05 else float("nan"))
+        self.assertNotEqual(ratio, ratio)

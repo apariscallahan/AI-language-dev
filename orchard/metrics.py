@@ -1299,8 +1299,9 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     # fruit; one number over both would let either hide behind the other.
     out["by_kind"] = {}
     if kind_sampler_for is not None and len(getattr(phase, "kinds", ())) > 1:
+        from .curriculum import ASK_ALL, round_chance
         for kind in phase.kinds:
-            rates = []
+            rates, held = [], []
             for v in phase.views():
                 sam = kind_sampler_for(v, kind)
                 if sam is None:
@@ -1308,13 +1309,44 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                 try:
                     r = evaluate_success(cfg, pop, world, max(128, n_eval // 3),
                                          device=device, rng=rng, phase=v, sampler=sam)
+                    # The same kind of round, on combinations nobody trained on.
+                    # A lineup rung has no per-field report to read -- success is
+                    # one K-way choice -- so this is the only way to ask of it
+                    # what `mutual` is asked: does *this field* generalise. It is
+                    # also the field-by-field view its own productivity gate has
+                    # never had, and `name-all` is judged by that gate.
+                    h = evaluate_success(cfg, pop, world, max(128, n_eval // 3),
+                                         device=device, rng=rng, phase=v,
+                                         sampler=lambda n, _ho=False, _s=sam:
+                                         _s(n, held_out=True))
                 except Exception:
                     continue
                 if r.get("n"):
                     rates.append(r["success_rate"])
+                if h.get("n"):
+                    held.append(h["success_rate"])
             if rates:
-                out["by_kind"][int(kind)] = {"success": sum(rates) / len(rates),
-                                             "views": len(rates)}
+                row = {"success": sum(rates) / len(rates), "views": len(rates)}
+                if held:
+                    ch = round_chance(cfg, kind)
+                    row["holdout"] = sum(held) / len(held)
+                    # Only a whole-thing round is a clean productivity test.
+                    # A single-field lineup holds every field but the queried
+                    # one fixed, and the Latin square reserves exactly one
+                    # value of that field for each such cell -- so the target
+                    # is the ONLY reserved candidate and can be told from the
+                    # rest without understanding a word. Measured: 1 of 3 on a
+                    # colour or quality round, 3 of 3 on a whole thing. The
+                    # number is still worth having, but it is not comparable
+                    # with one from a round where every candidate is reserved.
+                    row["holdout_clean"] = bool(kind == ASK_ALL)
+                    head = row["success"] - ch
+                    # As everywhere else: over the headroom above a guesser, so a
+                    # memorised code reads 0.00 rather than the chance it scores
+                    # anyway, and too little headroom reads as no answer at all.
+                    row["transfers"] = (max(0.0, min(1.0, (row["holdout"] - ch) / head))
+                                        if head > 0.05 else float("nan"))
+                out["by_kind"][int(kind)] = row
 
     if (phase.mutual or phase.order) and out["views"]:
         # no analytic chance for "report / fill a whole tuple": silence is the floor

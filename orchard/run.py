@@ -295,7 +295,7 @@ def compare(paths: list[str], out: str) -> int:
 
 
 # --------------------------------------------------------------------------
-def holdout_report(cfg: Config, path: str) -> int:
+def holdout_report(cfg: Config, path: str, at: "str | None" = None) -> int:
     """Which field generalises to combinations nobody trained on, field by field.
 
     The promotion gate reports one number -- the mean over (fruit, colour,
@@ -327,6 +327,11 @@ def holdout_report(cfg: Config, path: str) -> int:
     out = os.path.join(os.path.dirname(os.path.abspath(path)), "_holdout_report")
     trainer = Trainer(cfg, out, quiet=True)
     trainer.load_snapshot(path)
+    if at:
+        # `after-<rung>.pt` points at the rung *after*, so scoring one of those
+        # on the rung it is named for needs saying. `--resume-at` already means
+        # "put the curriculum here", so it means the same thing here.
+        trainer.rewind_to(at)
     phase = trainer.curriculum.phase
     if not getattr(phase, "whole", False):
         # The gate runs at `name-all` and `mutual` only; a later snapshot has to
@@ -344,12 +349,47 @@ def holdout_report(cfg: Config, path: str) -> int:
         n_topsim=cfg.log.topsim_samples, n_semantics=cfg.log.topsim_samples,
         chance=trainer.chance_for(phase), device=cfg.train.device,
         rng=_random.Random(0), holdout_sampler_for=trainer.holdout_sampler,
-        holdout_floor_for=trainer.holdout_floor)
+        holdout_floor_for=trainer.holdout_floor,
+        kind_sampler_for=trainer.kind_sampler)
     acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
     floors = trainer.holdout_floor(phase) or (float("nan"), float("nan"))
     print("rung %s, %d held-out combinations of %d"
           % (phase.name, len(trainer.referential_world.holdout.held),
              cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
+    by_kind = ev.get("by_kind") or {}
+    if by_kind:
+        # A lineup rung scores one K-way choice, so there is no per-field report
+        # to read; its single-field rounds are the per-field question instead.
+        from .curriculum import ROUND_NAMES, round_chance
+        print()
+        print("%-13s %8s %8s %9s %8s" % ("round", "held-out", "trained",
+                                          "transfers", "chance"))
+        dirty = False
+        for k in sorted(by_kind):
+            row = by_kind[k]
+            mark = "" if row.get("holdout_clean", True) else " (*)"
+            dirty = dirty or bool(mark)
+            print("%-13s %8.3f %8.3f %9s %8.3f%s"
+                  % (ROUND_NAMES[k] if 0 <= k < len(ROUND_NAMES) else str(k),
+                     row.get("holdout", float("nan")),
+                     row.get("success", float("nan")),
+                     ("%.3f" % row["transfers"]) if row.get("transfers") ==
+                     row.get("transfers") else "n/a", round_chance(cfg, k), mark))
+        if dirty:
+            print()
+            print("  (*) not a clean productivity test. A single-field lineup "
+                  "holds every field but")
+            print("      the queried one fixed, and the reserved set keeps "
+                  "exactly one value of that")
+            print("      field per cell -- so the target is the only reserved "
+                  "candidate in the lineup")
+            print("      and can be told from the rest without understanding a "
+                  "word. Only the whole")
+            print("      thing has every candidate reserved.")
+        print()
+    if not acc:
+        trainer.close()
+        return 0
     each = ev.get("holdout_field_ratios") or []
     print("%-11s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
     prod_h = prod_s = 1.0
@@ -483,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = config_from_args(args)
     if args.holdout_report:
-        return holdout_report(cfg, args.holdout_report)
+        return holdout_report(cfg, args.holdout_report, args.resume_at)
     if args.smoke:
         return smoke(cfg)
     if args.benchmark:
@@ -503,8 +543,9 @@ def main(argv: list[str] | None = None) -> int:
         trainer.load_snapshot(args.resume)
         if args.resume_at:
             trainer.rewind_to(args.resume_at)
-    elif args.resume_at:
-        print("--resume-at needs --resume: it moves the curriculum of a snapshot")
+    elif args.resume_at and not args.holdout_report:
+        print("--resume-at needs --resume or --holdout-report: it moves the "
+              "curriculum of a snapshot")
         return 2
     try:
         final = trainer.run()
