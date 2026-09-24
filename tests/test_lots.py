@@ -93,8 +93,10 @@ class TestReportRungCheckpoints(unittest.TestCase):
                 self.assertIn(lbl + k, ev)
             self.assertIn("muted_" + lbl + "_new", ev)
         for k in ("holdout_field_ratio", "holdout_field_success", "seen_field_success",
+                  "holdout_field_floors", "seen_field_floors", "holdout_field_names",
                   "transfer"):
             self.assertIn(k, ev)
+        self.assertEqual(len(ev["seen_field_floors"]), len(ev["holdout_field_names"]))
         # and the promotion check ran on it, per field
         self.assertTrue(last.get("checks"), "no promotion check was run")
         self.assertTrue(any("carries" in k for k in last["checks"]),
@@ -113,6 +115,13 @@ class TestReportRungCheckpoints(unittest.TestCase):
         row, last = self._checkpoint("order")
         self.assertEqual(row["phase"], "order")
         self._check(row, last, order.report_names)
+        # The shopper mostly wants LOW quality, so on trained rounds a reader
+        # that ignores the message already gets quality ~0.44 of the time; the
+        # reserved combinations are drawn flat. Each side's floor is its own.
+        ev = row["rung_evidence"]
+        q = ev["holdout_field_names"].index("quality")
+        self.assertGreater(ev["seen_field_floors"][q], 0.30, ev["seen_field_floors"])
+        self.assertLess(ev["holdout_field_floors"][q], ev["seen_field_floors"][q])
 
     def test_judge(self):
         cfg = Config()

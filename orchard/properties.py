@@ -307,10 +307,27 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
     zs, zr = _latest(rows, lambda r: _num(r["zero_shot"]["retention"])
                      if (r.get("zero_shot") or {}).get("context") == "lineup tuples" else None)
     ts, _ = _latest(rows, lambda r: _num((r.get("compositionality") or {}).get("mean")))
-    if zs is None:
+    # The report rungs measure the same thing per field, over the headroom above
+    # a message-blind guesser (`metrics.phase_evidence`), and they come after
+    # the lineup, so a later checkpoint's per-field ratio is the number to read.
+    fr, frow = _latest(rows, lambda r: _num((r.get("rung_evidence") or {})
+                                            .get("holdout_field_ratio")))
+    if fr is not None and (zs is None or (frow or {}).get("update", -1)
+                           >= (zr or {}).get("update", -1)):
+        v = PRESENT if fr >= 0.8 else (PARTIAL if fr >= 0.5 else ABSENT)
+        each = (frow.get("rung_evidence") or {}).get("holdout_field_ratios") or []
+        names = (frow.get("rung_evidence") or {}).get("holdout_field_names") or []
+        per = ", ".join("%s %s" % (n, ("%.2f" % x) if x == x else "n/a")
+                        for n, x in zip(names, each))
+        add("productivity", "held-out (fruit, colour, quality) combinations reported "
+            "as well as trained ones, per field, as a share of the headroom above "
+            "a message-blind guesser (report rung %s)" % frow.get("phase", "?"), fr, v,
+            ("per field: %s; " % per if per else "")
+            + "topsim %.3f at the same point" % (ts if ts is not None else float("nan")))
+    elif zs is None:
         add("productivity", "success on (fruit, colour, quality) combinations never "
             "seen in training, relative to seen ones", float("nan"), NOT_REACHED,
-            "no lineup checkpoint measured held-out combinations")
+            "no checkpoint measured held-out combinations")
     else:
         v = PRESENT if zs >= 0.8 else (PARTIAL if zs >= 0.5 else ABSENT)
         add("productivity", "held-out combination success / seen success (lineup)", zs, v,

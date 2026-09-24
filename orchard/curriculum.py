@@ -285,7 +285,12 @@ class Phase:
         words are about whichever lot was asked for, which no probe of its own
         observation can hold fixed.
         """
-        roles = [r for r in (FARMER, BUYER) if self.speaks(cfg, r)]
+        # Over every view: in a swap rung the buyer describes in the second
+        # view and would otherwise be taken for a barn speaker and never
+        # probed, which left `name-all` with an n/a structure bar it could not
+        # clear.
+        roles = [r for r in (FARMER, BUYER)
+                 if any(v.speaks(cfg, r) for v in self.views())]
         if self.tuples:
             return roles
         return [r for r in roles if r == BUYER]

@@ -134,6 +134,29 @@ class TestTheLadderTeachesOneFieldAtATime(unittest.TestCase):
                         "nothing pays for reusing a word on the rung whose whole "
                         "job is to reuse three of them")
 
+    def test_both_describers_are_probed_for_structure_in_a_swap_rung(self):
+        """A swap rung has the buyer describing in its second view. Asking the
+        default view alone made the buyer a barn speaker to the structure
+        probes, so its coverage read n/a and `name-all` could not be left."""
+        from orchard import metrics as M
+        cfg = Config()
+        for p in ladder(cfg):
+            want = ([FARMER, BUYER] if p.tuples else
+                    [r for r in (BUYER,) if any(v.speaks(cfg, r) for v in p.views())])
+            self.assertEqual(p.lot_speakers(cfg), want, p.name)
+        cfg.model.d_model, cfg.model.d_ff = 32, 64
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.population.founders_farmers = cfg.population.founders_buyers = 2
+        from orchard.population import Population
+        pop = Population(cfg, random.Random(0))
+        comp = M.compositionality(cfg, pop, World(cfg.world, random.Random(1)),
+                                  n_samples=24, phase=phase_named(cfg, "name-all"),
+                                  rng=random.Random(0), n_null=1)
+        for label in ("farmer", "buyer"):
+            self.assertEqual(len(comp[label]["per_field_coverage"]), N_LOT_FIELDS,
+                             "%s was not probed at name-all" % label)
+            self.assertTrue(comp[label]["per_agent"], label)
+
     def test_the_costs_are_a_per_rung_rule_not_a_threshold(self):
         """`Phase.invents` decides, with `costs_from_rung` as a floor. With every
         field named below `mutual` the two agree -- off on the naming rungs, on

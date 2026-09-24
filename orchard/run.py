@@ -348,7 +348,9 @@ def holdout_report(cfg: Config, path: str) -> int:
         holdout_floor_for=trainer.holdout_floor)
     acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
     names = list(ev.get("holdout_field_names") or COMBO_FIELDS)
-    floors = trainer.holdout_floor(phase) or ([], [])
+    floors = (ev.get("holdout_field_floors") or [], ev.get("seen_field_floors") or [])
+    if not floors[0]:
+        floors = trainer.holdout_floor(phase) or ([], [])
 
     def floor_at(i, which):
         row = floors[which]

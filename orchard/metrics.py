@@ -807,7 +807,9 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
         # got every field the rung introduced right at once, and how often it got
         # everything. One conjunction would hide a field sitting at chance,
         # which is how the old `haggle` failure looked.
-        for label in ("farmer", "buyer"):
+        from .curriculum import report_spec
+        spec = report_spec(cfg, phase, batch.sb) if batch.sb is not None else {}
+        for label, role in (("farmer", FARMER), ("buyer", BUYER)):
             if not res["%s_field_names" % label]:
                 continue                       # this role reports nothing here
             ff = res["%s_fields" % label].float()
@@ -816,6 +818,18 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
                 [float(x) for x in ff.mean(0)] if ff.shape[1] else [])
             extra["%s_new" % label] = float(res["%s_new_ok" % label].float().mean())
             extra["%s_field_names" % label] = list(res["%s_field_names" % label])
+            # What a reader that ignores the message gets on *these* rounds:
+            # the commonest value's share, per field. The trading world skews a
+            # request's quality (the shopper mostly wants LOW) and its price,
+            # and the reserved combinations do not, so the two sides of a
+            # held-out comparison have different floors and each must be read
+            # against its own.
+            floors = []
+            for _name, _head, truth in spec.get(role, []):
+                t = truth.reshape(-1).long()
+                floors.append(float(torch.bincount(t).max()) / max(1, int(t.numel()))
+                              if t.numel() else float("nan"))
+            extra["%s_field_floor" % label] = floors
     return {
         **extra,
         "n": n,
@@ -1271,6 +1285,8 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
         # lot's stock, quality and price), so nothing is averaged by position.
         acc_h: dict[str, list[float]] = {}
         acc_s: dict[str, list[float]] = {}
+        flo_h: dict[str, list[float]] = {}
+        flo_s: dict[str, list[float]] = {}
         for v in phase.views():
             sam = holdout_sampler_for(v)
             plain = sampler_for(v)
@@ -1299,10 +1315,16 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                     names = h.get("%s_field_names" % label) or []
                     hv = h.get("%s_report_fields" % label) or []
                     sv = s.get("%s_report_fields" % label) or []
-                    for name, a, b in zip(names, hv, sv):
+                    hfl = h.get("%s_field_floor" % label) or []
+                    sfl = s.get("%s_field_floor" % label) or []
+                    for i, (name, a, b) in enumerate(zip(names, hv, sv)):
                         if name in COMBO_FIELDS:
                             acc_h.setdefault(name, []).append(float(a))
                             acc_s.setdefault(name, []).append(float(b))
+                            if i < len(hfl) and hfl[i] == hfl[i]:
+                                flo_h.setdefault(name, []).append(float(hfl[i]))
+                            if i < len(sfl) and sfl[i] == sfl[i]:
+                                flo_s.setdefault(name, []).append(float(sfl[i]))
                 da, db = _report_side(h), _report_side(s)
                 if da == da:
                     hd.append(da)
@@ -1350,10 +1372,19 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             # same masking the per-role and per-kind gates already refuse --
             # "a pooled average would let a fluent farmer carry a buyer that
             # never learned to speak".
+            # The floor each side was actually played against, where the rounds
+            # said (a report rung's evaluation records it per field); the pool's
+            # marginal otherwise.
+            lo_hs = [mean(flo_h[n]) if flo_h.get(n) else _floor_of(h_floor, n)
+                     for n in fields]
+            lo_ss = [mean(flo_s[n]) if flo_s.get(n) else _floor_of(s_floor, n)
+                     for n in fields]
+            out["holdout_field_floors"] = lo_hs
+            out["seen_field_floors"] = lo_ss
             ratios = []
             for i, name in enumerate(fields):
-                lo_h = _floor_of(h_floor, name)
-                lo_s = _floor_of(s_floor, name)
+                lo_h = lo_hs[i]
+                lo_s = lo_ss[i]
                 # A ratio between two numbers both at the floor is noise, and
                 # noise reads 1.00 as readily as 0.00. A field the language
                 # never learned has nothing to say about generalising, so it is

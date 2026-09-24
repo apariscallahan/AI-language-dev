@@ -1175,7 +1175,7 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 | vocabulary stats | distinct words **over sampled play**, beside the **greedy lexicon** — what the describers say when asked. The first counts variants as well as words (a flawless 12-word code at 98% per-symbol accuracy reads as ~170), so the pair is what says whether a big number is a big vocabulary or an unsure speaker. Plus word length in atoms, words per utterance, token entropy, silent share, share at the buffer end |
 | stability | re-probing the same meaning against the same agent at different times |
 | cross-generation intelligibility | a newborn straight out of its apprenticeship, tested against veterans it never played |
-| zero-shot generalisation | success on the reserved combinations against success on trained ones — whole-round in the lineup; on a report rung **per field**, each field's held-out accuracy over trained as a share of the headroom above a message-blind guesser (the commonest value's share in the pool being scored), then the mean of those ratios, never a ratio of means. The whole round is a conjunction of every field on both sides and sits at 0.00 while each field generalises: on the first run to promote out of `mutual` the fields transferred 0.89, 0.41 and 0.41 of their headroom and the whole round read 0.000 — fewer successes than independence would predict, because a Latin-square holdout asks for exactly the quality a correctly-read (fruit, colour) pair never showed. The checkpoint line prints both, per field by name |
+| zero-shot generalisation | success on the reserved combinations against success on trained ones — whole-round in the lineup; on a report rung **per field**, each field's held-out accuracy over trained as a share of the headroom above a message-blind guesser (the commonest value's share on the rounds actually played, per side — the shopper mostly wants LOW quality, so a trained round's quality floor is ~0.44 while a reserved one's is 0.25), then the mean of those ratios, never a ratio of means. The whole round is a conjunction of every field on both sides and sits at 0.00 while each field generalises: on the first run to promote out of `mutual` the fields transferred 0.89, 0.41 and 0.41 of their headroom and the whole round read 0.000 — fewer successes than independence would predict, because a Latin-square holdout asks for exactly the quality a correctly-read (fruit, colour) pair never showed. The checkpoint line prints both, per field by name |
 | length ↔ frequency | correlation between how often a meaning occurs and how long its message is, in symbols and in words |
 | per-bucket metrics | everything above, split into frequent and rare meanings |
 | form survival | whether a meaning's form survives, drifts, or is rebuilt compositionally across turnover |
@@ -1183,8 +1183,10 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 | language properties | reference, productivity, word classes, intentionality, decontextualised, displaced, interchangeable, generic, perspectives, cultural transmission, duality of patterning — each with how it is measured, its value, and present / partial / absent / untestable / not reached |
 
 Structure measures (topsim, positional structure, coverage) are taken from
-speakers whose *own observation* is a lot: every describer in the naming rungs,
-and the buyer in the market. A farmer in the market speaks about the lot it was
+speakers whose *own observation* is a lot: every describer in the naming rungs
+(both of them, in a swap rung — the buyer describes in the second view, and a
+check that asked the first view alone once took it for a barn speaker and left
+`name-all` with an n/a bar), and the buyer in the market. A farmer in the market speaks about the lot it was
 asked for, and its own observation is a barn, so a structure measure over that
 would be noise; its words are judged by what the buyer recovers from them.
 
