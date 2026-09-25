@@ -124,7 +124,8 @@ class TestSchedulesCountUpdates(unittest.TestCase):
 
     def test_every_schedule_is_in_updates(self):
         cfg = Config()
-        for sect in ("curriculum", "population", "train", "reward", "log", "bottleneck"):
+        for sect in ("curriculum", "population", "train", "reward", "log", "bottleneck",
+                     "gesture"):
             for f in dataclasses.fields(getattr(cfg, sect)):
                 if not self.SCHEDULE.search(f.name) or f.name in self.NOT_LEARNING:
                     continue

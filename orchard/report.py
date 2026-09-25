@@ -898,6 +898,62 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
                                                 p["verdict"], p.get("note", "")))
         A("")
 
+    A("## 3g. Gestures: what the hands did")
+    A("")
+    A("Alongside the words, a speaker may open a turn with one iconic gesture -- "
+      "fingers for a quantity or a price, pointing at an exemplar for a fruit, "
+      "colour or quality -- whose meaning is given by the world, as a real "
+      "gesture's is. The world decides in what share of rounds a gesture is "
+      "possible (high while a naming rung is inventing its words, withdrawn over "
+      "the rung, a small standing share from `mutual` on); the speaker decides "
+      "whether to make one and about which field, and pays for it. **Every "
+      "number in this report outside this section is word-only**: no probe, gate "
+      "or ablation ever emits a gesture, so a rung is left only when the words "
+      "carry what the gestures used to. What is recorded here is what happened "
+      "in training.")
+    A("")
+    gest = final.get("gestures") or {}
+    by_rung = gest.get("by_rung") or {}
+    if not cfg.gesture.enabled:
+        A("Gestures were switched off for this run (`gesture.enabled = false`).")
+        A("")
+    elif not by_rung:
+        A("No rung of this run allowed a gesture yet.")
+        A("")
+    else:
+        A("| rung | updates | rounds a gesture was possible in | gestures made | "
+          "per possible round | fruit | colour | quality | quantity | price | "
+          "possible share, first -> last update |")
+        A("|---|---|---|---|---|---|---|---|---|---|---|")
+        for name, d in by_rung.items():
+            allowed = float(d.get("rounds_allowed", 0.0))
+            made = int(d.get("gestures", 0))
+            by = list(d.get("by_field") or [0] * 5) + [0] * 5
+            A("| `%s` | %s | %s (%.0f%%) | %s | %.2f | %d | %d | %d | %d | %d | "
+              "%.0f%% -> %.0f%% |"
+              % (name, "{:,}".format(int(d.get("updates", 0))),
+                 "{:,}".format(int(round(allowed))),
+                 100.0 * allowed / max(1, int(d.get("rounds", 0))),
+                 "{:,}".format(made), made / allowed if allowed > 0 else 0.0,
+                 by[0], by[1], by[2], by[3], by[4],
+                 100 * float(d.get("share_first", 0.0)),
+                 100 * float(d.get("share_last", 0.0))))
+        A("")
+        A("Read \"per possible round\" against the word-only success of the same "
+          "rung: a scaffold that is doing its job is used heavily while the word is "
+          "forming and then dropped -- it costs %.3f a time -- once the word works. "
+          "Speakers still reaching for their fingers in a rung whose words pass the "
+          "gate are telling you the gesture is cheaper than the word for them."
+          % cfg.gesture.cost)
+        A("")
+        A("The listener innately reads a description into five attributes -- what "
+          "fruit, what colour, what quality, how many, what price -- and matches "
+          "lineup candidates attribute by attribute (`model.factored_choice`, %s). "
+          "That is the preconception of word classes the agents were given: that "
+          "there are kinds of thing to name, never which words name them."
+          % ("on" if cfg.model.factored_choice else "off"))
+        A("")
+
     A("## 4. Example transcripts across the run")
     A("")
     A("Raw token ids only -- placeholder labels, no imposed semantics.")

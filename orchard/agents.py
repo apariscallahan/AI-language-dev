@@ -47,6 +47,7 @@ import torch.nn.functional as F
 
 from .config import Config
 from .env import BUYER, FARMER, speaker_of_turn
+from .gesture import n_token_ids
 from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
                     N_LOT_FIELDS, QUERY_ALL, n_cells, n_obs_slots, obs_schema)
 
@@ -108,7 +109,12 @@ class CommNet(nn.Module):
         self.n_obs = len(self.schema)
         self.dialogue_offset = dialogue_offset(cfg)
 
-        self.tok_emb = nn.Embedding(c.n_token_ids, d)
+        # Every symbol, plus every gesture (orchard/gesture.py): a gesture sits
+        # in a dialogue slot like a symbol and is read through the same table,
+        # which is what lets the words that share the slot inherit the readout
+        # the gesture trains. The table always has the room, so switching
+        # gestures off is a change of method, not of architecture.
+        self.tok_emb = nn.Embedding(n_token_ids(cfg), d)
         self.variety_emb = nn.Embedding(w.n_varieties, d)
         self.qty_emb = nn.Embedding(w.max_qty + 1, d)
         self.quality_emb = nn.Embedding(w.n_quality, d)
@@ -159,16 +165,27 @@ class CommNet(nn.Module):
         # relational trick the network has to discover from nothing.  Present in
         # every phase so the architecture -- and the carried weights -- never
         # change at a curriculum boundary.
-        self.choice_proj = nn.Linear(d, d)
-        # Both sides of the match are normalised before the dot product.  Without
-        # this the candidate side is a sum of three freshly-initialised embeddings
-        # (norm ~0.24) against a query of norm ~6.8, which put the choice logits at
-        # std 0.03 where every other head sits near 1.0 -- a policy so close to
-        # uniform that the gradient could not move it, and the lineup game sat
-        # exactly at chance no matter how long it ran.
-        self.choice_ln_cand = nn.LayerNorm(d)
-        self.choice_ln_query = nn.LayerNorm(d)
+        # With `model.factored_choice` the choice is read off the five belief
+        # heads instead (see `choice_logits`), and the pointer below does not
+        # exist; a parameter nothing reads would still be saved and compared.
+        self.factored_choice = bool(m.factored_choice)
+        if not self.factored_choice:
+            self.choice_proj = nn.Linear(d, d)
+            # Both sides of the match are normalised before the dot product.
+            # Without this the candidate side is a sum of three freshly-initialised
+            # embeddings (norm ~0.24) against a query of norm ~6.8, which put the
+            # choice logits at std 0.03 where every other head sits near 1.0 -- a
+            # policy so close to uniform that the gradient could not move it, and
+            # the lineup game sat exactly at chance no matter how long it ran.
+            self.choice_ln_cand = nn.LayerNorm(d)
+            self.choice_ln_query = nn.LayerNorm(d)
         self.n_candidates = max(2, cfg.curriculum.n_candidates)
+        # Whether to gesture at the start of a turn, and about which field of
+        # the lot: none, or one of the five. Sampled from the same hidden state
+        # that emits the turn's first symbol, trained by REINFORCE like the
+        # decisions (orchard/gesture.py). Which options a seat actually has, and
+        # whether the round allows any, is masked in by the rollout.
+        self.gesture_head = nn.Linear(d, 1 + N_LOT_FIELDS)
         self.value_head = nn.Linear(d, 1)
         # The barn lookup (ModelConfig.barn_lookup): a query from each hidden
         # state against every barn row's identity, reading back the matching
@@ -376,17 +393,53 @@ class CommNet(nn.Module):
             vecs.append(vec)
         return torch.stack(vecs, dim=1)
 
+    def report_logits(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The five belief heads in lot order: fruit, colour, quality, quantity, price."""
+        return (self.belief_variety_head(h), self.belief_color_head(h),
+                self.belief_quality_head(h), self.belief_qty_head(h),
+                self.belief_price_head(h))
+
     def choice_logits(self, h_last: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
         """(B, K) -- how well each candidate matches what was just heard.
 
-        A dot product between a projection of the final hidden state (which has
-        seen the whole message) and each candidate's embedding: the standard
-        listener for a signalling game, and the one structure that makes
-        "does this description fit this candidate" directly expressible.
+        Two listeners, chosen by ``model.factored_choice``.
+
+        **Factored** (the default): the message is first read into the five
+        belief heads -- what fruit, colour, quality, quantity and price was that
+        about -- and a candidate scores the sum over fields of the log-probability
+        its value gets under the matching head. The listener innately parses a
+        description into a kind of thing, its properties and a number, and
+        matches attribute by attribute; a code with a word per field is read
+        directly, a holistic label has to be squeezed through five independent
+        readouts. On a round that varies one field the other four terms are the
+        same for every candidate, so the choice *is* that field's head restricted
+        to the three values on offer -- which is also the head the report and
+        trading rungs will score, so naming trains reporting from the first rung.
+
+        **Pointer** (off): a dot product between a projection of the final hidden
+        state and each candidate's summed embedding -- the standard listener for
+        a signalling game, kept as the control.
         """
-        cand = self.choice_ln_cand(self.candidate_embeddings(obs))   # (B, K, d)
-        q = self.choice_ln_query(self.choice_proj(h_last)).unsqueeze(-1)
-        return torch.bmm(cand, q).squeeze(-1) / math.sqrt(self.d_model)
+        if not self.factored_choice:
+            cand = self.choice_ln_cand(self.candidate_embeddings(obs))   # (B, K, d)
+            q = self.choice_ln_query(self.choice_proj(h_last)).unsqueeze(-1)
+            return torch.bmm(cand, q).squeeze(-1) / math.sqrt(self.d_model)
+        K = self.n_candidates
+        W = N_LOT_FIELDS
+        B = h_last.shape[0]
+        scores = h_last.new_zeros((B, K))
+        heads = self.report_logits(h_last)
+        for k in range(K):
+            i = W * k
+            if i + W - 1 >= obs.shape[1]:
+                continue
+            for j, lg in enumerate(heads):
+                lp = F.log_softmax(lg, dim=-1)
+                # Outside a lineup these slots hold other fields; clamping keeps
+                # the gather legal, and the head's output is unused there.
+                v = obs[:, i + j].clamp(0, lp.shape[-1] - 1)
+                scores[:, k] = scores[:, k] + lp.gather(-1, v.unsqueeze(-1)).squeeze(-1)
+        return scores
 
     def all_heads(self, h: torch.Tensor, obs: Optional[torch.Tensor] = None
                   ) -> tuple[torch.Tensor, ...]:

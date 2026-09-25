@@ -311,7 +311,9 @@ one at a time, from
 { a0 … a31 }  ∪  { HYPHEN, SPACE, END }
 ```
 
-(`channel.atomic_vocab` = 32 atoms; 36 token ids in all once padding is counted.)
+(`channel.atomic_vocab` = 32 atoms; 36 token ids in all once padding is counted,
+plus 27 **gesture** ids that sit after them in the embedding table and that the
+token head can never emit — see [§5](#gestures-the-scaffold-a-word-forms-on).)
 
 - a **word** is atoms joined by `HYPHEN` — `a7-a2-a3` is one word;
 - an **utterance** (one turn) is words separated by `SPACE` — `a7-a2 a3` is two;
@@ -738,6 +740,87 @@ to form from nothing — all six naming rungs — runs without it, and it joins
 where every word exists and the listener's job is to put five of them into five
 heads.
 
+### Gestures: the scaffold a word forms on
+
+The run of 2026-09-24 (`gpu_community`, 2 + 2 founders, the five-field ladder)
+passed `name-fruit`, `name-color` and `name-quality` and then sat in
+`name-quantity` for 850 updates at exactly chance — 0.32–0.34 against 0.333,
+the channel carrying −2% to +1% of the headroom, the rehearsed fields still
+named at 0.91 / 0.83 / 0.68. The transcripts show what that looks like: on a
+quantity round the describer says one arbitrary atom (`a15`, `a25`, `a24`) and
+the guesser picks at random. Nine number words had to break symmetry from
+nothing, through a listener whose reading of the message was itself random, so
+the straight-through gradient reaching the speaker had no consistent direction
+to point in. Four fruit words took 1,775 updates to form that way; nine number
+words did not form at all.
+
+Humans do not learn words from words alone. A parent points at the apple while
+saying "apple"; a trader holds up three fingers while naming a quantity. The
+gesture puts the referent and the word in front of the listener at the same
+moment, and it is what makes the word learnable. So the simulation now has a
+**gesture channel** beside the spoken one (`orchard/gesture.py`,
+`GestureConfig`):
+
+- A speaker may open a turn with **one iconic gesture**, occupying the turn's
+  first dialogue slot: *fingers* for a quantity (0–8) or a price bin, *pointing*
+  at an exemplar for a fruit, a colour or a quality. Its meaning is given by the
+  world, as a real gesture's is — 27 gesture ids, one per (field, value) — and
+  it is **truthful by construction**: the value shown is read off the speaker's
+  own observation, never the scenario, so a gesture can only reveal what its
+  maker can see. A describer, either party in `mutual` and the buyer at market
+  look at a lot and may show any of its five fields; the farmer at market looks
+  at a barn and can hold up fingers for its floor price only — "how many of
+  what you asked for" depends on having understood the request, and a gesture
+  the world computed for it would be the world doing the understanding.
+- **The world decides when.** Gesturing is possible in a share of rounds
+  (`gesture.share_start` = 0.75 at the start of every rung that still has a
+  word to invent, withdrawn linearly to `share_end` = 0 over `anneal_updates` =
+  600), then a small standing share in every rung that only reuses words
+  (`share_reuse` = 0.1): fingers are part of a market, and whether speakers
+  still bother with them once the words work is something to measure. Below 1
+  from the start, so word-only rounds exist from the first update.
+- **The speaker decides whether.** A sixth head (`CommNet.gesture_head`),
+  sampled from the same hidden state that emits the turn's first symbol and
+  trained by REINFORCE like the decisions, chooses none or one of the fields
+  its seat can show; a round the world allows no gesture in is masked to none
+  and not trained on. Each gesture costs `gesture.cost` = 0.02 — small against
+  a round's reward of ~1, so gesturing is worth it while the word fails and
+  worth stopping once the word works.
+- **The listener is taught what the gesture showed** (`gesture.supervise_coef`
+  = 0.5): its belief head for the gestured field is pulled towards the gestured
+  value. This is *not* hindsight, and the reason hindsight is off in the
+  naming rungs does not apply: hindsight tells a listener the answer while the
+  message carries nothing, so the listener learns — correctly — to ignore the
+  message. Here the answer is *in* the message. The term also reaches the
+  speaker through the straight-through channel, pulling its words towards
+  whatever the listener already reads as that value.
+
+Why that should help the *words*, and not just replace them: the gesture and
+the atoms share the dialogue, the token table and the listener's readout. A
+listener that has learned "this slot says 3 fingers → quantity 3" has a
+readout for quantity that the speaker's atoms pass through too, so on a
+word-only round the gradient on an atom says "become whatever this listener
+reads as 3" — a consistent direction across episodes for the same meaning, which
+is exactly what symmetry breaking needs and exactly what an untrained readout
+cannot supply. With the factored listener below, that readout *is* the
+quantity head, so the choice on a quantity round is the same head the gesture
+trains.
+
+What a gesture is not: it is not a word, and **nothing about the language is
+measured on it**. A gesture is not parsed as a word, not costed as a symbol,
+not counted in utterance length; a newborn is never taught to emit one (the
+slot is masked from its token lesson) though it learns to read them like
+everyone else; and `run_episodes` — every probe, every promotion check, the
+intact / scrambled / muted ablation, the held-out test — never emits one. A
+rung is left only when the *words* carry what the gestures used to. What the
+hands did is recorded separately: how often the world allowed a gesture, how
+often the speakers made one and about which field, per rung, on the checkpoint
+line (`gestures possible 74%, used 89%`), in `metrics.jsonl`, in the plots and
+in the report's §3g. A scaffold doing its job is used heavily while the word is
+forming and dropped once it works; speakers still reaching for their fingers in
+a rung whose words pass the gate are saying the gesture is cheaper than the
+word for them.
+
 ### Telling inherited structure from new structure
 
 Some of the vocabulary visible at the end was inherited from the naming game
@@ -1081,6 +1164,23 @@ Measured, supervised, with the answer given ([§11](#11-findings-with-the-eviden
 without it the stock and quality of the asked-for lot stayed at the base rate
 after 800 steps; with it both reached 1.00 by step 500.
 
+**Innate word classes** (`model.factored_choice`). The lineup guesser's choice
+is no longer a free pointer over a candidate's summed embedding. It is read
+*through the five belief heads*: a candidate scores the sum over fields of the
+log-probability the listener's fruit, colour, quality, quantity and price head
+gives that candidate's value. The listener therefore parses a description into
+"a kind of thing, its properties, a number" before it can pick anything — the
+preconception a child brings to a new word, that it names one sort of thing —
+and matches candidates attribute by attribute, which is the reading a
+compositional code needs and a holistic one cannot use. Nothing about *which
+words* name which field is given; only that there are fields to name. Two
+things follow. On a round that varies one field, the other four terms are the
+same for every candidate, so the choice *is* that field's head restricted to the
+three values on offer; and those heads are the ones `mutual`, the report rungs
+and `haggle` score, so naming trains reporting from the first rung instead of
+handing `mutual` five untrained heads. The old pointer is kept as the control
+(`factored_choice = false`).
+
 Sizes are a declared scale choice ([§14](#14-one-method-declared-scale)): 55k
 parameters per agent at the reference scale, up to 850k in `gpu_large`.
 
@@ -1180,6 +1280,7 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 | per-bucket metrics | everything above, split into frequent and rare meanings |
 | form survival | whether a meaning's form survives, drifts, or is rebuilt compositionally across turnover |
 | cross-role overlap | histogram intersection of the two roles' word use; reported as not yet askable while one pool fills both seats, since the two roles are then the same agents |
+| gestures | training-time bookkeeping only, never a measurement of the language: the share of rounds the world allowed a gesture in, the share of those turns the speakers used one in, and how many were about each field, per rung. Every other row in this table is word-only |
 | language properties | reference, productivity, word classes, intentionality, decontextualised, displaced, interchangeable, generic, perspectives, cultural transmission, duality of patterning — each with how it is measured, its value, and present / partial / absent / untestable / not reached |
 
 Structure measures (topsim, positional structure, coverage) are taken from
@@ -1422,6 +1523,19 @@ current design answers.
    cross-validated ([§5](#promotion-is-on-evidence-not-on-a-schedule)): 1.00 for
    a perfect code at 100 probes, 0.78 for one right three times in four, 0.04
    for a holistic code.
+13. **The five-field ladder stalled on quantity, at chance, with the words for
+   the first three fields intact** (2026-09-24, `gpu_community`): `name-fruit`
+   1,775 updates, `name-color` 425, `name-quality` 350, then 850 updates in
+   `name-quantity` at 0.32–0.34 against 0.333 while fruit, colour and quality
+   rounds still scored 0.91 / 0.83 / 0.68. The describer said one arbitrary
+   atom per quantity round; live messages carried −0.008 bits of quantity
+   beyond what variety already gave. Nine number words had to break symmetry
+   through a listener whose reading of the channel was random. The response is
+   the gesture channel and the factored listener
+   ([§5](#gestures-the-scaffold-a-word-forms-on), [§8](#the-agent)): fingers
+   and pointing that a listener can read from the first round, withdrawn as the
+   rung goes on, with every gate still word-only. Whether that gets number
+   words to form is the next thing to run.
 
 ### The rest of the log
 
@@ -1527,6 +1641,17 @@ hindsight feedback must wait; the three-field naming ladder climbs to and throug
   is a candidate for a further rung rather than for quietly loosening the test.
 - The `duality` experiment (12 fruits against 8 atoms, so no atom can name a
   whole meaning — the setting where duality of patterning is *necessary*).
+- **Gestures and the factored listener have not been run on a GPU.** What is
+  verified (`tests/test_gesture.py`): a gesture is a symbol of its own, never a
+  word and never costed; it can only show what its maker can see; the world
+  withdraws it over a naming rung and never allows one in any measurement; the
+  token policy is not credited for the slot and a newborn is never taught to
+  emit one; on a single-field round the factored choice is that field's belief
+  head; the factored listener learns a fixed compositional code supervised;
+  every rung still plays with gestures on; switching gestures off changes no
+  parameter shape. Whether the scaffold gets number words to form in play — and
+  whether the speakers then drop it, as the cost is meant to make them — is
+  what the next run measures, in the report's §3g against the word-only gates.
 
 **Do not relax a promotion criterion to make a run pass.** The thresholds are the
 experiment. Where a threshold was recalibrated here it was because the game
@@ -1659,6 +1784,8 @@ orchard/
   batched.py     the tensor world and reward the training loop uses
   rollout.py     batched play (probes and evaluation)
   gumbel.py      training: straight-through Gumbel channel + REINFORCE decisions
+  gesture.py     the gesture channel: fingers and pointing, what a seat may show,
+                 when the world allows it, what the listener is taught
   curriculum.py  the ladder of rungs, the lineup and report games, and promotion
   conventions.py the population's recent usage: rarity cost, convention bonus
   population.py  ageing, death, birth, generation counting, the role split

@@ -202,4 +202,10 @@ def build_vocab_panels(history) -> list[dict[str, Any]]:
         {"title": "Reference accuracy (can the farmer name it?)", "ylim": (0, 1),
          "series": [S("variety", getattr(h, "variety_acc", [])),
                     S("quantity", getattr(h, "qty_acc", []))]},
+        {"title": "Gestures (training only; every other panel is word-only)",
+         "ylim": (0, 1),
+         "series": [S("share of rounds a gesture was possible in",
+                      getattr(h, "gesture_share", [])),
+                    S("share of possible turns it was used in",
+                      getattr(h, "gesture_used", []))]},
     ]

@@ -291,6 +291,74 @@ class ModelConfig:
     # base rate after 800 steps (0.27-0.34; quality 0.5); with it both reached
     # 1.00 by step 500. Only active when the observation is a barn.
     barn_lookup: bool = True
+    # The innate word classes, on the comprehension side. The lineup choice is
+    # computed *through the five belief heads*: for each candidate, the sum
+    # over fields of the log-probability the listener's fruit / colour /
+    # quality / quantity / price head gives that candidate's value. A listener
+    # therefore parses a description into "a kind of thing, its properties, a
+    # number" before it can pick anything -- the preconception a child brings
+    # to a new word (it names one sort of thing) -- and matches candidates
+    # attribute by attribute, which is the reading a compositional code needs
+    # and a holistic one cannot use. Nothing about *which words* name which
+    # field is given; only that there are fields to name. It also makes the
+    # naming rungs train the very heads the report and trading rungs score: on
+    # a quantity round the choice *is* the quantity head restricted to the
+    # three candidates. Off restores the plain candidate pointer (a dot product
+    # between the final state and each candidate's summed embedding).
+    factored_choice: bool = True
+
+
+# --------------------------------------------------------------------------
+# Gestures  (orchard/gesture.py)
+# --------------------------------------------------------------------------
+@dataclass
+class GestureConfig:
+    """The pre-linguistic channel: pointing, and fingers for numbers.
+
+    A speaker may open a turn with one iconic gesture -- fingers for a quantity
+    or a price bin, pointing at an exemplar for a fruit, colour or quality --
+    whose meaning is given by the world, as a real gesture's is. It occupies the
+    turn's first dialogue slot, is read from the speaker's own observation (so
+    it can only show what the speaker sees), is not a word, is not costed as a
+    symbol, and is never emitted in any measurement: every gate, probe and
+    ablation is word-only.
+
+    Measured on the run this answers: fruit, colour and quality words formed
+    and quantity sat at chance for 850 updates (0.32-0.34 against 0.333), the
+    describer saying one arbitrary atom per round. Nine number words had to
+    break symmetry through a listener whose reading of the channel was itself
+    random. A gesture the listener can read grounds that reading -- the slot
+    that carries "3 fingers" trains a readout for quantity -- and the words,
+    which pass through the same readout, inherit somewhere for their gradient
+    to point.
+    """
+    enabled: bool = True
+    # The world's side: in what share of rounds gesturing is possible. In a rung
+    # that still has a word to invent it starts at `share_start` and is withdrawn
+    # to `share_end` over `anneal_updates` -- the parent stops pointing once the
+    # child has the word -- so the words must carry the meaning before the rung
+    # can be left (which is judged word-only regardless). Below 1 from the
+    # start, so word-only rounds exist from the first update.
+    share_start: float = 0.75
+    share_end: float = 0.0
+    anneal_updates: int = 600
+    # In every rung that only reuses words (`mutual` and above): a small
+    # standing share. Fingers are part of a market; whether speakers still use
+    # them once the words work is measured, not decided.
+    share_reuse: float = 0.1
+    # The speaker's side: it chooses whether to gesture and which field, by a
+    # sampled head trained like the decisions, and pays this per gesture. Small
+    # against a round's reward (~1), so it is worth gesturing while the word
+    # fails and worth stopping once the word works.
+    cost: float = 0.02
+    # The listener's belief head for the gestured field is trained towards the
+    # gestured value, in rounds where a gesture was shown. This is not hindsight
+    # (`train.hindsight_from_rung`), which teaches a listener the answer while
+    # the message carries nothing and so teaches it, correctly, to ignore the
+    # message: here the answer *is in the message*. It reaches the speaker
+    # through the straight-through channel as well, pulling its words towards
+    # whatever the listener already reads as that value. 0 turns it off.
+    supervise_coef: float = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -858,6 +926,7 @@ class Config:
     bottleneck: BottleneckConfig = field(default_factory=BottleneckConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    gesture: GestureConfig = field(default_factory=GestureConfig)
 
     # ---- serialisation -------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -974,7 +1043,7 @@ SCALE_KEYS = frozenset({
 # name tensors, and not one of them names the setting that is wrong.
 ARCH_KEYS = frozenset({
     "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
-    "model.barn_lookup",
+    "model.barn_lookup", "model.factored_choice",
     "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
     "world.n_varieties", "world.max_qty", "world.n_quality",
     "world.n_colors", "world.n_price_bins",
@@ -1258,3 +1327,7 @@ def validate(cfg: Config) -> None:
     assert cfg.train.device == "auto" or cfg.train.device.split(":")[0] in ("cpu", "cuda")
     assert cfg.economy.episodes_per_day >= 1
     assert cfg.economy.season_days >= 1
+    g = cfg.gesture
+    for name in ("share_start", "share_end", "share_reuse"):
+        assert 0.0 <= getattr(g, name) <= 1.0, "gesture.%s must be a share in [0, 1]" % name
+    assert g.anneal_updates >= 0 and g.cost >= 0.0 and g.supervise_coef >= 0.0

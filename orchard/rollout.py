@@ -433,3 +433,10 @@ class UpdateStats:
     grad_norm: float = 0.0
     n_agents: int = 0
     n_actions: int = 0
+    # gestures (orchard/gesture.py): the share of rounds the world allowed one
+    # in, the share of allowed turns the speakers actually used, and how many
+    # were about each field of a lot
+    gesture_share: float = 0.0
+    gesture_available: float = 0.0
+    gesture_used: float = 0.0
+    gesture_fields: list = field(default_factory=list)

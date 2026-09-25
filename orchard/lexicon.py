@@ -254,8 +254,9 @@ def word_stats(cfg: Config, batches: Sequence[Any]) -> dict[str, Any]:
             seg = toks[:, turn * c.max_symbols:(turn + 1) * c.max_symbols]
             # A turn the phase never schedules is all PAD. Counting it as a
             # "silent message" padded every lineup statistic with phantom silence.
-            spoken = (act[:, turn * c.max_symbols].tolist() if act is not None
-                      else [True] * B)
+            # (Read off the tokens, not `active`: a turn opened with a gesture has
+            # an inactive first slot and was spoken all the same.)
+            spoken = (seg[:, 0] != c.pad_id).tolist()
             for i in range(B):
                 if not spoken[i]:
                     continue

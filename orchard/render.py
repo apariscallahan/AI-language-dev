@@ -16,6 +16,7 @@ from typing import Any, Iterable, Optional
 
 from .config import Config
 from .env import FARMER, BUYER, Transcript, parse_words, speaker_of_turn
+from .gesture import gesture_text, is_gesture
 
 
 def barn_text(w, f) -> str:
@@ -41,6 +42,8 @@ def token_label(cfg: Config, tok: int) -> str:
         return "-"
     if tok == c.space_id:
         return "_"
+    if is_gesture(cfg, tok):
+        return gesture_text(cfg, tok)
     return "a%d" % tok
 
 
@@ -52,10 +55,13 @@ def render_message(cfg: Config, symbols: Iterable[int], *,
     joined with hyphens as the agent joined them.  Nothing is renamed or
     regrouped -- the raw symbol ids remain the authoritative record (spec 6.3).
     """
-    words = parse_words(cfg, list(symbols))
-    if not words:
+    syms = list(symbols)
+    words = parse_words(cfg, syms)
+    # A gesture opens the turn and is shown as what it is -- `[3 fingers]`,
+    # `[points: APPLE]` -- because its meaning is the world's, not the agent's.
+    out = [gesture_text(cfg, s) for s in syms if is_gesture(cfg, s)]
+    if not words and not out:
         return "<silence>"
-    out = []
     for w in words:
         text = "-".join("a%d" % t for t in w)
         if semantics is not None:

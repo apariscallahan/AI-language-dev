@@ -41,12 +41,14 @@ from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, grammar_allowed, length_cost, resolve,
                   speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
-from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch, Phase,
+from .curriculum import (H_BELIEF, H_CHOICE, H_REPORT, N_HEADS, MutualBatch, Phase,
                          ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
                          phase_schema, resolve_referential, resolve_reports)
+from .gesture import (GESTURE_NONE, draw_availability, gesture_option_mask,
+                      gesture_tokens_for, gestured_fields, n_token_ids)
 from .rollout import (BatchRollout, UpdateStats, anneal, belief_columns,
                       group_by_agent, n_outputs, split_decision)
-from .world import Scenario
+from .world import N_LOT_FIELDS, Scenario
 
 
 def _count(content: torch.Tensor, positions: list[int]) -> torch.Tensor:
@@ -69,7 +71,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                           train: bool = True, phase: Optional[Phase] = None,
                           generator: Optional[torch.Generator] = None,
                           usage=None, cost_scale: float = 1.0,
-                          convention_scale: Optional[float] = None
+                          convention_scale: Optional[float] = None,
+                          gesture_share: float = 0.0
                           ) -> tuple[BatchRollout, UpdateStats]:
     """Play a batch with a reparameterised message channel, then learn from it.
 
@@ -90,6 +93,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     ``phase_update`` is how far into its own rung the run is. The temperature and
     entropy anneals count that rather than the whole run when
     ``train.anneal_per_rung`` is on, so a rung that starts late still explores.
+
+    ``gesture_share`` is the share of this batch's rounds in which a speaker may
+    open a turn with a gesture (orchard/gesture.py). The trainer sets it from
+    the rung's schedule; every measurement leaves it at 0, so nothing about the
+    language is ever judged on a gesture.
     """
     c = cfg.channel
     t = cfg.train
@@ -108,7 +116,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                BUYER: phase.self_mask(cfg, BUYER, device)}
     B = len(scenarios)
     D = c.dialogue_len
-    NT = c.n_token_ids
+    NT = n_token_ids(cfg)
     # How far into its *own* rung the run is, which is what the anneals count
     # when `train.anneal_per_rung` is on.
     anneal_at = update if phase_update is None else int(phase_update)
@@ -140,6 +148,22 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     want_token_logp = (t.gumbel_mix_reinforce > 0 or t.shaping_reinforce > 0
                        or t.convention_reinforce > 0)
 
+    # ---- gestures (orchard/gesture.py) -------------------------------------
+    # The world says in which rounds a gesture is possible; in those, the speaker
+    # decides at the start of each of its turns whether to make one, and about
+    # which field. A gesture takes the turn's first slot, is not the token
+    # policy's action (so it is inactive for the token terms and masked from a
+    # newborn's lesson), and the speaker pays for it.
+    gest_on = bool(cfg.gesture.enabled) and gesture_share > 0
+    avail = (draw_availability(gesture_share, B, device, generator) if gest_on
+             else torch.zeros(B, dtype=torch.bool, device=device))
+    gest_logp = {FARMER: torch.zeros(B, device=device), BUYER: torch.zeros(B, device=device)}
+    gest_ent = {FARMER: torch.zeros(B, device=device), BUYER: torch.zeros(B, device=device)}
+    gest_n = {FARMER: torch.zeros(B, device=device), BUYER: torch.zeros(B, device=device)}
+    turn_starts: dict[int, list[int]] = {FARMER: [], BUYER: []}
+    gest_field_counts = torch.zeros(1 + N_LOT_FIELDS, dtype=torch.long, device=device)
+    onehot_table = torch.eye(NT, device=device) if gest_on else None
+
     # ---- the conversation ------------------------------------------------
     # Phases that use fewer turns simply leave the later dialogue slots empty,
     # which keeps one sequence layout -- and therefore one set of weights -- valid
@@ -149,6 +173,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         alive = torch.ones(B, dtype=torch.bool, device=device)
 
+        turn_starts[role].append(turn * c.max_msg_len)
         for k in range(c.max_msg_len):
             # Deliberately no `if not alive.any(): break`.  That reads a tensor on
             # the host and so synchronises the device on every symbol step, which
@@ -157,6 +182,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             p = turn * c.max_msg_len + k
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
+            g_logits = (torch.zeros((B, 1 + N_LOT_FIELDS), device=device)
+                        if gest_on and k == 0 else None)
             for a_i, ep in groups_of[role]:
                 # only the conversation so far, gathered per agent: the gathered
                 # copy is what the backward pass keeps, so it must not carry the
@@ -165,23 +192,56 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                                          schema=schema_of[role],
                                          self_mask=mask_of[role])[:, -1]
                 logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))
+                if g_logits is not None:
+                    g_logits = g_logits.index_copy(0, ep, pool[a_i].net.gesture_head(h))
 
             allowed = grammar_allowed(cfg, tokens[:, p - 1] if k > 0 else tokens[:, p], k)
             logits = logits.masked_fill(~allowed, MASKED)
             y = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
             tok = y.argmax(dim=-1)
             tok = torch.where(alive, tok, torch.full_like(tok, c.pad_id))
-            y_full = torch.cat([y, torch.zeros((B, 1), device=device)], dim=-1)
+            y_full = torch.cat([y, torch.zeros((B, NT - c.n_emittable), device=device)],
+                               dim=-1)
             row = torch.where(alive.unsqueeze(-1), y_full, pad_onehot.view(1, NT))
+
+            gestured = torch.zeros(B, dtype=torch.bool, device=device)
+            if g_logits is not None:
+                # Which options this seat has at all, and only "none" in a round
+                # the world allows no gesture in. A round without the choice is
+                # not trained on it.
+                opts = gesture_option_mask(cfg, phase, role, device).unsqueeze(0).expand(B, -1)
+                none_only = torch.zeros_like(opts)
+                none_only[:, GESTURE_NONE] = True
+                allowed_g = torch.where(avail.unsqueeze(1), opts, none_only)
+                g_lp = F.log_softmax(g_logits.masked_fill(~allowed_g, MASKED), dim=-1)
+                with torch.no_grad():
+                    g_choice = torch.multinomial(g_lp.exp(), 1, generator=generator).squeeze(-1)
+                # The value shown is read off the speaker's own observation, so
+                # a gesture can only ever reveal what its maker can see.
+                g_tok = gesture_tokens_for(cfg, phase, role, obs, g_choice)
+                gestured = g_tok != c.pad_id
+                had_choice = avail.float()
+                gest_logp[role] = gest_logp[role] + (
+                    g_lp.gather(-1, g_choice.unsqueeze(-1)).squeeze(-1) * had_choice)
+                gest_ent[role] = gest_ent[role] + (-(g_lp.exp() * g_lp).sum(-1)) * had_choice
+                gest_n[role] = gest_n[role] + gestured.float()
+                gest_field_counts = gest_field_counts + torch.bincount(
+                    g_choice[gestured], minlength=1 + N_LOT_FIELDS)
+                # the gesture takes the slot: an exact one-hot, no gradient --
+                # its content is the world's, only the choice was the agent's
+                tok = torch.where(gestured, g_tok, tok)
+                row = torch.where(gestured.unsqueeze(-1), onehot_table[g_tok], row)
+            # what the token policy actually did here (a gesture is not its act)
+            acted = alive & ~gestured
             soft = soft.index_copy(1, torch.tensor([p], device=device), row.unsqueeze(1))
 
             tokens[:, p] = tok.detach()
-            active[:, p] = alive
+            active[:, p] = acted
             lp = F.log_softmax(logits, dim=-1)
-            token_entropy_terms.append(-(lp.exp() * lp).sum(-1) * alive.float())
+            token_entropy_terms.append(-(lp.exp() * lp).sum(-1) * acted.float())
             if want_token_logp:
                 chosen = lp.gather(-1, tok.clamp(max=c.n_emittable - 1).unsqueeze(-1)).squeeze(-1)
-                token_logp_terms[role].append((chosen, alive.float()))
+                token_logp_terms[role].append((chosen, acted.float()))
             alive = alive & (tok != c.eos_id)
             # Stop early once every utterance in the batch has ended. Checked every
             # few symbols only: the check reads the device, and the buffer is long.
@@ -197,6 +257,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     targets = (hindsight_targets(cfg, phase, scenarios)
                if use_hindsight else {FARMER: {}, BUYER: {}})
     head_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
+    # Which heads' log-probabilities to keep for a supervised term: hindsight's,
+    # and -- when the other party may have gestured -- the five report heads,
+    # one of which is taught the gestured value (see below).
+    supervise_gestures = train and gest_on and cfg.gesture.supervise_coef > 0
+    keep_lp = {r: set(targets[r]) | (set(H_REPORT) if supervise_gestures else set())
+               for r in (FARMER, BUYER)}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         scored = set(phase.active_heads(role, cfg))
@@ -217,7 +283,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 with torch.no_grad():
                     a = torch.multinomial(lp.exp(), 1, generator=generator).squeeze(-1)
                 out[ep, col] = a
-                if col in targets[role]:
+                if col in keep_lp[role]:
                     full = head_lp[role].get(col)
                     if full is None:
                         full = torch.zeros((B, lp.shape[-1]), device=device)
@@ -236,8 +302,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             logp_sum = logp_sum.index_copy(0, ep, lps)
             ent_sum = ent_sum.index_copy(0, ep, ents)
         dec_sampled[role] = out
-        dec_logp[role] = logp_sum
-        dec_ent[role] = ent_sum
+        # Whether to gesture is one of the speaker's decisions: it is trained on
+        # the same advantage as the rest, which includes the cost of having done it.
+        dec_logp[role] = logp_sum + gest_logp[role]
+        dec_ent[role] = ent_sum + gest_ent[role]
         dec_value[role] = val
 
     # ---- resolve ---------------------------------------------------------
@@ -282,6 +350,19 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             outcomes.append(o)
             f_rew[i] = o.farmer_reward
             b_rew[i] = o.buyer_reward
+
+    # ---- gesturing takes effort -------------------------------------------
+    # Charged whatever the rung: this is what makes a word worth more than the
+    # gesture it replaces once the word works, and it is small enough that the
+    # gesture is still worth making while it does not.
+    if gest_on and cfg.gesture.cost > 0:
+        f_g = cfg.gesture.cost * gest_n[FARMER]
+        b_g = cfg.gesture.cost * gest_n[BUYER]
+        f_rew = f_rew - f_g
+        b_rew = b_rew - b_g
+        if res is not None:
+            res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
+            res["farmer_gesture_cost"], res["buyer_gesture_cost"] = f_g, b_g
 
     # ---- the speaker's own terms: brevity, coining, convention ------------
     g = float(min(1.0, max(0.0, cost_scale)))
@@ -386,6 +467,28 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 tgt = tgt.long().clamp(0, lp.shape[-1] - 1)
                 loss = loss + t.hindsight_coef * F.nll_loss(lp, tgt)
 
+    # A gesture is the answer, shown: the listener's head for that field is
+    # taught to read it. Not hindsight -- the answer is *in the message*, so this
+    # cannot teach a listener that the message carries nothing -- and it reaches
+    # the speaker's words through the straight-through channel, pulling them
+    # towards whatever the listener already reads as that value.
+    if supervise_gestures:
+        coef = float(cfg.gesture.supervise_coef)
+        for role in (FARMER, BUYER):
+            other = BUYER if role == FARMER else FARMER
+            if not turn_starts[other]:
+                continue
+            field, value = gestured_fields(cfg, tokens, turn_starts[other])
+            for j in range(N_LOT_FIELDS):
+                sel = field == j
+                if not bool(sel.any()):
+                    continue
+                lp = head_lp[role].get(H_REPORT[j])
+                if lp is None:
+                    continue
+                tgt = value[sel].clamp(0, lp.shape[-1] - 1)
+                loss = loss + coef * F.nll_loss(lp[sel], tgt)
+
     if token_entropy_terms:
         ent_stack = torch.stack(token_entropy_terms, dim=1)
         mask = active.float()[:, :ent_stack.shape[1]]
@@ -412,4 +515,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     stats.n_agents = len(seen)
     stats.grad_norm = gn / max(1, len(seen))
     stats.n_actions = int(active.sum())
+    if gest_on:
+        n_turns = sum(len(v) for v in turn_starts.values())
+        allowed_turns = float(avail.sum()) * n_turns
+        used = float(gest_n[FARMER].sum() + gest_n[BUYER].sum())
+        stats.gesture_share = float(gesture_share)
+        stats.gesture_available = float(avail.float().mean())
+        stats.gesture_used = used / allowed_turns if allowed_turns > 0 else 0.0
+        stats.gesture_fields = [int(x) for x in gest_field_counts[1:].tolist()]
     return batch, stats

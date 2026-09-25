@@ -40,6 +40,7 @@ from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
                          costs_apply, evaluate_rung, growth_applies, ladder,
                          phase_named, pooled_at, promotion_for, rung_budget,
                          turnover_applies)
+from .gesture import gesture_share
 from .lexicon import (FormTracker, WordProvenance, bucketed_analysis,
                       cross_role_overlap, length_frequency, live_encoding, word_stats)
 from .metrics import phase_evidence
@@ -109,6 +110,10 @@ class History:
     mean_word_len: list[float] = field(default_factory=list)
     at_length_cap: list[float] = field(default_factory=list)
     phase_index: list[float] = field(default_factory=list)
+    # gestures (orchard/gesture.py): the share of rounds the world allowed one
+    # in, and the share of those turns the speakers used one in
+    gesture_share: list[float] = field(default_factory=list)
+    gesture_used: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: list(v) for k, v in self.__dict__.items()}
@@ -188,6 +193,11 @@ class Trainer:
         self._next_check = cfg.curriculum.check_every_updates
         self._next_grow: Optional[int] = None         # in updates
         self.community_log: list[dict[str, Any]] = []
+        # What the hands did, per rung (orchard/gesture.py): how often the world
+        # allowed a gesture, how often the speakers made one, and about what.
+        # Training-time bookkeeping only -- no measurement ever sees a gesture.
+        self.gesture_log: dict[str, dict[str, Any]] = {}
+        self._gesture_recent = RollingStat(window=200)
 
         # ---- the curriculum -------------------------------------------------
         self.curriculum = CurriculumState(ladder(cfg))
@@ -235,6 +245,31 @@ class Trainer:
         self._headline: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
+    def gesture_share_now(self) -> float:
+        """The share of this update's rounds in which a speaker may gesture."""
+        return gesture_share(self.cfg, self.curriculum.phase,
+                             self.curriculum.updates_in_phase)
+
+    def record_gestures(self, phase, st, n: int) -> None:
+        """Fold one update's gesture statistics into the per-rung record."""
+        d = self.gesture_log.get(phase.name)
+        if st.gesture_share <= 0 and d is None:
+            return                     # a rung in which gesturing was never possible
+        if d is None:
+            d = self.gesture_log[phase.name] = {
+                "updates": 0, "updates_allowed": 0, "rounds": 0, "rounds_allowed": 0.0,
+                "gestures": 0, "by_field": [0] * 5, "share_first": st.gesture_share,
+                "share_last": st.gesture_share}
+        d["updates"] += 1
+        d["rounds"] += n
+        d["share_last"] = st.gesture_share
+        if st.gesture_share > 0:
+            d["updates_allowed"] += 1
+            d["rounds_allowed"] += st.gesture_available * n
+            d["gestures"] += int(sum(st.gesture_fields))
+            d["by_field"] = [a + b for a, b in zip(d["by_field"], st.gesture_fields)]
+            self._gesture_recent.add(st.gesture_used)
+
     def curriculum_report(self) -> dict[str, Any]:
         """Where the run got to on the ladder, and what vocabulary came from where."""
         cur = self.curriculum
@@ -639,6 +674,7 @@ class Trainer:
             "shared": self.pop.shared,
             "turnover_started": self._turnover_started,
             "next_grow": self._next_grow, "community_log": self.community_log,
+            "gesture_log": self.gesture_log,
             "farmers": [agent_state(a) for a in self.pop.farmers],
             "buyers": [agent_state(a) for a in self.pop.buyers],
             "next_id": self.pop._next_id, "deaths": self.pop.deaths,
@@ -854,6 +890,7 @@ class Trainer:
         else:                   # an episode-counted schedule: restart it now
             self._next_grow = None if st["next_grow"] is None else self.updates
         self.community_log = list(st["community_log"])
+        self.gesture_log = dict(st.get("gesture_log") or {})
 
         def restore(rec):
             a = make_agent(self.cfg, agent_id=rec["agent_id"], role=rec["role"],
@@ -1221,6 +1258,20 @@ class Trainer:
         L("hindsight feedback : %s" % (
             "off" if c.train.hindsight_coef <= 0 else
             "from `%s` up (off while the first codes form)" % c.train.hindsight_from_rung))
+        gs = c.gesture
+        L("gestures           : %s" % (
+            "OFF" if not gs.enabled else
+            "fingers for quantity and price, pointing for fruit, colour and quality; "
+            "possible in %.0f%% -> %.0f%% of rounds over the first %d updates of each "
+            "naming rung, %.0f%% of rounds from `mutual` on; the speaker chooses and "
+            "pays %.3f; every gate and probe is word-only"
+            % (100 * gs.share_start, 100 * gs.share_end, gs.anneal_updates,
+               100 * gs.share_reuse, gs.cost)))
+        L("innate word classes: %s" % (
+            "the lineup choice is read through the five belief heads (fruit, colour, "
+            "quality, quantity, price), one attribute at a time"
+            if c.model.factored_choice else
+            "off -- a plain candidate pointer over the summed embedding"))
         L("agent brain        : %d-layer transformer, d=%d, %d params, RANDOMLY INITIALISED"
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))
@@ -1448,6 +1499,10 @@ class Trainer:
             "quantity_encoding_live": qty_live,
             "usage": self.usage.summary(),
             "speaker_cost_gate": self.cost_gate,
+            "gestures": {"share_now": self.gesture_share_now(),
+                         "recent_used": (self._gesture_recent.mean
+                                         if len(self._gesture_recent) else float("nan")),
+                         "by_rung": {k: dict(v) for k, v in self.gesture_log.items()}},
             "started_utc": self.started_utc,
             "final": final,
         }
@@ -1485,6 +1540,8 @@ class Trainer:
         h.mean_word_len.append(words["mean_word_len_atoms"])
         h.at_length_cap.append(words["at_length_cap_frac"])
         h.phase_index.append(float(phase.index))
+        h.gesture_share.append(row["gestures"]["share_now"])
+        h.gesture_used.append(row["gestures"]["recent_used"])
         h.transmission.append(intel["transmission_ratio"])
         h.zeroshot.append(zs["retention"])
         h.ablation_drop.append(abl.get("comprehension_drop", float("nan")))
@@ -1647,6 +1704,19 @@ class Trainer:
             else "off until `%s`" % self.cfg.reward.convention_from_rung,
             "on" if row.get("speaker_cost_gate", 1.0) >= 1.0
             else "off until `%s`" % self.cfg.reward.costs_from_rung))
+        gs = row.get("gestures") or {}
+        if gs:
+            d = (gs.get("by_rung") or {}).get(self.curriculum.phase.name) or {}
+            names = ("fruit", "colour", "quality", "quantity", "price")
+            by = d.get("by_field") or []
+            L("  gestures          : possible in %.0f%% of rounds now; used in %.0f%% of "
+              "the turns they were possible in recently%s  (training only -- every "
+              "number above is word-only)"
+              % (100 * gs.get("share_now", 0.0),
+                 100 * (gs.get("recent_used") if gs.get("recent_used") == gs.get("recent_used")
+                        else 0.0),
+                 ("; this rung so far: " + ", ".join(
+                     "%s %d" % (n, c) for n, c in zip(names, by) if c)) if any(by) else ""))
         us = row.get("usage") or {}
         if us:
             L("  recent usage      : %d word types in circulation, %d established; "
@@ -1887,16 +1957,22 @@ class Trainer:
         # decode every structure metric uses -- and is the lexicon.
         lex = max([sp.get("lexicon_size", 0) or 0
                    for sp in (row.get("per_role_structure") or {}).values()] or [0])
+        gs = row.get("gestures") or {}
+        gest = ""
+        if gs.get("share_now", 0.0) > 0 or (gs.get("recent_used") == gs.get("recent_used")):
+            gest = " | gestures possible %s, used %s" % (
+                f(100 * gs.get("share_now", 0.0), "%.0f%%"),
+                f(100 * gs.get("recent_used", float("nan")), "%.0f%%"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
-            "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end"
+            "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end%s"
             % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
                w.get("distinct_words", "n/a"), lex or "n/a",
                f(w.get("mean_word_len_atoms"), "%.2f"),
                f(w.get("mean_words_per_message"), "%.2f"),
                f(100 * w.get("silent_frac", float("nan")), "%.0f%%"),
-               f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%")))
+               f(100 * w.get("at_length_cap_frac", float("nan")), "%.0f%%"), gest))
 
     def batch_size_for(self, rung) -> int:
         scale = float((self.cfg.train.rung_batch_scale or {}).get(rung.name, 1))
@@ -1935,12 +2011,14 @@ class Trainer:
                 scen = self.economy.make_batch_tensor(
                     n, len(self.pop.farmers), len(self.pop.buyers),
                     self.tensor_world, f_idx, b_idx)
-            batch, _ = run_and_update_gumbel(
+            batch, ustats = run_and_update_gumbel(
                 cfg, scen, self.pop.farmers, self.pop.buyers, f_idx, b_idx,
                 update=self.updates, device=self.device, phase=phase, usage=self.usage,
                 cost_scale=self.cost_gate, convention_scale=self.convention_gate,
                 phase_update=(self.curriculum.updates_in_phase
-                              if cfg.train.anneal_per_rung else None))
+                              if cfg.train.anneal_per_rung else None),
+                gesture_share=self.gesture_share_now())
+            self.record_gestures(rung, ustats, n)
 
             self.pop.record_episode_participation(f_idx, b_idx, batch)
             self.update_cost_gate()
