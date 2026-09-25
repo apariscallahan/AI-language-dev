@@ -272,3 +272,35 @@ def gestured_fields(cfg: Config, tokens: torch.Tensor, turn_starts: Sequence[int
 
 def field_name(field: int) -> str:
     return LOT_FIELDS[int(field)]
+
+
+def without_gestures(cfg: Config, tokens: torch.Tensor, dialogue: torch.Tensor,
+                     turn_starts: Sequence[int]) -> torch.Tensor:
+    """The dialogue as it would have been without the gestures: each gestured turn
+    shifted one slot left so its words sit where a gesture-free turn's words sit.
+
+    ``dialogue`` is (B, D) ids or (B, D, V) soft one-hots (the straight-through
+    channel's), aligned with ``tokens`` (B, D) ids. The last slot of a shifted
+    turn becomes PAD. This is what the ostensive lesson shows the listener: the
+    same words, heard as they would be in a round with no pointing.
+    """
+    L = cfg.channel.max_msg_len
+    lo = first_gesture_id(cfg)
+    hi = lo + n_gesture_ids(cfg)
+    out = dialogue.clone()
+    soft = dialogue.dim() == 3
+    for p in turn_starts:
+        g = (tokens[:, p] >= lo) & (tokens[:, p] < hi)
+        if not bool(g.any()):
+            continue
+        seg = dialogue[:, p:p + L]
+        if soft:
+            pad = torch.zeros_like(seg[:, :1])
+            pad[:, 0, cfg.channel.pad_id] = 1.0
+            shifted = torch.cat([seg[:, 1:], pad], dim=1)
+            out[:, p:p + L] = torch.where(g.view(-1, 1, 1), shifted, seg)
+        else:
+            pad = torch.full_like(seg[:, :1], cfg.channel.pad_id)
+            shifted = torch.cat([seg[:, 1:], pad], dim=1)
+            out[:, p:p + L] = torch.where(g.view(-1, 1), shifted, seg)
+    return out

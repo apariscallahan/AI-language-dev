@@ -773,12 +773,14 @@ moment, and it is what makes the word learnable. So the simulation now has a
   what you asked for" depends on having understood the request, and a gesture
   the world computed for it would be the world doing the understanding.
 - **The world decides when.** Gesturing is possible in a share of rounds
-  (`gesture.share_start` = 0.75 at the start of every rung that still has a
-  word to invent, withdrawn linearly to `share_end` = 0 over `anneal_updates` =
-  600), then a small standing share in every rung that only reuses words
-  (`share_reuse` = 0.1): fingers are part of a market, and whether speakers
-  still bother with them once the words work is something to measure. Below 1
-  from the start, so word-only rounds exist from the first update.
+  (`gesture.share_start` = 1.0 at the start of every rung that still has a
+  word to invent — lots of pointing before there are words — withdrawn
+  linearly to `share_end` = 0 over `anneal_updates` = 600), then a small
+  standing share in every rung that only reuses words (`share_reuse` = 0.1):
+  fingers are part of a market, and whether speakers still bother with them
+  once the words work is something to measure. The words are shaped from the
+  first update regardless, by the innate lexicon below, which does not go
+  through the listener.
 - **The speaker decides whether.** A sixth head (`CommNet.gesture_head`),
   sampled from the same hidden state that emits the turn's first symbol and
   trained by REINFORCE like the decisions, chooses none or one of the fields
@@ -794,6 +796,16 @@ moment, and it is what makes the word learnable. So the simulation now has a
   message. Here the answer is *in* the message. The term also reaches the
   speaker through the straight-through channel, pulling its words towards
   whatever the listener already reads as that value.
+- **The ostensive lesson** (`gesture.ostensive_coef` = 1.0): the parent points
+  at the apple *and says "apple"*, and the child learns the word. On a round
+  where the speaker both gestured and said its established name for the
+  gestured meaning — the speaker's own lexicon, below, says which utterances
+  are names — the listener is shown the turn *without* the gesture, the words
+  shifted to where a gesture-free turn's words sit, and its head for that
+  field is taught the gestured value: a labelled example of the word, from the
+  words alone. Babble is not a lesson, so this cannot teach a listener that
+  words carry nothing before any word exists. The lesson reaches the speaker's
+  word through the straight-through channel too.
 
 Why that should help the *words*, and not just replace them: the gesture and
 the atoms share the dialogue, the token table and the listener's readout. A
@@ -820,6 +832,65 @@ in the report's §3g. A scaffold doing its job is used heavily while the word is
 forming and dropped once it works; speakers still reaching for their fingers in
 a rung whose words pass the gate are saying the gesture is cheaper than the
 word for them.
+
+### One name per meaning: the innate lexicon
+
+A child brings two assumptions to a new word: it names one sort of thing, and a
+thing that already has a name is not what it names. Nothing about *which*
+sounds go with which things is innate; that a name is for one meaning and a
+meaning has one name is. So when there are four fruits there should very soon
+be four names — not one form for everything, and not a new form every time.
+
+Before this the only pressure on the words in the naming rungs was the gradient
+through the listener, and a listener whose reading of the channel is random
+gives that gradient no consistent direction. That is a fact about *speakers*
+that was missing, not about communities: the population-level convention bonus
+([§6](#6-speaker-pressures-and-the-community)) waits for `name-all` because a
+speaker that has not settled its own names has nothing to agree with anyone
+about. Two speaker-side terms now supply it, on from the first round of the
+first rung, never gated, per agent (`orchard/conventions.py`):
+
+- **Positive signalling** (`reward.lexicon_mi` = 2.0): the mutual information,
+  in the speaker's own policy, between the value it was asked about and the
+  first symbol it speaks — taken *within the asked-about field* — plus the
+  mean pairwise separation of the values' first-symbol distributions. Apple
+  rounds should sound alike and unlike banana rounds, by the speaker's own
+  lights: exact, listener-free, and it names no symbol. This is the bias of
+  Eccles et al. (2019) applied per meaning rather than per observation, so the
+  variation rewarded is in the asked-about field and not in the colour of the
+  apple being described.
+- **The speaker's own lexicon** (`reward.lexicon` = 0.30): a decayed record,
+  per speaker, of the forms it has used for each (field, value) it was asked
+  about. An utterance is paid for being closer to this meaning's recent forms
+  than to any other meaning's — the mutual-exclusivity charge runs across
+  fields, so a fruit name and a colour name are pressed apart too — and a form
+  counts as *a name* once it has `lexicon_min_support` = 3 recent uses and is
+  not also the speaker's name for something else. That last judgement is what
+  gates the ostensive lesson above, and what the checkpoint line reports as
+  `names 4/4`: distinct names over meanings named.
+
+Three things were got wrong on the way, each measured on `name-fruit` at batch
+256 with two founders, and each is a test now (`tests/test_lexicon_prior.py`):
+
+| version | what happened |
+|---|---|
+| lexicon bonus against each meaning's *modal* form | both speakers said one form for every fruit and stayed there for 60 updates: the shared form was charged equally on every fruit, which says "not that" but never "something different for each" |
+| information alone | 0.00 bits for 90 updates, with or without gestures: mutual information has a zero *gradient* where every meaning's distribution is the same, which is where an untrained speaker starts. The pairwise separation has full-size gradient at any asymmetry, and is what breaks it |
+| information and separation across *all* meanings | on `name-quantity` from scratch both speakers settled on **one name per field** — every fruit one form, every quantity another — and the objective read 1.5–2.1 with every value at chance: 139 of the 190 meaning pairs lie across fields, and *which field was asked* is in the speaker's observation. Within the field, the shortcut is gone |
+
+With the within-field objective at 2.0 and the distribution-based lexicon,
+`name-fruit` at batch 256 goes from chance to **0.98–0.99 word-only success in
+90 updates**, both founders holding three distinct names, with gestures on or
+off; at 0.5 the names stayed shared; the same population with neither term
+had no code after 90, and the GPU run had needed 1,775. On `name-quantity`
+played from scratch — four fields and twenty values at once, which the real
+ladder never asks, and with about 7 rows per quantity value per update — the
+signal climbs to 1.33 with gestures against 0.82 without over 150 updates and
+the quantity names begin to separate; the estimate the objective is taken on
+has 16× the rows at the GPU batch. The scaffold is meant to be dropped:
+gesturing costs 0.02 a time and words cost nothing here, so once the words
+work the gesture head has nothing to earn, and the world withdraws the
+possibility over the rung in any case.
 
 ### Telling inherited structure from new structure
 
@@ -1641,6 +1712,11 @@ hindsight feedback must wait; the three-field naming ladder climbs to and throug
   is a candidate for a further rung rather than for quietly loosening the test.
 - The `duality` experiment (12 fruits against 8 atoms, so no atom can name a
   whole meaning — the setting where duality of patterning is *necessary*).
+- **The innate lexicon has not been run on a GPU.** Measured at the reference
+  scale on a CPU: `name-fruit` from chance to 0.98 word-only in 90 updates of
+  256; `name-quantity` from scratch separating slowly over 150 (see
+  [§5](#one-name-per-meaning-the-innate-lexicon)). Whether the five-field
+  ladder now climbs past quantity at the GPU batch is the next thing to run.
 - **Gestures and the factored listener have not been run on a GPU.** What is
   verified (`tests/test_gesture.py`): a gesture is a symbol of its own, never a
   word and never costed; it can only show what its maker can see; the world
@@ -1787,7 +1863,8 @@ orchard/
   gesture.py     the gesture channel: fingers and pointing, what a seat may show,
                  when the world allows it, what the listener is taught
   curriculum.py  the ladder of rungs, the lineup and report games, and promotion
-  conventions.py the population's recent usage: rarity cost, convention bonus
+  conventions.py the population's recent usage: rarity cost, convention bonus;
+                 each speaker's own lexicon and the naming objective (one name per meaning)
   population.py  ageing, death, birth, generation counting, the role split
   bottleneck.py  iterated learning: frequency-skewed apprenticeship, withheld combinations
   metrics.py     success, topsim, entropy, stability, intelligibility,

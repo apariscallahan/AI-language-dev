@@ -339,7 +339,7 @@ class GestureConfig:
     # child has the word -- so the words must carry the meaning before the rung
     # can be left (which is judged word-only regardless). Below 1 from the
     # start, so word-only rounds exist from the first update.
-    share_start: float = 0.75
+    share_start: float = 1.0
     share_end: float = 0.0
     anneal_updates: int = 600
     # In every rung that only reuses words (`mutual` and above): a small
@@ -359,6 +359,17 @@ class GestureConfig:
     # through the straight-through channel as well, pulling its words towards
     # whatever the listener already reads as that value. 0 turns it off.
     supervise_coef: float = 0.5
+    # The ostensive lesson: a parent points at the apple *and says "apple"*, and
+    # the child learns the word. On a round where the speaker both gestured and
+    # said its established name for the gestured meaning (`reward.lexicon`),
+    # the listener is shown the turn *without* the gesture -- exactly as it
+    # would hear it in a gesture-free round -- and its head for that field is
+    # taught the gestured value. A labelled example of the word, from the words
+    # alone; the gradient reaches the speaker's word through the
+    # straight-through channel too. Only established names are taught, so
+    # early babble is not a lesson and cannot teach a listener that words carry
+    # nothing (the way hindsight does before a code exists). 0 turns it off.
+    ostensive_coef: float = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -573,6 +584,60 @@ class RewardConfig:
     # convention minus its similarity to the closest other meaning's, which is
     # zero.
     convention_from_rung: str = "name-all"
+    # The innate lexicon: one name per meaning, one meaning per name -- a
+    # pressure on each *speaker's own* words, on from the first round of the
+    # first rung, independent of the listener and of the population
+    # (orchard/conventions.py, `SpeakerLexicon`). In a round that asks about
+    # one field, the meaning is that field's value; the speaker is paid for
+    # saying its own established name for it and charged for resembling its
+    # established name for any *other* meaning -- so four fruits get four
+    # distinct, consistent names within a few updates, whether or not anyone
+    # has yet learned to read them. That is what a child assumes about a new
+    # word (it names one sort of thing, and a thing already named is not what
+    # it names), and it is what an untrained listener cannot supply: without
+    # it, the only thing shaping the words was a gradient through a listener
+    # whose reading of them was random, and nine number words never formed.
+    # Contrastive like the convention bonus, so a collapsed code (one form for
+    # everything) earns nothing and is charged for the resemblance; a name
+    # counts once it has `lexicon_min_support` recent uses behind it. It also
+    # says when an utterance *is* a word -- the speaker's established name --
+    # which is what makes a gestured round an ostensive lesson
+    # (`gesture.ostensive_coef`). 0 turns it off.
+    lexicon: float = 0.30
+    lexicon_min_support: int = 3
+    # The bonus compares an utterance with each meaning's *recent form
+    # distribution* -- its top few forms, by recent use -- rather than with one
+    # modal form. Measured: against the modal form alone, two speakers whose
+    # untrained policies said one thing for every fruit were charged equally for
+    # it on every fruit, which says "not that" but never "something different
+    # for each", and both stayed collapsed for 60 updates. Against the
+    # distributions, a form that has happened to co-occur more with apple than
+    # with banana earns when said for apple, and that is the positive feedback
+    # that pulls the names apart.
+    lexicon_top_forms: int = 4
+    # Positive signalling: the mutual information, in the speaker's own policy,
+    # between the meaning it was asked about and the first symbol it speaks --
+    # H(mean distribution over the batch) minus the meaning-weighted mean of
+    # H(mean distribution within each meaning). It rewards apple rounds
+    # sounding alike and unlike banana rounds, exactly and without a listener,
+    # from the very first update, and it names no symbol. This is the bias of
+    # Eccles et al. (2019) applied per meaning rather than per observation, so
+    # that the variation it rewards is variation in the *asked-about* field and
+    # not in the colour of the apple being described. It is what "one name per
+    # meaning" is as a fact about a policy. 0 turns it off.
+    #
+    # Information alone has a *zero gradient* where every meaning's distribution
+    # is the same, which is where an untrained speaker starts: measured, it sat
+    # at 0.00 bits for 90 updates. So the term also carries the mean pairwise
+    # separation of the meanings' distributions, whose gradient at any
+    # asymmetry, however small, has full size in that asymmetry's direction
+    # (`conventions.naming_mutual_information`). Measured on `name-fruit` at
+    # batch 256: at 0.5 the signal reached 0.18 in 60 updates and the names
+    # stayed shared; at 2.0 it reached 2.8, 41% of turns were the speaker's
+    # established name, and word-only success was 0.57 against 0.33 chance --
+    # where the run without it had not left chance after 90 updates and the
+    # GPU run had taken 1,775.
+    lexicon_mi: float = 2.0
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -1331,3 +1396,5 @@ def validate(cfg: Config) -> None:
     for name in ("share_start", "share_end", "share_reuse"):
         assert 0.0 <= getattr(g, name) <= 1.0, "gesture.%s must be a share in [0, 1]" % name
     assert g.anneal_updates >= 0 and g.cost >= 0.0 and g.supervise_coef >= 0.0
+    assert g.ostensive_coef >= 0.0
+    assert cfg.reward.lexicon >= 0.0 and cfg.reward.lexicon_min_support >= 1

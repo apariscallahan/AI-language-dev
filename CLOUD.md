@@ -152,6 +152,12 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
 - **`[costs]`**, once per costed rung, when the rung reaches its floor and the
   speaker costs start ramping in;
 - **budget stops**, naming exactly what was unmet;
+- on the second checkpoint line, **`names 4/4, 4/4`** (distinct names over
+  meanings named, per speaker) and **`naming signal S, name used Z%`**: how
+  far each speaker's own lexicon has settled. On `name-fruit` expect the names
+  to reach 4/4 within ~100 updates and `name used` to climb towards 100%; on a
+  later naming rung the count grows by that rung's values. Distinct below
+  named means two meanings share a name;
 - on the second checkpoint line, **`gestures possible X%, used Y%`**: the share
   of rounds the world allowed a gesture in, and the share of those turns the
   speakers used one in. Training-time numbers only; everything else on the line
@@ -345,7 +351,10 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `reward.convention_contrast_samples` | how many other meanings' forms each utterance is contrasted with (16), taking the *closest* rather than the average: a collapsed code earns exactly nothing at 16 and starts earning again below 8, so this is not where to buy speed. It is the whole cost of the term — host-side edit distances while the device waits, 0.75 s per update at batch 4,096 against a ~2.7 s update. |
 | `train.hindsight_from_rung` | the first rung with hindsight feedback (`mutual`). Earlier, it stops the first code forming. |
 | `gesture.enabled` | the gesture channel (on): a speaker may open a turn with fingers for a quantity or price, or by pointing at a fruit, colour or quality. Iconic, truthful, never a word, never measured — every gate and probe is word-only. Off is the ablation: the 2026-09-24 run, which stalled at chance on `name-quantity` for 850 updates. |
-| `gesture.share_start`, `gesture.share_end`, `gesture.anneal_updates` | in what share of rounds a gesture is possible over a rung that is still inventing a word: 0.75 at its start, withdrawn to 0 over 600 updates, so the words have to take over before the (word-only) gate can pass. |
+| `gesture.share_start`, `gesture.share_end`, `gesture.anneal_updates` | in what share of rounds a gesture is possible over a rung that is still inventing a word: every round at its start, withdrawn to none over 600 updates, so the words have to take over before the (word-only) gate can pass. |
+| `gesture.ostensive_coef` | the ostensive lesson (1.0): where a speaker gestured *and* said its established name, the listener is taught the gestured value from the words alone. Needs the innate lexicon to say which utterances are names. |
+| `reward.lexicon_mi` | positive signalling (2.0): information plus separation between the asked-about values' first-symbol distributions, within the asked-about field, in the speaker's own policy. The term that gets four fruit names to form in ~90 updates instead of ~1,700. At 0.5 the names stayed shared; taken across fields instead of within, speakers named the *field* and no value. |
+| `reward.lexicon`, `reward.lexicon_min_support`, `reward.lexicon_top_forms` | each speaker's own lexicon (0.30): paid for an utterance closer to this meaning's recent forms than to any other meaning's, per speaker, from the first round. A form is a name after 3 recent uses. Compared against each meaning's top 4 recent forms, not its modal form alone (the modal form could not pull collapsed names apart). |
 | `gesture.share_reuse` | the standing share from `mutual` on (0.1). Whether speakers still use it once words work is what §3g of the report shows. |
 | `gesture.cost` | what the speaker pays per gesture (0.02): small enough to be worth it while the word fails, enough to drop once the word works. |
 | `gesture.supervise_coef` | the listener's head for the gestured field is taught the gestured value (0.5). Not hindsight: the answer is in the message, so it cannot teach the listener to ignore the message. |

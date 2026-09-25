@@ -45,7 +45,8 @@ from .curriculum import (H_BELIEF, H_CHOICE, H_REPORT, N_HEADS, MutualBatch, Pha
                          ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
                          phase_schema, resolve_referential, resolve_reports)
 from .gesture import (GESTURE_NONE, draw_availability, gesture_option_mask,
-                      gesture_tokens_for, gestured_fields, n_token_ids)
+                      gesture_tokens_for, gestured_fields, n_token_ids,
+                      without_gestures)
 from .rollout import (BatchRollout, UpdateStats, anneal, belief_columns,
                       group_by_agent, n_outputs, split_decision)
 from .world import N_LOT_FIELDS, Scenario
@@ -164,6 +165,22 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     gest_field_counts = torch.zeros(1 + N_LOT_FIELDS, dtype=torch.long, device=device)
     onehot_table = torch.eye(NT, device=device) if gest_on else None
 
+    # ---- positive signalling (`reward.lexicon_mi`) --------------------------
+    # The distribution over the first symbol a speaker *speaks* in its first
+    # turn (after its gesture, if it made one), kept per role so that after the
+    # conversation the mutual information between the asked-about meaning and
+    # that symbol can be taken over the batch. Grouped by meaning, so the
+    # variation rewarded is in the asked-about field, not in the rest of the lot.
+    mi_on = train and cfg.reward.lexicon_mi > 0
+    first_lp = {r: torch.zeros((B, c.n_emittable), device=device) for r in (FARMER, BUYER)}
+    have_first = {r: torch.zeros(B, dtype=torch.bool, device=device) for r in (FARMER, BUYER)}
+    mi_keys: dict[int, list] = {}
+    if mi_on:
+        from .conventions import naming_keys
+        for r in (FARMER, BUYER):
+            if phase.speaks(cfg, r):
+                mi_keys[r] = naming_keys(cfg, phase, r, obs_of[r])
+
     # ---- the conversation ------------------------------------------------
     # Phases that use fewer turns simply leave the later dialogue slots empty,
     # which keeps one sequence layout -- and therefore one set of weights -- valid
@@ -238,6 +255,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             tokens[:, p] = tok.detach()
             active[:, p] = acted
             lp = F.log_softmax(logits, dim=-1)
+            if mi_on and role in mi_keys and k <= 1:
+                take = acted & ~have_first[role]
+                first_lp[role] = torch.where(take.unsqueeze(-1), lp, first_lp[role])
+                have_first[role] = have_first[role] | take
             token_entropy_terms.append(-(lp.exp() * lp).sum(-1) * acted.float())
             if want_token_logp:
                 chosen = lp.gather(-1, tok.clamp(max=c.n_emittable - 1).unsqueeze(-1)).squeeze(-1)
@@ -380,15 +401,24 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         # agreeing is not economising. The rarity cost stays with the costs.
         cg = g if convention_scale is None else float(min(1.0, max(0.0, convention_scale)))
         conv_on = cg > 0 or not cfg.reward.convention_gated
+        # Who spoke each episode, for the speaker's own lexicon (the innate
+        # one-name-per-meaning prior, `reward.lexicon`): never gated, so it is
+        # on from the first round of the first rung.
+        ids_of = None
+        if cfg.reward.lexicon > 0:
+            ids_of = {r: [pool_of[r][i].agent_id for i in idx_of[r].tolist()]
+                      for r in (FARMER, BUYER) if phase.speaks(cfg, r)}
         terms = usage.speaker_terms(phase, tokens, obs_of, rarity=g > 0,
-                                    convention=conv_on)
+                                    convention=conv_on, agent_ids=ids_of)
         for role, d in terms.items():
             d["rarity"] = g * d["rarity"]
             if cfg.reward.convention_gated:
                 d["convention"] = cg * d["convention"]
-            extra = d["convention"] - d["rarity"]
+            extra = d["convention"] + d["lexicon"] - d["rarity"]
             shape[role] = shape[role] - d["rarity"]
-            agree[role] = d["convention"]
+            # both are pressures to *agree* -- with the community, and with
+            # oneself -- and reach the words by the same route
+            agree[role] = d["convention"] + d["lexicon"]
             if role == FARMER:
                 f_rew = f_rew + extra
             else:
@@ -399,6 +429,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 zero = torch.zeros(B, device=device)
                 res[label + "_rarity_cost"] = d["rarity"] if d else zero
                 res[label + "_convention"] = d["convention"] if d else zero
+                res[label + "_lexicon"] = d["lexicon"] if d else zero
             res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
         if train:
             usage.observe(terms, B)
@@ -467,6 +498,58 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 tgt = tgt.long().clamp(0, lp.shape[-1] - 1)
                 loss = loss + t.hindsight_coef * F.nll_loss(lp, tgt)
 
+    # Positive signalling: apple rounds should sound alike and unlike banana
+    # rounds, by the speaker's own lights. Exact, listener-free, from update one.
+    if mi_on:
+        from .conventions import naming_mutual_information
+        mi_total = 0.0
+        for role, keys in mi_keys.items():
+            mi = naming_mutual_information(first_lp[role], have_first[role], keys)
+            if mi is None:
+                continue
+            loss = loss - cfg.reward.lexicon_mi * mi
+            mi_total += float(mi.detach())
+        stats.naming_signal = mi_total / (len(mi_keys) or 1)
+
+    # The ostensive lesson (`gesture.ostensive_coef`): the parent points at the
+    # apple and says "apple". On a round where the other party gestured *and*
+    # said its established name for the gestured meaning (the speaker's own
+    # lexicon says which utterances are names), the listener is shown the turn
+    # without the gesture -- the words shifted to where a gesture-free turn's
+    # words sit -- and its head for that field is taught the gestured value: a
+    # labelled example of the word, from the words alone. Babble is not a
+    # lesson, which is what keeps this from teaching a listener that words
+    # carry nothing before any word exists.
+    ost = float(cfg.gesture.ostensive_coef)
+    if train and gest_on and ost > 0 and terms:
+        for role in (FARMER, BUYER):
+            other = BUYER if role == FARMER else FARMER
+            d = terms.get(other)
+            if d is None or not turn_starts[other]:
+                continue
+            field, value = gestured_fields(cfg, tokens, turn_starts[other])
+            lesson = d["word_used"] & (field >= 0)
+            if not bool(lesson.any()):
+                continue
+            words_only = without_gestures(cfg, tokens, soft, turn_starts[other])
+            pool, obs = pool_of[role], obs_of[role]
+            for a_i, ep in groups_of[role]:
+                sel = ep[lesson[ep]]
+                if sel.numel() == 0:
+                    continue
+                net = pool[a_i].net
+                h = net.encode(obs[sel], words_only[sel], schema=schema_of[role],
+                               self_mask=mask_of[role])[:, -1]
+                heads = net.report_logits(h)
+                for j in range(N_LOT_FIELDS):
+                    rows = field[sel] == j
+                    if not bool(rows.any()):
+                        continue
+                    lg = heads[j][rows]
+                    tgt = value[sel][rows].clamp(0, lg.shape[-1] - 1)
+                    loss = loss + ost * F.cross_entropy(lg, tgt) * (
+                        float(rows.sum()) / float(lesson.sum()))
+
     # A gesture is the answer, shown: the listener's head for that field is
     # taught to read it. Not hindsight -- the answer is *in the message*, so this
     # cannot teach a listener that the message carries nothing -- and it reaches
@@ -515,6 +598,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     stats.n_agents = len(seen)
     stats.grad_norm = gn / max(1, len(seen))
     stats.n_actions = int(active.sum())
+    if terms:
+        stats.lexicon_bonus = float(sum(float(d["lexicon"].sum()) for d in terms.values())) / B
+        used_n = sum(int(d["word_used"].sum()) for d in terms.values())
+        stats.words_used = used_n / float(B * max(1, len(terms)))
     if gest_on:
         n_turns = sum(len(v) for v in turn_starts.values())
         allowed_turns = float(avail.sum()) * n_turns

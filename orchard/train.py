@@ -114,6 +114,10 @@ class History:
     # in, and the share of those turns the speakers used one in
     gesture_share: list[float] = field(default_factory=list)
     gesture_used: list[float] = field(default_factory=list)
+    # the innate lexicon: the naming signal (information plus separation) and
+    # the share of turns in which a speaker said its established name
+    naming_signal: list[float] = field(default_factory=list)
+    words_used: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: list(v) for k, v in self.__dict__.items()}
@@ -198,6 +202,10 @@ class Trainer:
         # Training-time bookkeeping only -- no measurement ever sees a gesture.
         self.gesture_log: dict[str, dict[str, Any]] = {}
         self._gesture_recent = RollingStat(window=200)
+        # the innate lexicon, recent: naming signal and how often a speaker used
+        # its established name (`reward.lexicon`, `reward.lexicon_mi`)
+        self._naming_recent = RollingStat(window=100)
+        self._words_used_recent = RollingStat(window=100)
 
         # ---- the curriculum -------------------------------------------------
         self.curriculum = CurriculumState(ladder(cfg))
@@ -252,6 +260,8 @@ class Trainer:
 
     def record_gestures(self, phase, st, n: int) -> None:
         """Fold one update's gesture statistics into the per-rung record."""
+        self._naming_recent.add(st.naming_signal)
+        self._words_used_recent.add(st.words_used)
         d = self.gesture_log.get(phase.name)
         if st.gesture_share <= 0 and d is None:
             return                     # a rung in which gesturing was never possible
@@ -681,7 +691,8 @@ class Trainer:
             "births": [asdict(e) for e in self.pop.births],
             "usage": {"scale": u.scale, "words": dict(u.words), "word_total": u.word_total,
                       "forms": {k: dict(v) for k, v in u.forms.items()},
-                      "form_total": dict(u.form_total), "episodes": u.episodes},
+                      "form_total": dict(u.form_total), "episodes": u.episodes,
+                      "lexicon": u.lexicon.state()},
             "store": {"buf": self.store._buf, "pos": self.store._pos,
                       "total_added": self.store.total_added,
                       "meaning_counts": dict(self.store.meaning_counts)},
@@ -958,6 +969,8 @@ class Trainer:
         u.forms = defaultdict(lambda: defaultdict(float),
                               {k: defaultdict(float, v) for k, v in us["forms"].items()})
         u.form_total = defaultdict(float, us["form_total"])
+        if us.get("lexicon"):
+            u.lexicon.load_state(us["lexicon"])
         # A snapshot from before the convention key carried *what was asked*
         # stores keys of a different shape. They cost nothing to keep except a
         # contrast set full of meanings that are no longer what those keys
@@ -1267,6 +1280,12 @@ class Trainer:
             "pays %.3f; every gate and probe is word-only"
             % (100 * gs.share_start, 100 * gs.share_end, gs.anneal_updates,
                100 * gs.share_reuse, gs.cost)))
+        L("innate lexicon     : %s" % (
+            "one name per meaning, one meaning per name -- each speaker is paid %.2f "
+            "for repeating its own established name for what it was asked about and "
+            "charged for resembling its name for anything else, from the first round; "
+            "a name counts after %d uses" % (c.reward.lexicon, c.reward.lexicon_min_support)
+            if c.reward.lexicon > 0 else "off"))
         L("innate word classes: %s" % (
             "the lineup choice is read through the five belief heads (fruit, colour, "
             "quality, quantity, price), one attribute at a time"
@@ -1499,6 +1518,11 @@ class Trainer:
             "quantity_encoding_live": qty_live,
             "usage": self.usage.summary(),
             "speaker_cost_gate": self.cost_gate,
+            "speaker_lexicons": self.usage.lexicon.summary(),
+            "naming": {"signal_recent": (self._naming_recent.mean
+                                         if len(self._naming_recent) else float("nan")),
+                       "words_used_recent": (self._words_used_recent.mean
+                                             if len(self._words_used_recent) else float("nan"))},
             "gestures": {"share_now": self.gesture_share_now(),
                          "recent_used": (self._gesture_recent.mean
                                          if len(self._gesture_recent) else float("nan")),
@@ -1542,6 +1566,8 @@ class Trainer:
         h.phase_index.append(float(phase.index))
         h.gesture_share.append(row["gestures"]["share_now"])
         h.gesture_used.append(row["gestures"]["recent_used"])
+        h.naming_signal.append(row["naming"]["signal_recent"])
+        h.words_used.append(row["naming"]["words_used_recent"])
         h.transmission.append(intel["transmission_ratio"])
         h.zeroshot.append(zs["retention"])
         h.ablation_drop.append(abl.get("comprehension_drop", float("nan")))
@@ -1704,6 +1730,22 @@ class Trainer:
             else "off until `%s`" % self.cfg.reward.convention_from_rung,
             "on" if row.get("speaker_cost_gate", 1.0) >= 1.0
             else "off until `%s`" % self.cfg.reward.costs_from_rung))
+        lex = row.get("speaker_lexicons") or {}
+        nm = row.get("naming") or {}
+        if lex:
+            by_id = {a.agent_id: a.name for a in self.pop.all_agents()}
+            L("  innate lexicon    : " + "; ".join(
+                "%s names %d meanings with %d distinct names%s"
+                % (by_id.get(int(k), "agent %s" % k), v["meanings_named"], v["distinct_names"],
+                   (" (%d shared)" % v["shared_names"]) if v["shared_names"] else "")
+                for k, v in lex.items()))
+        if nm:
+            L("  naming signal     : %.2f (information plus separation between the meanings' "
+              "first symbols, in the speakers' own policies); the speaker said its "
+              "established name in %.0f%% of recent turns"
+              % (nm.get("signal_recent", float("nan")),
+                 100 * (nm.get("words_used_recent") if nm.get("words_used_recent")
+                        == nm.get("words_used_recent") else 0.0)))
         gs = row.get("gestures") or {}
         if gs:
             d = (gs.get("by_rung") or {}).get(self.curriculum.phase.name) or {}
@@ -1963,6 +2005,15 @@ class Trainer:
             gest = " | gestures possible %s, used %s" % (
                 f(100 * gs.get("share_now", 0.0), "%.0f%%"),
                 f(100 * gs.get("recent_used", float("nan")), "%.0f%%"))
+        lex = row.get("speaker_lexicons") or {}
+        if lex:
+            gest += " | names " + ", ".join(
+                "%s/%s" % (v["distinct_names"], v["meanings_named"]) for v in lex.values())
+        nm = row.get("naming") or {}
+        if nm and nm.get("signal_recent") == nm.get("signal_recent"):
+            gest += " | naming signal %s, name used %s" % (
+                f(nm.get("signal_recent"), "%.2f"),
+                f(100 * nm.get("words_used_recent", float("nan")), "%.0f%%"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
             "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end%s"

@@ -77,7 +77,7 @@ import torch
 
 from .config import Config
 from .env import BUYER, FARMER, parse_words
-from .world import K_EMPTY, K_FIELD
+from .world import K_EMPTY, K_FIELD, N_LOT_FIELDS
 
 
 def _edit(a: Sequence[int], b: Sequence[int]) -> int:
@@ -138,6 +138,304 @@ def query_slots(cfg: Config, role: int, phase) -> list[int]:
     return [i for i, k in enumerate(phase_schema(cfg, role, phase)) if k == K_FIELD]
 
 
+def naming_keys(cfg: Config, phase, role: int, obs: torch.Tensor) -> list:
+    """(field, value) per episode where one field of a lot is asked about; None otherwise.
+
+    The meaning a name is *for*: in a fruit round, the fruit; in a quantity
+    round, the number. A round that asks for a whole lot has no single meaning
+    and gets None.
+    """
+    B = obs.shape[0]
+    q = query_slots(cfg, role, phase)
+    if not q:
+        return [None] * B
+    cols = obs[:, [q[0]] + list(range(N_LOT_FIELDS))].tolist()
+    out = []
+    for row in cols:
+        f = int(row[0])
+        out.append((f, int(row[1 + f])) if 0 <= f < N_LOT_FIELDS else None)
+    return out
+
+
+def naming_mutual_information(lp: torch.Tensor, have: torch.Tensor, keys: Sequence
+                              ) -> Optional[torch.Tensor]:
+    """I(value; first spoken symbol) *within the asked-about field*, under the
+    speaker's policy, in nats, plus the separation of the values' distributions.
+
+    ``lp`` (B, E) is the log-distribution over the first symbol each speaker
+    spoke, ``have`` (B,) which rows have one, ``keys`` the (field, value) per row
+    (None for rows with no single meaning). The rows are split by field and the
+    objective taken within each -- the distribution of each value is the mean of
+    its rows' distributions, the marginal their weighted mean, the information
+    H(marginal) - sum_v w_v H(value v), plus the mean pairwise separation --
+    then averaged over fields, weighted by rows.
+
+    Within the field, not across all meanings. Measured across all of them on
+    `name-quantity` (four fields asked about, twenty values), both speakers
+    settled on **one name per field** -- every fruit one form, every quantity
+    another -- and the objective read 1.5-2.1 while every value sat at chance:
+    with 139 of 190 meaning pairs lying across fields, distinguishing *what
+    was asked* (which is in the speaker's observation) satisfied most of it and
+    the values, which are the point, hardly counted. Telling fields apart is
+    the mutual-exclusivity charge's job (:class:`SpeakerLexicon`), not this
+    term's. Differentiable through ``lp``. None if no field has two values.
+    """
+    by_field: dict[int, list[int]] = {}
+    for i, k in enumerate(keys):
+        if k is not None and bool(have[i]):
+            by_field.setdefault(int(k[0]), []).append(i)
+    total = torch.zeros((), device=lp.device)
+    n_rows = 0
+    for rows in by_field.values():
+        part = _naming_objective(lp, [keys[i][1] for i in rows], rows)
+        if part is not None:
+            total = total + part * len(rows)
+            n_rows += len(rows)
+    return total / n_rows if n_rows else None
+
+
+def _naming_objective(lp: torch.Tensor, values: Sequence, rows: Sequence[int]
+                      ) -> Optional[torch.Tensor]:
+    """Information plus separation among the ``values`` named on these ``rows``."""
+    ids: dict = {}
+    gidx = [ids.setdefault(v, len(ids)) for v in values]
+    if len(ids) < 2:
+        return None
+    dev = lp.device
+    rows_t = torch.tensor(rows, dtype=torch.long, device=dev)
+    g = torch.tensor(gidx, dtype=torch.long, device=dev)
+    probs = lp[rows_t].exp()
+    counts = torch.bincount(g, minlength=len(ids)).float()
+    p_m = torch.zeros((len(ids), probs.shape[-1]), device=dev).index_add_(0, g, probs)
+    p_m = p_m / counts.unsqueeze(-1)
+    w = counts / counts.sum()
+    p_bar = (w.unsqueeze(-1) * p_m).sum(0)
+
+    def H(p):
+        return -(p * (p + 1e-9).log()).sum(-1)
+    mi = H(p_bar) - (w * H(p_m)).sum()
+    # Mutual information is zero *with zero gradient* where every meaning's
+    # distribution is the same -- which is where an untrained speaker starts, and
+    # where it stayed for 90 updates at 0.00 bits. The mean pairwise L1 distance
+    # between the meanings' distributions has a gradient of full size at any
+    # asymmetry however small, in the direction of that asymmetry, so it is what
+    # breaks the symmetry; the information term then sharpens what it started.
+    G = p_m.shape[0]
+    sep = (p_m.unsqueeze(0) - p_m.unsqueeze(1)).abs().sum(-1) / 2.0        # (G, G) in [0, 1]
+    sep = sep.sum() / (G * (G - 1))
+    return mi + sep
+
+
+class SpeakerLexicon:
+    """Each speaker's own names for the meanings it has been asked to name.
+
+    The innate assumption behind it -- the one a child brings to a new word --
+    is that a name is *for* one meaning and a meaning *has* one name. Nothing
+    here says which sounds name which things; it says that whatever a speaker
+    has been calling a thing is what it should go on calling it, and that a
+    name it already uses for something else is not this thing's name. The
+    population-level convention bonus (:class:`PopulationUsage`) asks the same
+    of a community and waits for `name-all`; this is per speaker and on from
+    the first round, because it is a fact about speakers, not about
+    communities: a speaker that has not settled its own names has nothing to
+    agree with anyone about.
+
+    Why it matters for learning: the only other pressure on the words in the
+    naming rungs is the gradient through the listener, and a listener whose
+    reading of the channel is still random gives that gradient no consistent
+    direction. This term does not go through the listener at all. A speaker
+    that says a random thing each round earns nothing; one that repeats its
+    own established name earns `reward.lexicon`; one whose name for this
+    meaning is also its name for another is charged for the resemblance. So the
+    speaker settles on distinct, consistent names on its own, and the listener
+    is left with a stationary code to learn -- which it can, quickly, from the
+    gestured rounds (:attr:`orchard.config.GestureConfig.ostensive_coef`).
+
+    A meaning is the value of the field a round asks about -- (fruit, APPLE),
+    (quantity, 3) -- so the prior applies wherever a single thing is being
+    named: the query rounds of every naming rung, including the rehearsed
+    ones. A round that asks for a whole lot has no single meaning to name and
+    is left to the convention bonus.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.scale = 1.0
+        # agent id -> meaning key -> utterance -> decayed count
+        self.forms: dict[int, dict[tuple, dict[tuple, float]]] = {}
+        self.total: dict[int, dict[tuple, float]] = {}
+
+    # ---- bookkeeping ---------------------------------------------------
+    def _decay(self, n_updates: int = 1) -> None:
+        hl = max(1, self.cfg.reward.usage_half_life_updates)
+        self.scale *= 0.5 ** (n_updates / hl)
+        if self.scale < 1e-6:
+            self._renormalise()
+
+    def _renormalise(self) -> None:
+        s = self.scale
+        forms: dict[int, dict[tuple, dict[tuple, float]]] = {}
+        totals: dict[int, dict[tuple, float]] = {}
+        for a, per in self.forms.items():
+            for key, d in per.items():
+                kept = {u: c * s for u, c in d.items() if c * s > 1e-3}
+                if kept:
+                    forms.setdefault(a, {})[key] = kept
+                    totals.setdefault(a, {})[key] = self.total[a][key] * s
+        self.forms, self.total = forms, totals
+        self.scale = 1.0
+
+    def _has_atom(self, u: Sequence[int]) -> bool:
+        A = self.cfg.channel.atomic_vocab
+        return any(x < A for x in u)
+
+    def support(self, agent: int, key: tuple) -> float:
+        return self.total.get(agent, {}).get(key, 0.0) * self.scale
+
+    def modal(self, agent: int, key: tuple) -> Optional[tuple[int, ...]]:
+        d = self.forms.get(agent, {}).get(key)
+        if not d:
+            return None
+        live = [(c, u) for u, c in d.items() if self._has_atom(u)]
+        return max(live)[1] if live else None
+
+    def names(self, agent: int) -> dict[tuple, tuple[int, ...]]:
+        """This speaker's established names: meaning -> the form it uses for it."""
+        need = self.cfg.reward.lexicon_min_support
+        out = {}
+        for key in self.forms.get(agent, {}):
+            if self.support(agent, key) >= need:
+                m = self.modal(agent, key)
+                if m:
+                    out[key] = m
+        return out
+
+    def distributions(self, agent: int) -> dict[tuple, list[tuple[tuple[int, ...], float]]]:
+        """Per established meaning: its top recent forms and their conditional weights."""
+        need = self.cfg.reward.lexicon_min_support
+        top = max(1, int(self.cfg.reward.lexicon_top_forms))
+        out = {}
+        for key, d in self.forms.get(agent, {}).items():
+            if self.support(agent, key) < need:
+                continue
+            live = sorted(((c, u) for u, c in d.items() if self._has_atom(u)), reverse=True)[:top]
+            tot = sum(c for c, _ in live)
+            if tot > 0:
+                out[key] = [(u, c / tot) for c, u in live]
+        return out
+
+    # ---- what a round is about ------------------------------------------
+    def keys(self, phase, role: int, obs: torch.Tensor) -> list:
+        """(field, value) per episode where one field is asked about; None otherwise."""
+        return naming_keys(self.cfg, phase, role, obs)
+
+    # ---- the term --------------------------------------------------------
+    def terms(self, agents: Sequence[int], keys: Sequence, firsts: Sequence[tuple]
+              ) -> tuple[list[float], list[bool]]:
+        """Per episode: the lexicon bonus, and whether the utterance *was* the
+        speaker's established name for the meaning (the ostensive gate).
+
+        own      expected similarity of the utterance to my recent forms for this
+                 meaning (its top forms, weighted by recent use);
+        closest  the same against the closest *other* meaning I have named: the
+                 mutual-exclusivity charge.
+        bonus = reward.lexicon x (own - closest).
+
+        A speaker saying one thing for everything scores own = closest and earns
+        nothing; a form that has co-occurred more with this meaning than with
+        any other earns when said for it, which is what pulls names apart; a
+        settled, distinct name earns the full amount every time it is used.
+
+        ``used`` is true where the utterance is the speaker's modal form for the
+        meaning and that form is not also its modal form for another meaning --
+        the utterance was, by the speaker's own usage, a word -- and it gates
+        the ostensive lesson (`gesture.ostensive_coef`).
+        """
+        coef = float(self.cfg.reward.lexicon)
+        B = len(firsts)
+        bonus = [0.0] * B
+        used = [False] * B
+        if coef <= 0:
+            return bonus, used
+        dist_cache: dict[int, dict] = {}
+        name_cache: dict[int, dict] = {}
+        shared_cache: dict[int, set] = {}
+        sim_cache: dict[tuple, float] = {}
+        exp_cache: dict[tuple, float] = {}
+
+        def sim(a, b):
+            k = (a, b)
+            v = sim_cache.get(k)
+            if v is None:
+                v = sim_cache[k] = similarity(a, b)
+            return v
+
+        def expected(a, key, u):
+            k = (a, key, u)
+            v = exp_cache.get(k)
+            if v is None:
+                v = exp_cache[k] = sum(w * sim(u, f) for f, w in dist_cache[a][key])
+            return v
+        for i, (a, key, u) in enumerate(zip(agents, keys, firsts)):
+            if key is None or not u or not self._has_atom(u):
+                continue
+            u = tuple(u)
+            if a not in dist_cache:
+                dist_cache[a] = self.distributions(a)
+                nm = name_cache[a] = self.names(a)
+                seen: dict[tuple, int] = {}
+                for f in nm.values():
+                    seen[f] = seen.get(f, 0) + 1
+                shared_cache[a] = {f for f, n in seen.items() if n > 1}
+            dists = dist_cache[a]
+            own = expected(a, key, u) if key in dists else 0.0
+            closest = max((expected(a, k, u) for k in dists if k != key), default=0.0)
+            bonus[i] = coef * (own - closest)
+            mine = name_cache[a].get(key)
+            used[i] = mine is not None and mine not in shared_cache[a] and u == mine
+        return bonus, used
+
+    def observe(self, agents: Sequence[int], keys: Sequence, firsts: Sequence[tuple]
+                ) -> None:
+        inc = 1.0 / self.scale
+        for a, key, u in zip(agents, keys, firsts):
+            if key is None or not u:
+                continue
+            per = self.forms.setdefault(a, {})
+            d = per.setdefault(key, {})
+            d[tuple(u)] = d.get(tuple(u), 0.0) + inc
+            t = self.total.setdefault(a, {})
+            t[key] = t.get(key, 0.0) + inc
+
+    # ---- reporting -------------------------------------------------------
+    def summary(self) -> dict[str, Any]:
+        """Per speaker: how many meanings it has a name for, how many distinct
+        names those are, and how many meanings share a name with another."""
+        out: dict[str, Any] = {}
+        for a in sorted(self.forms):
+            nm = self.names(a)
+            forms = list(nm.values())
+            distinct = len(set(forms))
+            out[str(a)] = {"meanings_named": len(nm), "distinct_names": distinct,
+                           "shared_names": len(nm) - distinct,
+                           "names": {"%s=%d" % (("fruit", "colour", "quality", "quantity",
+                                                  "price")[k[0]], k[1]):
+                                     "-".join(str(x) for x in f) for k, f in sorted(nm.items())}}
+        return out
+
+    def state(self) -> dict[str, Any]:
+        return {"scale": self.scale,
+                "forms": {a: {k: dict(d) for k, d in per.items()} for a, per in self.forms.items()},
+                "total": {a: dict(t) for a, t in self.total.items()}}
+
+    def load_state(self, st: dict[str, Any]) -> None:
+        self.scale = float(st.get("scale", 1.0))
+        self.forms = {int(a): {tuple(k): dict(d) for k, d in per.items()}
+                      for a, per in (st.get("forms") or {}).items()}
+        self.total = {int(a): {tuple(k): float(v) for k, v in t.items()}
+                      for a, t in (st.get("total") or {}).items()}
+
+
 class PopulationUsage:
     """Decayed counts of recent words, and of recent utterances per meaning.
 
@@ -148,6 +446,9 @@ class PopulationUsage:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.scale = 1.0
+        # each speaker's own names for the things it has named -- the innate
+        # one-name-per-meaning prior, on from the first round
+        self.lexicon = SpeakerLexicon(cfg)
         self.words: dict[tuple[int, ...], float] = defaultdict(float)
         self.word_total = 0.0
         self.forms: dict[tuple, dict[tuple[int, ...], float]] = defaultdict(
@@ -257,13 +558,21 @@ class PopulationUsage:
 
     def speaker_terms(self, phase, tokens: torch.Tensor,
                       obs_of: dict[int, torch.Tensor], *, rarity: bool = True,
-                      convention: bool = True) -> dict[int, dict[str, torch.Tensor]]:
+                      convention: bool = True,
+                      agent_ids: "dict[int, Sequence[int]] | None" = None
+                      ) -> dict[int, dict[str, torch.Tensor]]:
         """Per role: coining cost and convention bonus for each episode, (B,) each.
 
         ``rarity`` / ``convention`` False skip a term whose weight is currently
         zero (the cost gate), which early on -- when every utterance is new --
         is most of the work. Also returns the parsed batch so :meth:`observe`
         does not parse it twice.
+
+        With ``agent_ids`` (per role, the speaking agent of each episode) the
+        speaker's own lexicon term is computed too (:class:`SpeakerLexicon`):
+        ``"lexicon"`` (B,) and ``"word_used"`` (B,) bool, the latter marking
+        the episodes in which the utterance was the speaker's established name
+        for what it was asked about.
         """
         R = self.cfg.reward
         B = tokens.shape[0]
@@ -338,18 +647,32 @@ class PopulationUsage:
                     # The *closest* other convention, not the average one.
                     base = max((v for ko, v in base_cache[u] if ko != k), default=0.0)
                     conv[i] = R.convention * (sim(u, m) - base)
+            lex = [0.0] * B
+            used = [False] * B
+            lkeys: list = [None] * B
+            ids: list = []
+            if agent_ids is not None and role in agent_ids and R.lexicon > 0:
+                ids = [int(x) for x in agent_ids[role]]
+                lkeys = self.lexicon.keys(phase, role, obs_of[role])
+                lex, used = self.lexicon.terms(ids, lkeys, firsts)
             out[role] = {
                 "rarity": torch.tensor(rarity, device=dev),
                 "convention": torch.tensor(conv, device=dev),
+                "lexicon": torch.tensor(lex, device=dev),
+                "word_used": torch.tensor(used, dtype=torch.bool, device=dev),
                 "_firsts": firsts, "_words": words, "_keys": keys,
+                "_lexicon_keys": lkeys, "_agents": ids,
             }
         return out
 
     def observe(self, terms: dict[int, dict[str, Any]], n_episodes: int) -> None:
         """Fold a batch that was just played -- one training update -- into recent usage."""
         self._decay(1)
+        self.lexicon._decay(1)
         inc = 1.0 / self.scale
         for role, d in terms.items():
+            if d.get("_agents"):
+                self.lexicon.observe(d["_agents"], d["_lexicon_keys"], d["_firsts"])
             for ws in d["_words"]:
                 for w in ws:
                     self.words[w] += inc

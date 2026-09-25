@@ -946,6 +946,20 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
           "gate are telling you the gesture is cheaper than the word for them."
           % cfg.gesture.cost)
         A("")
+        lex = final.get("speaker_lexicons") or {}
+        if lex:
+            A("Each speaker's own lexicon at the end -- the innate one-name-per-meaning "
+              "prior (`reward.lexicon`, %.2f): how many single-field meanings it has an "
+              "established name for, and how many distinct names those are. Distinct "
+              "below named means two meanings share a name, which the prior charges for."
+              % cfg.reward.lexicon)
+            A("")
+            A("| speaker | meanings named | distinct names | shared |")
+            A("|---|---|---|---|")
+            for k, v in lex.items():
+                A("| agent %s | %d | %d | %d |" % (k, v["meanings_named"], v["distinct_names"],
+                                                    v["shared_names"]))
+            A("")
         A("The listener innately reads a description into five attributes -- what "
           "fruit, what colour, what quality, how many, what price -- and matches "
           "lineup candidates attribute by attribute (`model.factored_choice`, %s). "

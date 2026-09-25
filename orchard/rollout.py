@@ -440,3 +440,11 @@ class UpdateStats:
     gesture_available: float = 0.0
     gesture_used: float = 0.0
     gesture_fields: list = field(default_factory=list)
+    # the innate lexicon (`reward.lexicon`): mean bonus per episode, and the
+    # share of turns in which the speaker said its established name
+    lexicon_bonus: float = 0.0
+    words_used: float = 0.0
+    # positive signalling (`reward.lexicon_mi`): I(meaning; first spoken symbol)
+    # under the speakers' own policies (nats) plus the mean pairwise separation
+    # of the meanings' distributions (0..1), averaged over speaking roles
+    naming_signal: float = 0.0

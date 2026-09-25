@@ -208,4 +208,9 @@ def build_vocab_panels(history) -> list[dict[str, Any]]:
                       getattr(h, "gesture_share", [])),
                     S("share of possible turns it was used in",
                       getattr(h, "gesture_used", []))]},
+        {"title": "The innate lexicon (training only)",
+         "series": [S("naming signal (information + separation)",
+                      getattr(h, "naming_signal", [])),
+                    S("share of turns that were the speaker's established name",
+                      getattr(h, "words_used", []))]},
     ]
