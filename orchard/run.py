@@ -345,7 +345,7 @@ def holdout_report(cfg: Config, path: str) -> int:
         n_topsim=cfg.log.topsim_samples, n_semantics=cfg.log.topsim_samples,
         chance=trainer.chance_for(phase), device=cfg.train.device,
         rng=_random.Random(0), holdout_sampler_for=trainer.holdout_sampler,
-        holdout_floor_for=trainer.holdout_floor)
+        holdout_floor_for=trainer.holdout_floor, seen_sampler_for=trainer.seen_sampler)
     acc, base = ev.get("holdout_field_acc"), ev.get("seen_field_acc")
     names = list(ev.get("holdout_field_names") or COMBO_FIELDS)
     floors = (ev.get("holdout_field_floors") or [], ev.get("seen_field_floors") or [])

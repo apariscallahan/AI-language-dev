@@ -295,7 +295,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             net = pool[a_i].net
             h = net.encode(obs[ep], soft[ep], schema=schema_of[role],
                            self_mask=mask_of[role])[:, -1]
-            heads = net.all_heads(h, obs[ep])
+            # the innate reader's reading of the other party's words, through
+            # the same soft one-hots, so it too carries a gradient to the speaker
+            lex = net.read_words(soft[ep], tokens[ep], mask_of[role])
+            heads = net.all_heads(h, obs[ep], lex=lex)
             val = val.index_copy(0, ep, net.value_head(h).squeeze(-1))
             lps = torch.zeros(ep.shape[0], device=device)
             ents = torch.zeros(ep.shape[0], device=device)
@@ -414,11 +417,12 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             d["rarity"] = g * d["rarity"]
             if cfg.reward.convention_gated:
                 d["convention"] = cg * d["convention"]
-            extra = d["convention"] + d["lexicon"] - d["rarity"]
+            extra = d["convention"] + d["lexicon"] + d["compose"] - d["rarity"]
             shape[role] = shape[role] - d["rarity"]
-            # both are pressures to *agree* -- with the community, and with
-            # oneself -- and reach the words by the same route
-            agree[role] = d["convention"] + d["lexicon"]
+            # all three are pressures to *agree* -- with the community, with
+            # oneself, and with one's own words when describing a whole thing --
+            # and reach the words by the same route
+            agree[role] = d["convention"] + d["lexicon"] + d["compose"]
             if role == FARMER:
                 f_rew = f_rew + extra
             else:
@@ -430,6 +434,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 res[label + "_rarity_cost"] = d["rarity"] if d else zero
                 res[label + "_convention"] = d["convention"] if d else zero
                 res[label + "_lexicon"] = d["lexicon"] if d else zero
+                res[label + "_compose"] = d["compose"] if d else zero
             res["farmer_reward"], res["buyer_reward"] = f_rew, b_rew
         if train:
             usage.observe(terms, B)
@@ -532,6 +537,7 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             if not bool(lesson.any()):
                 continue
             words_only = without_gestures(cfg, tokens, soft, turn_starts[other])
+            words_ids = without_gestures(cfg, tokens, tokens, turn_starts[other])
             pool, obs = pool_of[role], obs_of[role]
             for a_i, ep in groups_of[role]:
                 sel = ep[lesson[ep]]
@@ -540,7 +546,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 net = pool[a_i].net
                 h = net.encode(obs[sel], words_only[sel], schema=schema_of[role],
                                self_mask=mask_of[role])[:, -1]
-                heads = net.report_logits(h)
+                heads = net.report_logits(h, net.read_words(
+                    words_only[sel], words_ids[sel], mask_of[role]))
                 for j in range(N_LOT_FIELDS):
                     rows = field[sel] == j
                     if not bool(rows.any()):
@@ -602,6 +609,20 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         stats.lexicon_bonus = float(sum(float(d["lexicon"].sum()) for d in terms.values())) / B
         used_n = sum(int(d["word_used"].sum()) for d in terms.values())
         stats.words_used = used_n / float(B * max(1, len(terms)))
+        # describing a whole lot (`reward.compose`): how many of the lot's
+        # fields the speaker named with its own word, and how consistent the
+        # order was -- the numbers that showed `name-all` failing
+        cs = [d["_compose_stats"] for d in terms.values() if d.get("_compose_stats")]
+        n_desc = sum(s["descriptions"] for s in cs)
+        if n_desc:
+            stats.descriptions = n_desc
+            stats.compose_bonus = sum(s["bonus_sum"] for s in cs) / n_desc
+            stats.names_reused = (sum(s["fields_reused"] for s in cs)
+                                  / float(n_desc * N_LOT_FIELDS))
+            n_pairs = sum(s["order_pairs"] for s in cs)
+            stats.order_pairs = n_pairs
+            stats.order_agreement = (sum(s["order_agreed"] for s in cs) / n_pairs
+                                     if n_pairs else 0.0)
     if gest_on:
         n_turns = sum(len(v) for v in turn_starts.values())
         allowed_turns = float(avail.sum()) * n_turns

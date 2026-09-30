@@ -946,26 +946,75 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
           "gate are telling you the gesture is cheaper than the word for them."
           % cfg.gesture.cost)
         A("")
-        lex = final.get("speaker_lexicons") or {}
-        if lex:
-            A("Each speaker's own lexicon at the end -- the innate one-name-per-meaning "
-              "prior (`reward.lexicon`, %.2f): how many single-field meanings it has an "
-              "established name for, and how many distinct names those are. Distinct "
-              "below named means two meanings share a name, which the prior charges for."
-              % cfg.reward.lexicon)
-            A("")
-            A("| speaker | meanings named | distinct names | shared |")
-            A("|---|---|---|---|")
-            for k, v in lex.items():
-                A("| agent %s | %d | %d | %d |" % (k, v["meanings_named"], v["distinct_names"],
-                                                    v["shared_names"]))
-            A("")
-        A("The listener innately reads a description into five attributes -- what "
-          "fruit, what colour, what quality, how many, what price -- and matches "
-          "lineup candidates attribute by attribute (`model.factored_choice`, %s). "
-          "That is the preconception of word classes the agents were given: that "
-          "there are kinds of thing to name, never which words name them."
-          % ("on" if cfg.model.factored_choice else "off"))
+
+    A("## 3h. The language faculty: what was innate, and what emerged")
+    A("")
+    A("The agents were born with a language faculty and no language. What was "
+      "innate is the architecture of words and the kinds of thing they name; which "
+      "atoms make which word, which word names what, and in what order words are "
+      "said were all left to the agents.")
+    A("")
+    m, r = cfg.model, cfg.reward
+    A("| innate | setting | what it gives |")
+    A("|---|---|---|")
+    A("| words name one thing each, in every field | `reward.lexicon` %.2f | a speaker is "
+      "paid for its own word for what it was asked about, said once and in at most %d "
+      "atoms, and charged for resembling its word for anything else |"
+      % (r.lexicon, r.lexicon_name_atoms))
+    A("| describing a thing names its parts | `reward.compose` %.2f | a whole lot is "
+      "described with the speaker's own words for its fields |" % r.compose)
+    A("| phrases have a consistent order | `reward.word_order` %.2f | each pair of "
+      "fields is paid for coming in the speaker's usual order; which order is learned |"
+      % r.word_order)
+    A("| words are read one at a time, as nouns, adjectives or numerals | "
+      "`model.lexical_reader` %s | a listener understands a combination of words "
+      "it learned separately |" % ("on" if m.lexical_reader else "off"))
+    A("| a fruit is an object, colour and quality properties, numbers magnitudes | "
+      "`model.innate_concepts` %s | concepts sorted into kinds, magnitudes on a "
+      "number line |" % ("on" if m.innate_concepts else "off"))
+    A("| attributes are matched one by one | `model.factored_choice` %s | the lineup "
+      "choice is read through the five belief heads |"
+      % ("on" if m.factored_choice else "off"))
+    A("")
+    lex = final.get("speaker_lexicons") or {}
+    if lex:
+        A("Each speaker's words at the end, by the class of meaning they name -- "
+          "nouns for the fruit, adjectives for colour and quality, numerals for "
+          "quantity and price -- and the order its descriptions put the fields in. "
+          "*Distinct* below *named* means two meanings share a word, which the "
+          "innate lexicon charges for.")
+        A("")
+        A("| speaker | named | distinct | nouns (fruit) | adjectives (colour; quality) "
+          "| numerals (quantity; price) | usual order |")
+        A("|---|---|---|---|---|---|---|")
+        for k, v in lex.items():
+            names = v.get("names") or {}
+
+            def words_of(field):
+                got = sorted(((int(key.split("=")[1]), w) for key, w in names.items()
+                              if key.split("=")[0] == field))
+                return " ".join("%d:`%s`" % (val, w) for val, w in got) or "-"
+            A("| agent %s | %d | %d | %s | %s; %s | %s; %s | %s |" % (
+                k, v["meanings_named"], v["distinct_names"], words_of("fruit"),
+                words_of("colour"), words_of("quality"), words_of("quantity"),
+                words_of("price"), " < ".join(v.get("order") or []) or "-"))
+        A("")
+    nm = final.get("naming") or {}
+    nr = nm.get("names_reused_recent", float("nan"))
+    if nr == nr:
+        oa = nm.get("order_agreement_recent", float("nan"))
+        A("In training, a describer asked for a whole lot named **%.0f%%** of its fields "
+          "with its own established word%s. This is the number that showed `name-all` "
+          "failing on the 2026-09-29 run, before descriptions were composed from "
+          "names: a speaker's own colour word appeared in 0 of its 760 late whole-lot "
+          "descriptions." % (100 * nr, (", and put %.0f%% of named field pairs in its "
+                                        "usual order" % (100 * oa)) if oa == oa else ""))
+        A("")
+    comm = (final.get("usage") or {}).get("community_lexicon")
+    if comm:
+        A("The community's words -- every speaker's, pooled, which the convention bonus "
+          "agrees with in the naming rungs (`reward.convention_words`): %d meanings "
+          "named with %d distinct words." % (comm["meanings_named"], comm["distinct_names"]))
         A("")
 
     A("## 4. Example transcripts across the run")

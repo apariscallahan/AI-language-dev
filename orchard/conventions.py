@@ -76,8 +76,13 @@ from typing import Any, Optional, Sequence
 import torch
 
 from .config import Config
-from .env import BUYER, FARMER, parse_words
-from .world import K_EMPTY, K_FIELD, N_LOT_FIELDS
+from .env import BUYER, FARMER, parse_words, word_text
+from .world import K_EMPTY, K_FIELD, LOT_FIELDS, LOT_KINDS, N_LOT_FIELDS, QUERY_ALL
+
+# The pseudo-speaker whose lexicon is the whole community's usage: every
+# speaker's words, pooled. It is what the convention bonus agrees with in the
+# naming rungs (`reward.convention_words`).
+POPULATION = -1
 
 
 def _edit(a: Sequence[int], b: Sequence[int]) -> int:
@@ -157,6 +162,27 @@ def naming_keys(cfg: Config, phase, role: int, obs: torch.Tensor) -> list:
     return out
 
 
+def lot_keys(cfg: Config, phase, role: int, obs: torch.Tensor) -> list:
+    """The whole lot per episode where a speaker is asked to describe all of it.
+
+    The describer's layout -- a lot's five fields, then what was asked -- with
+    "all of it" in the query slot: `name-all`'s open rounds, each side's lot in
+    `mutual`, and a buyer's request in the trading world (whose query slot
+    always says "all of it"). None everywhere else: a round asking about one
+    field (:func:`naming_keys` has that), the lineup's guesser, a barn.
+    """
+    from .curriculum import phase_schema
+    B = obs.shape[0]
+    schema = phase_schema(cfg, role, phase)
+    n = N_LOT_FIELDS
+    if (len(schema) <= n or tuple(schema[:n]) != tuple(LOT_KINDS)
+            or schema[n] != K_FIELD):
+        return [None] * B
+    rows = obs[:, :n + 1].tolist()
+    return [tuple(int(x) for x in r[:n]) if int(r[n]) == QUERY_ALL else None
+            for r in rows]
+
+
 def naming_mutual_information(lp: torch.Tensor, have: torch.Tensor, keys: Sequence
                               ) -> Optional[torch.Tensor]:
     """I(value; first spoken symbol) *within the asked-about field*, under the
@@ -227,43 +253,66 @@ def _naming_objective(lp: torch.Tensor, values: Sequence, rows: Sequence[int]
 
 
 class SpeakerLexicon:
-    """Each speaker's own names for the meanings it has been asked to name.
+    """Each speaker's own words for the meanings it has been asked to name.
 
     The innate assumption behind it -- the one a child brings to a new word --
-    is that a name is *for* one meaning and a meaning *has* one name. Nothing
+    is that a word is *for* one meaning and a meaning *has* one word. Nothing
     here says which sounds name which things; it says that whatever a speaker
     has been calling a thing is what it should go on calling it, and that a
-    name it already uses for something else is not this thing's name. The
+    word it already uses for something else is not this thing's word. The
     population-level convention bonus (:class:`PopulationUsage`) asks the same
-    of a community and waits for `name-all`; this is per speaker and on from
-    the first round, because it is a fact about speakers, not about
-    communities: a speaker that has not settled its own names has nothing to
-    agree with anyone about.
+    of a community; this is per speaker and on from the first round, because it
+    is a fact about speakers, not about communities: a speaker that has not
+    settled its own words has nothing to agree with anyone about.
 
     Why it matters for learning: the only other pressure on the words in the
     naming rungs is the gradient through the listener, and a listener whose
     reading of the channel is still random gives that gradient no consistent
     direction. This term does not go through the listener at all. A speaker
     that says a random thing each round earns nothing; one that repeats its
-    own established name earns `reward.lexicon`; one whose name for this
-    meaning is also its name for another is charged for the resemblance. So the
-    speaker settles on distinct, consistent names on its own, and the listener
+    own established word earns `reward.lexicon`; one whose word for this
+    meaning is also its word for another is charged for the resemblance. So the
+    speaker settles on distinct, consistent words on its own, and the listener
     is left with a stationary code to learn -- which it can, quickly, from the
     gestured rounds (:attr:`orchard.config.GestureConfig.ostensive_coef`).
+
+    **The unit is the word** -- atoms joined by hyphens -- not the utterance.
+    In a round asking about one field the speaker's word for the value is the
+    first word it says, and it is paid for saying it once. Judged on whole
+    utterances, one speaker named banana `a16` and red `a16 a16 a16 ...` twelve
+    times over, which edit distance on the utterance read as two different
+    forms; judged on words they are one word naming two things, which is what
+    mutual exclusivity forbids -- across fields as well as within them, since a
+    description that has to name the fruit and the colour at once cannot use
+    the same word for both.
 
     A meaning is the value of the field a round asks about -- (fruit, APPLE),
     (quantity, 3) -- so the prior applies wherever a single thing is being
     named: the query rounds of every naming rung, including the rehearsed
-    ones. A round that asks for a whole lot has no single meaning to name and
-    is left to the convention bonus.
+    ones. A round that asks for a whole lot is scored by
+    :meth:`compose_terms` instead: describing a thing means saying the words
+    one has for its parts.
+
+    One class serves two lexicons: each speaker's own (``reward.lexicon``),
+    and the community's (:data:`POPULATION`, ``reward.convention``), which is
+    every speaker's words pooled under one pseudo-speaker.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, coef: Optional[float] = None,
+                 min_support: Optional[int] = None):
         self.cfg = cfg
+        R = cfg.reward
+        self.coef = float(R.lexicon if coef is None else coef)
+        self.min_support = int(R.lexicon_min_support if min_support is None else min_support)
+        self.name_atoms = max(1, int(R.lexicon_name_atoms))
         self.scale = 1.0
-        # agent id -> meaning key -> utterance -> decayed count
+        # agent id -> meaning key -> word -> decayed count
         self.forms: dict[int, dict[tuple, dict[tuple, float]]] = {}
         self.total: dict[int, dict[tuple, float]] = {}
+        # agent id -> (f, g) -> decayed count of descriptions naming field f
+        # before field g: the speaker's word order, pair by pair
+        self.orders: dict[int, dict[tuple, float]] = {}
+        self._parsed: dict[tuple, list] = {}
 
     # ---- bookkeeping ---------------------------------------------------
     def _decay(self, n_updates: int = 1) -> None:
@@ -282,12 +331,21 @@ class SpeakerLexicon:
                 if kept:
                     forms.setdefault(a, {})[key] = kept
                     totals.setdefault(a, {})[key] = self.total[a][key] * s
+        orders = {a: {p: c * s for p, c in d.items() if c * s > 1e-3}
+                  for a, d in self.orders.items()}
         self.forms, self.total = forms, totals
+        self.orders = {a: d for a, d in orders.items() if d}
         self.scale = 1.0
 
-    def _has_atom(self, u: Sequence[int]) -> bool:
-        A = self.cfg.channel.atomic_vocab
-        return any(x < A for x in u)
+    def words(self, utterance: Sequence[int]) -> list[tuple[int, ...]]:
+        """The words of an utterance (a first turn's symbols), parsed once."""
+        u = tuple(utterance)
+        hit = self._parsed.get(u)
+        if hit is None:
+            if len(self._parsed) > 50_000:
+                self._parsed.clear()
+            hit = self._parsed[u] = parse_words(self.cfg, list(u))
+        return hit
 
     def support(self, agent: int, key: tuple) -> float:
         return self.total.get(agent, {}).get(key, 0.0) * self.scale
@@ -296,62 +354,74 @@ class SpeakerLexicon:
         d = self.forms.get(agent, {}).get(key)
         if not d:
             return None
-        live = [(c, u) for u, c in d.items() if self._has_atom(u)]
-        return max(live)[1] if live else None
+        return max((c, u) for u, c in d.items())[1]
 
     def names(self, agent: int) -> dict[tuple, tuple[int, ...]]:
-        """This speaker's established names: meaning -> the form it uses for it."""
-        need = self.cfg.reward.lexicon_min_support
+        """This speaker's established words: meaning -> the word it uses for it."""
         out = {}
         for key in self.forms.get(agent, {}):
-            if self.support(agent, key) >= need:
+            if self.support(agent, key) >= self.min_support:
                 m = self.modal(agent, key)
                 if m:
                     out[key] = m
         return out
 
+    def shared(self, agent: int, names: Optional[dict] = None) -> set:
+        """Words this speaker uses as the name of more than one meaning."""
+        seen: dict[tuple, int] = {}
+        for f in (self.names(agent) if names is None else names).values():
+            seen[f] = seen.get(f, 0) + 1
+        return {f for f, n in seen.items() if n > 1}
+
     def distributions(self, agent: int) -> dict[tuple, list[tuple[tuple[int, ...], float]]]:
-        """Per established meaning: its top recent forms and their conditional weights."""
-        need = self.cfg.reward.lexicon_min_support
+        """Per established meaning: its top recent words and their conditional weights."""
         top = max(1, int(self.cfg.reward.lexicon_top_forms))
         out = {}
         for key, d in self.forms.get(agent, {}).items():
-            if self.support(agent, key) < need:
+            if self.support(agent, key) < self.min_support:
                 continue
-            live = sorted(((c, u) for u, c in d.items() if self._has_atom(u)), reverse=True)[:top]
+            live = sorted(((c, u) for u, c in d.items()), reverse=True)[:top]
             tot = sum(c for c, _ in live)
             if tot > 0:
                 out[key] = [(u, c / tot) for c, u in live]
         return out
+
+    def order_count(self, agent: int, f: int, g: int) -> float:
+        """Recent descriptions by this speaker that named field ``f`` before ``g``."""
+        return self.orders.get(agent, {}).get((f, g), 0.0) * self.scale
 
     # ---- what a round is about ------------------------------------------
     def keys(self, phase, role: int, obs: torch.Tensor) -> list:
         """(field, value) per episode where one field is asked about; None otherwise."""
         return naming_keys(self.cfg, phase, role, obs)
 
-    # ---- the term --------------------------------------------------------
+    # ---- naming one thing ------------------------------------------------
     def terms(self, agents: Sequence[int], keys: Sequence, firsts: Sequence[tuple]
               ) -> tuple[list[float], list[bool]]:
-        """Per episode: the lexicon bonus, and whether the utterance *was* the
-        speaker's established name for the meaning (the ostensive gate).
+        """Per episode: the lexicon bonus, and whether the utterance's word *was*
+        the speaker's established name for the meaning (the ostensive gate).
 
-        own      expected similarity of the utterance to my recent forms for this
-                 meaning (its top forms, weighted by recent use);
-        closest  the same against the closest *other* meaning I have named: the
-                 mutual-exclusivity charge.
-        bonus = reward.lexicon x (own - closest).
+        own      expected similarity of the first word to my recent words for this
+                 meaning (its top words, weighted by recent use);
+        closest  the same against the closest *other* meaning I have named, in
+                 any field: the mutual-exclusivity charge.
+        bonus = coef x (own - closest), divided -- when it is positive -- by the
+                number of words said and by the word's atoms beyond
+                `reward.lexicon_name_atoms`: a name is said once, and is short.
+                (Charged in full when it is negative, so saying more never
+                softens a wrong word.)
 
-        A speaker saying one thing for everything scores own = closest and earns
-        nothing; a form that has co-occurred more with this meaning than with
+        A speaker saying one word for everything scores own = closest and earns
+        nothing; a word that has co-occurred more with this meaning than with
         any other earns when said for it, which is what pulls names apart; a
-        settled, distinct name earns the full amount every time it is used.
+        settled, distinct name said alone earns the full amount every time.
 
-        ``used`` is true where the utterance is the speaker's modal form for the
-        meaning and that form is not also its modal form for another meaning --
-        the utterance was, by the speaker's own usage, a word -- and it gates
+        ``used`` is true where the first word is the speaker's modal word for
+        the meaning and that word is not also its word for another meaning --
+        the utterance was, by the speaker's own usage, a name -- and it gates
         the ostensive lesson (`gesture.ostensive_coef`).
         """
-        coef = float(self.cfg.reward.lexicon)
+        coef = self.coef
         B = len(firsts)
         bonus = [0.0] * B
         used = [False] * B
@@ -360,80 +430,235 @@ class SpeakerLexicon:
         dist_cache: dict[int, dict] = {}
         name_cache: dict[int, dict] = {}
         shared_cache: dict[int, set] = {}
-        sim_cache: dict[tuple, float] = {}
         exp_cache: dict[tuple, float] = {}
 
-        def sim(a, b):
-            k = (a, b)
-            v = sim_cache.get(k)
-            if v is None:
-                v = sim_cache[k] = similarity(a, b)
-            return v
-
-        def expected(a, key, u):
-            k = (a, key, u)
+        def expected(a, key, w):
+            k = (a, key, w)
             v = exp_cache.get(k)
             if v is None:
-                v = exp_cache[k] = sum(w * sim(u, f) for f, w in dist_cache[a][key])
+                v = exp_cache[k] = sum(p * _word_similarity(w, n)
+                                       for n, p in dist_cache[a][key])
             return v
         for i, (a, key, u) in enumerate(zip(agents, keys, firsts)):
-            if key is None or not u or not self._has_atom(u):
+            if key is None or not u:
                 continue
-            u = tuple(u)
+            ws = self.words(u)
+            if not ws:
+                continue
+            w0 = ws[0]
             if a not in dist_cache:
                 dist_cache[a] = self.distributions(a)
-                nm = name_cache[a] = self.names(a)
-                seen: dict[tuple, int] = {}
-                for f in nm.values():
-                    seen[f] = seen.get(f, 0) + 1
-                shared_cache[a] = {f for f, n in seen.items() if n > 1}
+                name_cache[a] = self.names(a)
+                shared_cache[a] = self.shared(a, name_cache[a])
             dists = dist_cache[a]
-            own = expected(a, key, u) if key in dists else 0.0
-            closest = max((expected(a, k, u) for k in dists if k != key), default=0.0)
-            bonus[i] = coef * (own - closest)
+            own = expected(a, key, w0) if key in dists else 0.0
+            closest = max((expected(a, k, w0) for k in dists if k != key), default=0.0)
+            d = own - closest
+            if d > 0:
+                d = d / len(ws) / max(1.0, len(w0) / self.name_atoms)
+            bonus[i] = coef * d
             mine = name_cache[a].get(key)
-            used[i] = mine is not None and mine not in shared_cache[a] and u == mine
+            used[i] = mine is not None and mine not in shared_cache[a] and w0 == mine
         return bonus, used
 
     def observe(self, agents: Sequence[int], keys: Sequence, firsts: Sequence[tuple]
                 ) -> None:
+        """Record the word each speaker used for each single meaning it named."""
         inc = 1.0 / self.scale
         for a, key, u in zip(agents, keys, firsts):
             if key is None or not u:
                 continue
+            ws = self.words(u)
+            if not ws:
+                continue
             per = self.forms.setdefault(a, {})
             d = per.setdefault(key, {})
-            d[tuple(u)] = d.get(tuple(u), 0.0) + inc
+            d[ws[0]] = d.get(ws[0], 0.0) + inc
             t = self.total.setdefault(a, {})
             t[key] = t.get(key, 0.0) + inc
 
+    # ---- describing a whole thing -----------------------------------------
+    def compose_terms(self, agents: Sequence[int], lots: Sequence, firsts: Sequence[tuple],
+                      coef: Optional[float] = None, order_coef: float = 0.0
+                      ) -> dict[str, Any]:
+        """Per episode where a whole lot is described: say your words for its parts.
+
+        For each field f of the lot, with true value v:
+
+            own_f    how closely the utterance's best-matching word resembles the
+                     speaker's word for (f, v)            -- the right word said
+            rival_f  the same for the speaker's word for any *other* value of f
+                                                          -- a wrong word said
+            score    = mean over the five fields of (own_f - rival_f)
+            bonus    = coef x score
+
+        A field the speaker has no word for yet scores 0, so the term grows
+        with the lexicon: one field named earns a fifth of it, all five earn
+        it whole. Words that name nothing cost nothing here (the length costs
+        price them from `mutual` on).
+
+        ``order_coef`` (``reward.word_order``): each word that closely matches
+        one of the speaker's words (0.5 similarity or more) stands for that
+        word's field, giving the sequence of fields in the order first named.
+        Every pair of fields in it earns ``order_coef`` x (the speaker's recent
+        share of saying them in this order - 1/2), averaged over the pairs, once
+        the pair has ``min_support`` recent descriptions behind it.
+
+        Returns ``bonus`` and ``order`` (lists of B floats), ``seqs`` (the field
+        sequence per episode, for :meth:`observe_orders`), and ``stats``:
+        descriptions scored, the bonus summed, fields named with the speaker's
+        exact word, and order pairs seen / said in their usual order.
+        """
+        import numpy as np
+        coef = self.coef if coef is None else float(coef)
+        B = len(firsts)
+        bonus = [0.0] * B
+        order = [0.0] * B
+        seqs: list = [None] * B
+        stats = {"descriptions": 0, "bonus_sum": 0.0, "fields_reused": 0,
+                 "order_pairs": 0, "order_agreed": 0}
+        by_agent: dict[int, list[int]] = {}
+        for i, (a, lot, u) in enumerate(zip(agents, lots, firsts)):
+            if lot is not None and u and self.words(u):
+                by_agent.setdefault(a, []).append(i)
+        for a, idxs in by_agent.items():
+            stats["descriptions"] += len(idxs)
+            dists = self.distributions(a)
+            if not dists:
+                continue                    # nothing named yet: nothing to compose from
+            keys = sorted(dists)
+            col = {k: j for j, k in enumerate(keys)}
+            field_of = [k[0] for k in keys]
+            by_field: dict[int, list[tuple[int, int]]] = {}
+            for k, j in col.items():
+                by_field.setdefault(k[0], []).append((k[1], j))
+            names = self.names(a)
+            rows: dict[tuple, Any] = {}
+
+            def row(w):
+                r = rows.get(w)
+                if r is None:
+                    r = rows[w] = np.array([sum(p * _word_similarity(w, n) for n, p in dists[k])
+                                            for k in keys])
+                return r
+            for i in idxs:
+                ws = self.words(firsts[i])
+                R = np.stack([row(w) for w in ws])               # (words, meanings)
+                m = R.max(axis=0)
+                lot = lots[i]
+                total = 0.0
+                reused = 0
+                for f in range(N_LOT_FIELDS):
+                    v = lot[f]
+                    j = col.get((f, v))
+                    own = float(m[j]) if j is not None else 0.0
+                    rival = max((float(m[jj]) for vv, jj in by_field.get(f, ()) if vv != v),
+                                default=0.0)
+                    total += own - rival
+                    if j is not None and names.get((f, v)) in ws:
+                        reused += 1
+                score = total / N_LOT_FIELDS
+                bonus[i] = coef * score
+                stats["bonus_sum"] += coef * score
+                stats["fields_reused"] += reused
+                seq: list[int] = []
+                best = R.argmax(axis=1)
+                for w_i, b in enumerate(best):
+                    if R[w_i, b] >= 0.5:
+                        f = field_of[int(b)]
+                        if f not in seq:
+                            seq.append(f)
+                seqs[i] = seq
+                if order_coef > 0 and len(seq) >= 2:
+                    agree_sum, n_pairs = 0.0, 0
+                    for x in range(len(seq)):
+                        for y in range(x + 1, len(seq)):
+                            n_pairs += 1
+                            fw = self.order_count(a, seq[x], seq[y])
+                            bw = self.order_count(a, seq[y], seq[x])
+                            if fw + bw >= self.min_support:
+                                agree_sum += fw / (fw + bw) - 0.5
+                                stats["order_pairs"] += 1
+                                stats["order_agreed"] += int(fw > bw)
+                    order[i] = order_coef * agree_sum / n_pairs
+        return {"bonus": bonus, "order": order, "seqs": seqs, "stats": stats}
+
+    def observe_orders(self, agents: Sequence[int], seqs: Sequence) -> None:
+        """Record the order in which each description named its fields."""
+        inc = 1.0 / self.scale
+        for a, seq in zip(agents, seqs):
+            if not seq or len(seq) < 2:
+                continue
+            d = self.orders.setdefault(a, {})
+            for x in range(len(seq)):
+                for y in range(x + 1, len(seq)):
+                    p = (seq[x], seq[y])
+                    d[p] = d.get(p, 0.0) + inc
+
+    def usual_order(self, agent: int) -> list[int]:
+        """The speaker's fields sorted by how often each comes before the others."""
+        ahead = {f: 0.0 for f in range(N_LOT_FIELDS)}
+        for (f, g), c in self.orders.get(agent, {}).items():
+            ahead[f] += c
+            ahead[g] -= c
+        seen = {f for p in self.orders.get(agent, {}) for f in p}
+        return sorted(seen, key=lambda f: -ahead[f])
+
     # ---- reporting -------------------------------------------------------
     def summary(self) -> dict[str, Any]:
-        """Per speaker: how many meanings it has a name for, how many distinct
-        names those are, and how many meanings share a name with another."""
+        """Per speaker: how many meanings it has a word for, how many distinct
+        words those are, how many meanings share a word, the words themselves,
+        and its usual order of fields in a description."""
         out: dict[str, Any] = {}
         for a in sorted(self.forms):
             nm = self.names(a)
             forms = list(nm.values())
             distinct = len(set(forms))
+            order = self.usual_order(a)
             out[str(a)] = {"meanings_named": len(nm), "distinct_names": distinct,
                            "shared_names": len(nm) - distinct,
-                           "names": {"%s=%d" % (("fruit", "colour", "quality", "quantity",
-                                                  "price")[k[0]], k[1]):
-                                     "-".join(str(x) for x in f) for k, f in sorted(nm.items())}}
+                           "names": {"%s=%d" % (LOT_FIELDS[k[0]], k[1]): word_text(self.cfg, f)
+                                     for k, f in sorted(nm.items())},
+                           "order": [LOT_FIELDS[f] for f in order]}
         return out
 
     def state(self) -> dict[str, Any]:
-        return {"scale": self.scale,
+        return {"version": 2, "scale": self.scale,
                 "forms": {a: {k: dict(d) for k, d in per.items()} for a, per in self.forms.items()},
-                "total": {a: dict(t) for a, t in self.total.items()}}
+                "total": {a: dict(t) for a, t in self.total.items()},
+                "orders": {a: dict(d) for a, d in self.orders.items()}}
 
-    def load_state(self, st: dict[str, Any]) -> None:
+    def load_state(self, st: dict[str, Any]) -> bool:
+        """Restore; False (and nothing restored) for a state written before
+        names were words, whose forms are whole utterances."""
+        if int(st.get("version", 1)) < 2:
+            return False
         self.scale = float(st.get("scale", 1.0))
-        self.forms = {int(a): {tuple(k): dict(d) for k, d in per.items()}
+        self.forms = {int(a): {tuple(k): {tuple(u): float(c) for u, c in d.items()}
+                               for k, d in per.items()}
                       for a, per in (st.get("forms") or {}).items()}
         self.total = {int(a): {tuple(k): float(v) for k, v in t.items()}
                       for a, t in (st.get("total") or {}).items()}
+        self.orders = {int(a): {tuple(p): float(c) for p, c in d.items()}
+                       for a, d in (st.get("orders") or {}).items()}
+        return True
+
+
+def _word_similarity(a: tuple, b: tuple) -> float:
+    """1 - normalised edit distance between two words' atoms.
+
+    A repetition of a word counts as a *partly* different word (`a19-a19` is
+    half like `a19`), deliberately. Counting it as the same word was tried
+    (2026-09-30, locally): it closed the quickest way to coin a second word
+    from an atom already in use, and colour stayed at chance at the first
+    `name-color` checkpoint on both runs that had it, where the run without it
+    was at 0.43. Long repetitions are priced instead, by the short-name rule
+    (`reward.lexicon_name_atoms`), so `a19` twelve times over earns a sixth of
+    a distinct short word and a two-atom variant remains a stepping stone.
+    """
+    if a == b:
+        return 1.0
+    return similarity(a, b)
 
 
 class PopulationUsage:
@@ -449,6 +674,11 @@ class PopulationUsage:
         # each speaker's own names for the things it has named -- the innate
         # one-name-per-meaning prior, on from the first round
         self.lexicon = SpeakerLexicon(cfg)
+        # the community's words: every speaker's, pooled, recorded from the
+        # first rung so that they exist by the time the convention bonus
+        # agrees with them (`reward.convention_words`)
+        self.pop_lexicon = SpeakerLexicon(cfg, coef=cfg.reward.convention,
+                                          min_support=cfg.reward.convention_min_support)
         self.words: dict[tuple[int, ...], float] = defaultdict(float)
         self.word_total = 0.0
         self.forms: dict[tuple, dict[tuple[int, ...], float]] = defaultdict(
@@ -503,18 +733,21 @@ class PopulationUsage:
 
     # ---- reading a batch -----------------------------------------------
     def _utterances(self, phase, role: int, toks: list[list[int]]
-                    ) -> tuple[list[tuple], list[list[tuple[int, ...]]]]:
-        """(first utterance's symbols, all words) per episode for one speaking role.
+                    ) -> tuple[list[tuple], list[list[tuple[int, ...]]], list[bool]]:
+        """(first utterance's symbols, all words, whether the first turn opened
+        with a gesture) per episode for one speaking role.
 
         A form is the speaker's first turn as emitted -- atoms, hyphens and
-        spaces, without the end mark. Words (for the coining cost) are parsed
-        from every turn it took.
+        spaces, without the end mark or any gesture. Words (for the coining
+        cost) are parsed from every turn it took.
         """
         c = self.cfg.channel
         L = c.max_msg_len
+        first_gesture = c.n_symbol_ids          # gesture ids follow the symbols
         turns = phase.turns_of(self.cfg, role)
         firsts: list[tuple] = []
         words: list[list[tuple[int, ...]]] = []
+        pointed: list[bool] = []
         # A living language repeats itself, so parse each distinct turn once.
         seen: dict[tuple, tuple[tuple, list]] = {}
         for row in toks:
@@ -533,7 +766,9 @@ class PopulationUsage:
                 ws.extend(hit[1])
             firsts.append(first)
             words.append(ws)
-        return firsts, words
+            t0 = turns[0] * L if turns else 0
+            pointed.append(bool(turns) and row[t0] >= first_gesture)
+        return firsts, words, pointed
 
     def _keys(self, phase, role: int, obs: torch.Tensor) -> list[tuple]:
         """(meaning kind, what was asked, what it is about) per episode.
@@ -601,18 +836,31 @@ class PopulationUsage:
                 parsed[role] = self._utterances(phase, role, toks)
         # the batch's average word rarity, over every word any speaker said
         do_rarity = rarity and ready and bool(R.rarity_cost)
-        all_r = ([rarity_of(w) for _, words in parsed.values() for ws in words for w in ws]
+        all_r = ([rarity_of(w) for _, words, _ in parsed.values() for ws in words for w in ws]
                  if do_rarity else [])
         mean_r = sum(all_r) / len(all_r) if all_r else 0.0
 
-        for role, (firsts, words) in parsed.items():
+        # In the naming rungs the convention is about words (`reward.convention_words`).
+        words_convention = bool(R.convention_words) and bool(getattr(phase, "referential", False))
+        for role, (firsts, words, pointed) in parsed.items():
             keys = self._keys(phase, role, obs_of[role])
             rarity = [0.0] * B
             conv = [0.0] * B
             if do_rarity:
                 for i, ws in enumerate(words):
                     rarity[i] = R.rarity_cost * sum(rarity_of(w) - mean_r for w in ws)
-            if convention and R.convention:
+            # what each episode asks this speaker to name: one field's value, or
+            # a whole lot to describe (or neither)
+            nkeys = naming_keys(self.cfg, phase, role, obs_of[role])
+            lots = lot_keys(self.cfg, phase, role, obs_of[role])
+            if convention and R.convention and words_convention:
+                # the community's word for a single meaning, and the community's
+                # words for a whole lot's parts
+                pop = [POPULATION] * B
+                one, _ = self.pop_lexicon.terms(pop, nkeys, firsts)
+                whole = self.pop_lexicon.compose_terms(pop, lots, firsts, coef=R.convention)
+                conv = [x + y for x, y in zip(one, whole["bonus"])]
+            elif convention and R.convention:
                 # a fixed sample of other meanings' conventions to contrast with
                 kind = phase.meaning_kind(role)
                 need = R.convention_min_support / max(self.scale, 1e-12)
@@ -649,19 +897,29 @@ class PopulationUsage:
                     conv[i] = R.convention * (sim(u, m) - base)
             lex = [0.0] * B
             used = [False] * B
-            lkeys: list = [None] * B
+            comp = [0.0] * B
+            seqs: list = [None] * B
+            cstats = None
             ids: list = []
-            if agent_ids is not None and role in agent_ids and R.lexicon > 0:
+            wants = R.lexicon > 0 or R.compose > 0 or R.word_order > 0
+            if agent_ids is not None and role in agent_ids and wants:
                 ids = [int(x) for x in agent_ids[role]]
-                lkeys = self.lexicon.keys(phase, role, obs_of[role])
-                lex, used = self.lexicon.terms(ids, lkeys, firsts)
+                if R.lexicon > 0:
+                    lex, used = self.lexicon.terms(ids, nkeys, firsts)
+                if (R.compose > 0 or R.word_order > 0) and any(k is not None for k in lots):
+                    ct = self.lexicon.compose_terms(ids, lots, firsts, coef=R.compose,
+                                                    order_coef=R.word_order)
+                    comp = [x + y for x, y in zip(ct["bonus"], ct["order"])]
+                    seqs, cstats = ct["seqs"], ct["stats"]
             out[role] = {
                 "rarity": torch.tensor(rarity, device=dev),
                 "convention": torch.tensor(conv, device=dev),
                 "lexicon": torch.tensor(lex, device=dev),
+                "compose": torch.tensor(comp, device=dev),
                 "word_used": torch.tensor(used, dtype=torch.bool, device=dev),
-                "_firsts": firsts, "_words": words, "_keys": keys,
-                "_lexicon_keys": lkeys, "_agents": ids,
+                "_firsts": firsts, "_words": words, "_keys": keys, "_pointed": pointed,
+                "_lexicon_keys": nkeys, "_agents": ids, "_seqs": seqs,
+                "_compose_stats": cstats,
             }
         return out
 
@@ -669,10 +927,28 @@ class PopulationUsage:
         """Fold a batch that was just played -- one training update -- into recent usage."""
         self._decay(1)
         self.lexicon._decay(1)
+        self.pop_lexicon._decay(1)
         inc = 1.0 / self.scale
         for role, d in terms.items():
+            # A name is learned from what a speaker says when its words have to
+            # carry the meaning: never from a turn it opened with a gesture.
+            # There the gesture does the naming and the words go unchecked, and
+            # they fill the lexicon with whatever the speaker says by habit --
+            # the 2026-09-29 run's "names" were 23-token babble after a gesture,
+            # and a local check had every colour "named" with one of the
+            # speaker's fruit words, which mutual exclusivity then charged
+            # against the fruit's real name too. (The bonus is still paid in
+            # gestured rounds, so a name stays the same with or without
+            # pointing; that is what makes pointing-and-saying a lesson.)
+            nkeys = d.get("_lexicon_keys")
+            if nkeys is not None:
+                nkeys = [None if p else k for k, p in zip(nkeys, d.get("_pointed") or
+                                                         [False] * len(nkeys))]
             if d.get("_agents"):
-                self.lexicon.observe(d["_agents"], d["_lexicon_keys"], d["_firsts"])
+                self.lexicon.observe(d["_agents"], nkeys, d["_firsts"])
+                self.lexicon.observe_orders(d["_agents"], d.get("_seqs") or [])
+            if nkeys is not None and any(k is not None for k in nkeys):
+                self.pop_lexicon.observe([POPULATION] * len(nkeys), nkeys, d["_firsts"])
             for ws in d["_words"]:
                 for w in ws:
                     self.words[w] += inc
@@ -736,4 +1012,6 @@ class PopulationUsage:
             "meanings_with_convention": sum(
                 1 for k in self.form_total
                 if self.form_total[k] * s >= self.cfg.reward.convention_min_support),
+            # the community's words: every speaker's, pooled (`reward.convention_words`)
+            "community_lexicon": self.pop_lexicon.summary().get(str(POPULATION)),
         }

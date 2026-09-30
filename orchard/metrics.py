@@ -1205,7 +1205,8 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    rng: Optional[random.Random] = None,
                    holdout_sampler_for=None,
                    holdout_floor_for=None,
-                   kind_sampler_for=None) -> dict[str, Any]:
+                   kind_sampler_for=None,
+                   seen_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
     * per view (both describers, in a swap rung): intact / muted success and the
@@ -1289,7 +1290,13 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
         flo_s: dict[str, list[float]] = {}
         for v in phase.views():
             sam = holdout_sampler_for(v)
-            plain = sampler_for(v)
+            # The comparison must be the same round on trained combinations
+            # (`seen_sampler_for`). It used to be the rung's ordinary sampler --
+            # 90% hard near-miss rounds against the held-out test's independent
+            # candidates -- so "held-out 0.89 vs trained 0.66" on the 2026-09-29
+            # run was an easier test scoring higher, not a code generalising.
+            plain = (seen_sampler_for(v) if seen_sampler_for is not None
+                     else sampler_for(v))
             if sam is None:
                 continue
             try:

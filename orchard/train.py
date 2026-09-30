@@ -118,6 +118,10 @@ class History:
     # the share of turns in which a speaker said its established name
     naming_signal: list[float] = field(default_factory=list)
     words_used: list[float] = field(default_factory=list)
+    # describing a whole lot: the share of its fields named with the
+    # describer's own word, and of field pairs said in its usual order
+    names_reused: list[float] = field(default_factory=list)
+    order_agreement: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {k: list(v) for k, v in self.__dict__.items()}
@@ -206,6 +210,10 @@ class Trainer:
         # its established name (`reward.lexicon`, `reward.lexicon_mi`)
         self._naming_recent = RollingStat(window=100)
         self._words_used_recent = RollingStat(window=100)
+        # describing a whole lot (`reward.compose`, `reward.word_order`), recent
+        self._reused_recent = RollingStat(window=100)
+        self._order_recent = RollingStat(window=100)
+        self._compose_recent = RollingStat(window=100)
 
         # ---- the curriculum -------------------------------------------------
         self.curriculum = CurriculumState(ladder(cfg))
@@ -262,6 +270,11 @@ class Trainer:
         """Fold one update's gesture statistics into the per-rung record."""
         self._naming_recent.add(st.naming_signal)
         self._words_used_recent.add(st.words_used)
+        if st.descriptions:
+            self._compose_recent.add(st.compose_bonus)
+            self._reused_recent.add(st.names_reused)
+            if st.order_pairs:
+                self._order_recent.add(st.order_agreement)
         d = self.gesture_log.get(phase.name)
         if st.gesture_share <= 0 and d is None:
             return                     # a rung in which gesturing was never possible
@@ -498,9 +511,12 @@ class Trainer:
         """
         rw = self.referential_world
         if phase.referential and rw is not None:
+            # On a rung whose job is a whole lot, every candidate shares one
+            # quantity and price, so only the fields a reserved combination is
+            # made of can decide the round (`ReferentialWorld._combo_round`).
             return lambda n, held_out=False: rw.sample(
                 n, informer=phase.informer, held_out=bool(held_out), hard_frac=0.0,
-                query=phase.primary)
+                query=phase.primary, combo_only=phase.whole)
         return self.phase_sampler(phase)
 
     def holdout_sampler(self, phase):
@@ -508,6 +524,15 @@ class Trainer:
         s = self.zero_shot_sampler(phase)
         # _play calls sampler(n, held_out); this one is held-out whatever it asks
         return (lambda n, _ho=False, _s=s: _s(n, held_out=True)) if s is not None else None
+
+    def seen_sampler(self, phase):
+        """What held-out rounds are compared with: the same rounds, trained combinations.
+
+        Called with ``held_out=`` as a keyword (`phase_evidence` wraps it the way
+        it wraps an ordinary sampler), and trained combinations whatever it says.
+        """
+        s = self.zero_shot_sampler(phase)
+        return (lambda n, held_out=False, _s=s: _s(n, held_out=False)) if s is not None else None
 
     def holdout_floor(self, phase):
         """(reserved, trained) per-field floors for a message-blind guesser.
@@ -545,11 +570,16 @@ class Trainer:
         # probe count, so the frequent check was strictly harder to pass than
         # the checkpoint one. `properties.field_coverage` now reads the message
         # in pieces, cross-validated, which is steady in the sample.
+        # The rehearsed kinds are measured on the light check too. They were
+        # not, and `evaluate_rung` skipped what was not measured, so every rung
+        # promoted between checkpoints -- most of them -- was never checked for
+        # having forgotten the fields below it.
         return phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
             holdout_floor_for=self.holdout_floor,
-            kind_sampler_for=(None if light else self.kind_sampler),
+            seen_sampler_for=self.seen_sampler,
+            kind_sampler_for=self.kind_sampler,
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
             device=self.device, rng=self.eval_rng)
@@ -692,7 +722,8 @@ class Trainer:
             "usage": {"scale": u.scale, "words": dict(u.words), "word_total": u.word_total,
                       "forms": {k: dict(v) for k, v in u.forms.items()},
                       "form_total": dict(u.form_total), "episodes": u.episodes,
-                      "lexicon": u.lexicon.state()},
+                      "lexicon": u.lexicon.state(),
+                      "pop_lexicon": u.pop_lexicon.state()},
             "store": {"buf": self.store._buf, "pos": self.store._pos,
                       "total_added": self.store.total_added,
                       "meaning_counts": dict(self.store.meaning_counts)},
@@ -721,11 +752,17 @@ class Trainer:
         if not old:
             return
         changed = []
+        # Brain parts added after a snapshot was written: the snapshot was
+        # trained without them, so that is the architecture it resumes with.
+        # (Predating any other setting just means it was never different.)
+        absent_means_off = {"model.lexical_reader", "model.innate_concepts"}
         for key in sorted(ARCH_KEYS):
             try:
                 was, now = config_get(old, key), config_get(self.cfg, key)
             except (KeyError, AttributeError, TypeError):
-                continue            # a setting this snapshot predates
+                if key not in absent_means_off:
+                    continue            # a setting this snapshot predates
+                was, now = False, config_get(self.cfg, key)
             if was != now:
                 config_set(self.cfg, key, was)
                 changed.append((key, now, was))
@@ -969,8 +1006,15 @@ class Trainer:
         u.forms = defaultdict(lambda: defaultdict(float),
                               {k: defaultdict(float, v) for k, v in us["forms"].items()})
         u.form_total = defaultdict(float, us["form_total"])
-        if us.get("lexicon"):
-            u.lexicon.load_state(us["lexicon"])
+        # Lexicons written before names were words hold whole utterances as
+        # forms; they are not restored, and rebuild from the next few updates.
+        stale = []
+        for name, lex in (("lexicon", u.lexicon), ("pop_lexicon", u.pop_lexicon)):
+            if us.get(name) and not lex.load_state(us[name]):
+                stale.append(name)
+        if stale:
+            self.log.always("  [resume] %s written before names were words: starting "
+                            "empty, rebuilt within a few updates" % " and ".join(stale))
         # A snapshot from before the convention key carried *what was asked*
         # stores keys of a different shape. They cost nothing to keep except a
         # contrast set full of meanings that are no longer what those keys
@@ -1281,16 +1325,36 @@ class Trainer:
             % (100 * gs.share_start, 100 * gs.share_end, gs.anneal_updates,
                100 * gs.share_reuse, gs.cost)))
         L("innate lexicon     : %s" % (
-            "one name per meaning, one meaning per name -- each speaker is paid %.2f "
-            "for repeating its own established name for what it was asked about and "
-            "charged for resembling its name for anything else, from the first round; "
-            "a name counts after %d uses" % (c.reward.lexicon, c.reward.lexicon_min_support)
+            "one word per meaning, one meaning per word, in every field -- each speaker "
+            "is paid %.2f for saying its own established word for what it was asked "
+            "about, once and in at most %d atoms, and charged for resembling its word "
+            "for anything else, from the first round; a word counts as a name after "
+            "%d uses" % (c.reward.lexicon, c.reward.lexicon_name_atoms,
+                         c.reward.lexicon_min_support)
             if c.reward.lexicon > 0 else "off"))
+        L("describing a thing : %s" % (
+            "a whole lot is described with the speaker's own words for its parts -- "
+            "paid %.2f per lot for its right words and charged for a wrong value's, "
+            "plus %.2f for putting each pair of fields in its usual order"
+            % (c.reward.compose, c.reward.word_order)
+            if (c.reward.compose > 0 or c.reward.word_order > 0) else "off"))
         L("innate word classes: %s" % (
             "the lineup choice is read through the five belief heads (fruit, colour, "
             "quality, quantity, price), one attribute at a time"
             if c.model.factored_choice else
             "off -- a plain candidate pointer over the summed embedding"))
+        L("innate reader      : %s" % (
+            "the other party's words are read one at a time, out of context, as nouns, "
+            "adjectives or numerals naming an attribute (numerals on a number line), "
+            "and a description's attributes are assembled from them"
+            if c.model.lexical_reader else "off"))
+        L("innate concepts    : %s" % (
+            "fruit is an object kind, colour and quality are properties, quantity and "
+            "price are magnitudes on a number line"
+            if c.model.innate_concepts else "off"))
+        if c.reward.convention_words:
+            L("naming conventions : in the naming rungs the convention bonus agrees with the "
+              "community's words, not its whole utterances")
         L("agent brain        : %d-layer transformer, d=%d, %d params, RANDOMLY INITIALISED"
           % (c.model.n_layers, c.model.d_model,
              count_parameters(self.pop.farmers[0].net)))
@@ -1522,7 +1586,14 @@ class Trainer:
             "naming": {"signal_recent": (self._naming_recent.mean
                                          if len(self._naming_recent) else float("nan")),
                        "words_used_recent": (self._words_used_recent.mean
-                                             if len(self._words_used_recent) else float("nan"))},
+                                             if len(self._words_used_recent) else float("nan")),
+                       # describing a whole lot, in training
+                       "names_reused_recent": (self._reused_recent.mean
+                                               if len(self._reused_recent) else float("nan")),
+                       "order_agreement_recent": (self._order_recent.mean
+                                                  if len(self._order_recent) else float("nan")),
+                       "compose_recent": (self._compose_recent.mean
+                                          if len(self._compose_recent) else float("nan"))},
             "gestures": {"share_now": self.gesture_share_now(),
                          "recent_used": (self._gesture_recent.mean
                                          if len(self._gesture_recent) else float("nan")),
@@ -1568,6 +1639,8 @@ class Trainer:
         h.gesture_used.append(row["gestures"]["recent_used"])
         h.naming_signal.append(row["naming"]["signal_recent"])
         h.words_used.append(row["naming"]["words_used_recent"])
+        h.names_reused.append(row["naming"]["names_reused_recent"])
+        h.order_agreement.append(row["naming"]["order_agreement_recent"])
         h.transmission.append(intel["transmission_ratio"])
         h.zeroshot.append(zs["retention"])
         h.ablation_drop.append(abl.get("comprehension_drop", float("nan")))
@@ -1735,10 +1808,25 @@ class Trainer:
         if lex:
             by_id = {a.agent_id: a.name for a in self.pop.all_agents()}
             L("  innate lexicon    : " + "; ".join(
-                "%s names %d meanings with %d distinct names%s"
+                "%s names %d meanings with %d distinct words%s"
                 % (by_id.get(int(k), "agent %s" % k), v["meanings_named"], v["distinct_names"],
                    (" (%d shared)" % v["shared_names"]) if v["shared_names"] else "")
                 for k, v in lex.items()))
+            # each speaker's words, field by field, and its usual order
+            for k, v in lex.items():
+                names = v.get("names") or {}
+                by_field = {}
+                for key, word in names.items():
+                    fld, val = key.split("=")
+                    by_field.setdefault(fld, []).append("%s:%s" % (val, word))
+                L("    %-14s %s%s" % (
+                    by_id.get(int(k), "agent %s" % k),
+                    " | ".join("%s %s" % (fld, " ".join(ws)) for fld, ws in by_field.items()),
+                    ("  [order: %s]" % " < ".join(v["order"])) if v.get("order") else ""))
+            comm = (row.get("usage") or {}).get("community_lexicon")
+            if comm:
+                L("  community words   : %d meanings named with %d distinct words"
+                  % (comm["meanings_named"], comm["distinct_names"]))
         if nm:
             L("  naming signal     : %.2f (information plus separation between the meanings' "
               "first symbols, in the speakers' own policies); the speaker said its "
@@ -1746,6 +1834,13 @@ class Trainer:
               % (nm.get("signal_recent", float("nan")),
                  100 * (nm.get("words_used_recent") if nm.get("words_used_recent")
                         == nm.get("words_used_recent") else 0.0)))
+            nr = nm.get("names_reused_recent", float("nan"))
+            if nr == nr:
+                oa = nm.get("order_agreement_recent", float("nan"))
+                L("  descriptions      : a describer named %.0f%% of a whole lot's fields "
+                  "with its own word%s (`reward.compose`)"
+                  % (100 * nr, ("; %.0f%% of named field pairs in its usual order" % (100 * oa))
+                     if oa == oa else ""))
         gs = row.get("gestures") or {}
         if gs:
             d = (gs.get("by_rung") or {}).get(self.curriculum.phase.name) or {}
@@ -1997,29 +2092,40 @@ class Trainer:
         # emitted at 98% per-symbol accuracy shows up there as ~170 words. The
         # second is what the speakers actually say when asked -- the same greedy
         # decode every structure metric uses -- and is the lexicon.
-        lex = max([sp.get("lexicon_size", 0) or 0
-                   for sp in (row.get("per_role_structure") or {}).values()] or [0])
+        said = max([sp.get("lexicon_size", 0) or 0
+                    for sp in (row.get("per_role_structure") or {}).values()] or [0])
         gs = row.get("gestures") or {}
         gest = ""
         if gs.get("share_now", 0.0) > 0 or (gs.get("recent_used") == gs.get("recent_used")):
             gest = " | gestures possible %s, used %s" % (
                 f(100 * gs.get("share_now", 0.0), "%.0f%%"),
                 f(100 * gs.get("recent_used", float("nan")), "%.0f%%"))
-        lex = row.get("speaker_lexicons") or {}
-        if lex:
+        # (This variable was `lex` twice over: the greedy lexicon size above, then
+        # the speakers' lexicons, so the whole names dictionary was printed where
+        # "N said" belongs and the count of what speakers say was lost.)
+        speakers = row.get("speaker_lexicons") or {}
+        if speakers:
             gest += " | names " + ", ".join(
-                "%s/%s" % (v["distinct_names"], v["meanings_named"]) for v in lex.values())
+                "%s/%s" % (v["distinct_names"], v["meanings_named"]) for v in speakers.values())
         nm = row.get("naming") or {}
         if nm and nm.get("signal_recent") == nm.get("signal_recent"):
             gest += " | naming signal %s, name used %s" % (
                 f(nm.get("signal_recent"), "%.2f"),
                 f(100 * nm.get("words_used_recent", float("nan")), "%.0f%%"))
+        nr = nm.get("names_reused_recent", float("nan")) if nm else float("nan")
+        if nr == nr:
+            # the number that showed `name-all` failing: how much of a whole lot
+            # a describer names with the words it has
+            gest += " | descriptions reuse %s of fields" % f(100 * nr, "%.0f%%")
+            oa = nm.get("order_agreement_recent", float("nan"))
+            if oa == oa:
+                gest += ", %s in usual order" % f(100 * oa, "%.0f%%")
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
             "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end%s"
             % (f(st.get("coherence_farmer")), f(st.get("coherence_buyer")),
                f(st.get("coherence_cross")), f(ov.get("weighted_overlap")),
-               w.get("distinct_words", "n/a"), lex or "n/a",
+               w.get("distinct_words", "n/a"), said or "n/a",
                f(w.get("mean_word_len_atoms"), "%.2f"),
                f(w.get("mean_words_per_message"), "%.2f"),
                f(100 * w.get("silent_frac", float("nan")), "%.0f%%"),

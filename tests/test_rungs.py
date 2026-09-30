@@ -288,10 +288,14 @@ def _report_evidence(phase, farmer_ok: bool = True, buyer_ok: bool = True,
 
 
 def _swap_evidence(farmer_ok: bool, buyer_ok: bool, holdout: float = 0.75) -> dict:
-    good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6}
-    bad = {"topsim": 0.03, "null": 0.01, "positional": 0.03, "field_coverage": 0.05}
+    good = {"topsim": 0.40, "null": 0.01, "positional": 0.45, "field_coverage": 0.6,
+            "per_field_coverage": [0.6] * 5}
+    bad = {"topsim": 0.03, "null": 0.01, "positional": 0.03, "field_coverage": 0.05,
+           "per_field_coverage": [0.05] * 5}
     return {
         "chance": 0.25,
+        # every rehearsed one-field kind still named (measured on every check now)
+        "by_kind": {k: {"success": 0.95} for k in range(5)},
         # the productivity gate: success on combinations never trained on
         "seen_success": 0.80, "holdout_success": 0.80 * holdout,
         "holdout_ratio": holdout,
@@ -847,7 +851,7 @@ class TestEveryRungIsReachable(unittest.TestCase):
         """Evidence from an imaginary rung that worked perfectly."""
         roles = ["farmer", "buyer"]
         spk = {r: {"topsim": 1.0, "null": 0.0, "positional": 1.0,
-                   "field_coverage": 1.0} for r in roles}
+                   "field_coverage": 1.0, "per_field_coverage": [1.0] * 5} for r in roles}
         ev = {
             "phase": phase.name, "speakers": spk,
             "success": 1.0, "chance": 0.0, "transfer": 1.0,
@@ -1903,6 +1907,9 @@ class TestTheConventionTermCanAffordToRun(unittest.TestCase):
     def test_the_contrast_sample_is_a_knob_and_is_honoured(self):
         cfg = cfg_small()
         cfg.reward.convention_min_support = 1
+        # the utterance-level convention: what runs from `mutual` on, and in the
+        # naming rungs too with the word-level one off
+        cfg.reward.convention_words = False
         c = cfg.channel
         phase = phase_named(cfg, "name-all")
         seen = {}

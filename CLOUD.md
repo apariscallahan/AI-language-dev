@@ -57,7 +57,11 @@ again.
 **Start a fresh run.** Snapshots written before the lot layout (anything from
 September 2026 or earlier that has `ask-qty` or `quote` in its ladder) cannot be
 resumed: the observation layout, the query embedding and the atom inventory all
-changed, and the loader stops with a message saying so.
+changed, and the loader stops with a message saying so. Snapshots written before
+the language faculty (2026-09-30: the innate reader and innate concepts) *do*
+resume, but without it: the file decides the architecture, and a brain trained
+without a reader is resumed without one (the `[resume]` line says so). To run the
+faculty, start fresh. The naming rungs took about 45 minutes on a 4090.
 
 ---
 
@@ -163,7 +167,18 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
   speakers used one in. Training-time numbers only; everything else on the line
   is word-only. `possible` should fall to 0 over the first 600 updates of each
   naming rung; `used` should be high while the rung's word is forming and fall
-  once it works;
+  once it works. **While gestures are possible, the status line's *rolling*
+  success counts gestured rounds** and runs well above the word-only number
+  (`name-quality` read 0.96 rolling against 0.68 word-only on 2026-09-29): read
+  the language off the checkpoint and promotion lines;
+- from `name-all` on, **`descriptions reuse X% of fields, Y% in usual order`**:
+  when a describer is asked for a whole lot, the share of the lot's fields it
+  names with its own established word, and the share of named field pairs it
+  puts in its usual order. This is the number that showed `name-all` failing on
+  2026-09-29 — a speaker's own colour word appeared in 0 of 760 descriptions —
+  and it should climb towards 100% before success does. The full checkpoint
+  block in `run.log` lists each speaker's words field by field and its usual
+  order (`quantity < colour < fruit`, say);
 - the **final verdict** and the report path.
 
 ### Reading the rungs
@@ -172,7 +187,7 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
 |---|---|
 | `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,500 updates, nothing above it will work. `coherence 0.500` through the single-field rungs is expected: the two founders each keep a dialect the other can read, and converge from `name-all` on. The rolling success on the status line and the checkpoint's success should agree roughly — both are fruit rounds between two different agents — so a wide gap means training and measurement are asking different questions. (From `name-color` on, the rolling number also counts the easier rehearsal rounds and runs higher; the checkpoint measures only the new field.) |
 | `name-color`, `name-quality`, `name-quantity`, `name-price` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` / … check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. Quantity has nine values (0 is "none of that") and price six; a colour round and a quantity round both have three candidates, so chance is 0.333 throughout. `name-quantity` is where the 2026-09-24 run stalled at chance for 850 updates; the gesture channel exists for it. Watch `gestures possible` fall over the rung's first 600 updates and the word-only success rise as it does; if success is still at chance when `possible` reaches 0, the scaffold did not transfer to the words. |
-| `name-all` | the hard one: five fields in one utterance. Watch **words per utterance** climb toward 5 and **coverage** toward 0.30 on every field — a run that sticks at ~1.5 words and coverage ~0.15 is naming one field and guessing the rest. The checkpoint line prints `held-out vs trained`; they should stay close (a wide gap is memorisation). The convention bonus comes on here, so `coherence` should start to rise from 0.5. |
+| `name-all` | the hard one: five fields in one utterance. Watch **descriptions reuse** climb first — the describers saying the words they already have — then **words per utterance** toward 5 and **coverage** on every field: the rung needs 0.30 on average *and* 0.25 on each field (`names each field` in the promotion block). A run that sticks at ~2 words with coverage ~0.25 and reuse near zero has grown a second code for whole lots instead of combining its words: that is how the 2026-09-29 run stalled at 0.65 for 1,000 updates. `held-out vs trained` is measured on rounds only fruit, colour and quality can decide (every candidate shares one quantity and price), so the two should be close for a code that combines its words, and the held-out number collapses towards 0.33 for one that does not. The convention bonus comes on here and agrees with the community's *words*, so `coherence` should rise from 0.5 as the two founders converge on one word per meaning. |
 | `mutual` | both report the other's lot, all five fields, with the five belief heads `haggle` will use. Newcomers, deaths and hindsight feedback all switch on here, and the founders' dialects should merge — **coherence** is the number to watch. The speaker costs come on partway through, once the rung reaches its floor (`[costs]` in the log), and are ramped in over 200 updates: `atoms/word` and `words/utterance` should settle without success dropping. The held-out gate here is per field: `held-out 0.58 vs trained 0.80` is the mean per-field accuracy on reserved combinations against trained ones. |
 | `order` | the buyer's request is a lot in the naming layout, so the buyer says exactly what it said in `name-all`; what is new is the farmer reporting it while looking at a barn of sixteen rows. Every field is `still carries`; if one falls to chance the farmer is not finding it among the rows. |
 | `offer` | the farmer answers about the lot that was asked for — `stock`, `lot-quality`, `reservation` — and the buyer reports that. This is the first rung where a farmer has to **find a lot in its barn** by the words it heard; `stock arrives` is the number to watch, and stock 0 ("none of that") is a value it has to be able to say. |
@@ -561,7 +576,7 @@ grep -E "rung|PHASE" runs/<run>/run.log | tail -20
 python -m unittest discover -s tests
 ```
 
-216 tests, about four minutes. Worth doing on the GPU box, not just locally:
+358 tests, about six minutes. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
 readable scalar one, `tests/test_config.py` that there is one configuration and
 no device-specific arithmetic, and `tests/test_lots.py` that every report rung's

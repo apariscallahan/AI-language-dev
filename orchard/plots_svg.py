@@ -213,4 +213,9 @@ def build_vocab_panels(history) -> list[dict[str, Any]]:
                       getattr(h, "naming_signal", [])),
                     S("share of turns that were the speaker's established name",
                       getattr(h, "words_used", []))]},
+        {"title": "Describing a whole lot (training only)", "ylim": (0, 1),
+         "series": [S("share of a lot's fields named with the speaker's own word",
+                      getattr(h, "names_reused", [])),
+                    S("share of named field pairs in the speaker's usual order",
+                      getattr(h, "order_agreement", []))]},
     ]

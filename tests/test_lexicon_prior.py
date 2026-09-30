@@ -8,7 +8,8 @@ What each class protects:
   one form used for everything, pulls a form that co-occurs more with one meaning
   towards that meaning, and is per speaker;
 * an utterance counts as "a word" -- and so as an ostensive lesson -- only when it
-  is the speaker's established, unshared name;
+  begins with the speaker's established, unshared name (names are words since
+  2026-09-30; `test_language_faculty.py` covers what that changed);
 * the naming objective is positive on a distinct code, and has a live gradient
   where the meanings' distributions are all but identical (information alone
   has none there);
@@ -32,7 +33,7 @@ from orchard.config import Config
 from orchard.conventions import (PopulationUsage, SpeakerLexicon, naming_keys,
                                  naming_mutual_information)
 from orchard.curriculum import ASK_ALL, ReferentialWorld, phase_named
-from orchard.env import BUYER, FARMER
+from orchard.env import BUYER, FARMER, parse_words
 from orchard.gumbel import run_and_update_gumbel
 from orchard.world import N_LOT_FIELDS
 
@@ -238,27 +239,30 @@ class TestTheOstensiveLesson(unittest.TestCase):
                                           fi, bi, phase=ph, usage=usage, gesture_share=1.0)
         self.assertEqual(st.words_used, 0.0)
         self.assertTrue(bool((batch.res["farmer_lexicon"] == 0).all()))
-        # settle names for the two describers by hand, then play again
+        # settle names for the two describers by hand -- in a lexicon holding
+        # nothing else, so what each is paid is exact -- then play again
+        usage = PopulationUsage(cfg)
         for a in f:
             for v in range(cfg.world.n_varieties):
                 teach(usage.lexicon, a.agent_id, (0, v), (v,), 10)
         rb = rw.sample(64, informer=FARMER, query=0)
         batch, st = run_and_update_gumbel(cfg, rb, f, b, fi, bi, phase=ph, usage=usage,
                                           gesture_share=1.0)
-        # whichever turns happened to say the settled name are counted as words
+        # whichever turns happened to *begin with* the settled name count as words
         L = cfg.channel.max_msg_len
         said_name = []
         for i in range(64):
             turn = G.strip_gestures(cfg, [t for t in batch.tokens[i, :L].tolist()
                                           if t != cfg.channel.pad_id])
-            spoken = tuple(t for t in turn if t < cfg.channel.end_id)
-            if spoken == (int(rb.true_meaning[i, 0]),):
-                said_name.append(i)
+            words = parse_words(cfg, [t for t in turn if t < cfg.channel.end_id])
+            if words and words[0] == (int(rb.true_meaning[i, 0]),):
+                said_name.append((i, len(words)))
         self.assertAlmostEqual(st.words_used, len(said_name) / 64.0, places=6)
-        # a settled, distinct name said of its meaning is paid in full
-        for i in said_name:
-            self.assertAlmostEqual(float(batch.res["farmer_lexicon"][i]), cfg.reward.lexicon,
-                                   places=5)
+        # a settled, distinct name said of its meaning is paid in full when it
+        # is said alone, and shared out over the words when it is not
+        for i, n in said_name:
+            self.assertAlmostEqual(float(batch.res["farmer_lexicon"][i]),
+                                   cfg.reward.lexicon / n, places=5)
 
     def test_the_prior_and_the_lesson_are_method_settings(self):
         cfg = cfg_small()

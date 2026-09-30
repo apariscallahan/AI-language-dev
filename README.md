@@ -695,6 +695,33 @@ binding check and is left as is.
 Success alone is never enough, because a pair can score on base rates without
 saying anything. Every check, passed or not, is written to `promotions.jsonl`.
 
+**Three holes the 2026-09-29 run found in these gates**, each now closed and
+tested (`tests/test_language_faculty.py`):
+
+* **The productivity test compared an easy round with a hard one.** Held-out
+  rounds drew their candidates independently; the "trained" rounds they were
+  compared with were the rung's ordinary ones, 90% hard near misses. And
+  independent candidates almost always differ in quantity and price, which are
+  never held out. The run showed "held-out 0.89 vs trained 0.66" for a code that
+  barely named fruit or colour. Simulated on the real sampler, a flawless code
+  for quantity and price *alone* scored 0.98 held-out against 0.69 trained, a
+  "productivity" ratio of 1.43, without a word for anything a reserved
+  combination is made of. On a whole-lot rung the test is now its own round
+  (`ReferentialWorld._combo_round`): every candidate shares one quantity and one
+  price and is a distinct combination from the same pool, all reserved or all
+  trained, so only fruit, colour and quality can decide it. The comparison is
+  the same round on trained combinations. A code without the combination
+  scores chance on both; one with it scores in full.
+* **Coverage was gated as a mean**, so three covered fields could carry two at
+  zero. A flawless code for quality, quantity and price alone scored 0.79
+  success and 0.60 coverage against bars of 0.667 and 0.30. `name-all` now also
+  needs every field on its own (`min_field_coverage_each`, 0.25).
+* **Most rungs were never checked for forgetting.** The frequent light check
+  never measured the rehearsed kinds, and `evaluate_rung` skipped what was not
+  measured, so every rung promoted between checkpoints (`name-quality`,
+  `name-quantity` and `name-price` on that run) went up without a "still names"
+  line. Every check measures them now, and an unmeasured kind is unmet.
+
 **Every rung has a budget** (`curriculum.rung_budget_updates`, in training
 updates): 80–2,000 for `name-fruit` (the first code forms suddenly and late:
 525 and 1,525 updates on two GPU runs), 80–1,500 for the other single-field
@@ -867,7 +894,10 @@ first rung, never gated, per agent (`orchard/conventions.py`):
   counts as *a name* once it has `lexicon_min_support` = 3 recent uses and is
   not also the speaker's name for something else. That last judgement is what
   gates the ostensive lesson above, and what the checkpoint line reports as
-  `names 4/4`: distinct names over meanings named.
+  `names 4/4`: distinct names over meanings named. Since 2026-09-30 a form is a
+  *word*, not a whole utterance, and a name is paid in full only when said once
+  and no longer than two atoms
+  ([below](#the-language-faculty-words-word-classes-and-composition)).
 
 Three things were got wrong on the way, each measured on `name-fruit` at batch
 256 with two founders, and each is a test now (`tests/test_lexicon_prior.py`):
@@ -891,6 +921,179 @@ has 16× the rows at the GPU batch. The scaffold is meant to be dropped:
 gesturing costs 0.02 a time and words cost nothing here, so once the words
 work the gesture head has nothing to earn, and the world withdraws the
 possibility over the rung in any case.
+
+### The language faculty: words, word classes and composition
+
+The run of 2026-09-29 (`gpu_community`, 2 + 2 founders, with the gestures and
+the innate lexicon above) climbed the five single-field rungs in 550 updates:
+`name-fruit` 100, `name-color` 100, `name-quality` 150, `name-quantity` 100 —
+where the run before it had sat at chance for 850 — and `name-price` 100. Then
+it stalled in `name-all` for 1,300 updates: whole-lot success rose from 0.51 to
+0.65 and stopped there, a hair under the 0.667 bar, with field coverage at
+0.20–0.29 from the first checkpoint to the last and utterances of 1.9 words.
+
+Every word existed. During `name-all` the rehearsed single-field rounds scored
+**fruit 1.00, colour 1.00, quality 1.00, quantity 0.98, price 0.96** — each
+field could be named alone. What never happened was putting the words
+together. Across the last 1,500 whole-lot rounds in the ledger, a speaker's own
+word for the lot's colour appeared in **0 of 760** of its descriptions, its
+word for the quality in **0 of 760**; the other speaker used its own words for
+2–12% of fields. The whole-lot rounds had grown a second, holistic code — 595
+words first seen in `name-all`, compounds like `a0-a25` and `a12-a25` that
+mostly meant a quantity, 9% of the rung's words inherited from the rungs that
+invented them — and it carried about 1.4 fields' worth of the lot.
+
+Nothing in the design asked for anything else. The innate lexicon applied only
+where one field is asked about; a whole lot was a new context for the
+speaker's policy, with no pressure to reuse what it said elsewhere. And the
+listener read everything through one pooled state, so a concatenation of words
+it had only ever heard alone was as foreign to it as any new utterance, and a
+speaker who tried one was not understood for it.
+
+The response gives the agents more of a language faculty. It is the debated
+premise of the nativist side of the argument — that children bring innate
+structure to language — made concrete and switchable, so that what it does and
+does not buy can be measured. **What is innate is the architecture of words and
+the kinds of thing they name; which atoms make which word, which word names
+what, whether a description names every field, and in what order are all left
+to the agents.**
+
+| innate | where | what it gives |
+|---|---|---|
+| a name is a short *word*, said once, and names one thing in every field | `reward.lexicon`, `reward.lexicon_name_atoms` (`SpeakerLexicon`) | four fruits, four colours, four qualities, nine numbers and six prices get 27 distinct words, not homonyms told apart by how often they are repeated |
+| describing a thing means naming its parts | `reward.compose` (0.30) | a whole lot is described with the speaker's own words for its fields |
+| phrases have a consistent order | `reward.word_order` (0.15) | each pair of fields comes in the speaker's usual order; which order is learned |
+| words are read one at a time, as nouns, adjectives or numerals | `model.lexical_reader` (`agents.LexicalReader`) | a listener understands a combination of words it learned one at a time |
+| numerals sit on a number line | inside the reader, and `model.innate_concepts` | numbers are magnitudes: 3 is near 4 and far from 8, in perception and in word meaning |
+| a fruit is an object, colour and quality properties, number magnitudes | `model.innate_concepts` | concepts arrive sorted into the kinds that nouns, adjectives and numerals name |
+
+**Names are words.** The innate lexicon used to treat a whole utterance as a
+form. One 2026-09-29 speaker named banana `a16` and red `a16 a16 a16 …`, twelve
+times over. Edit distance on the utterances read those as two forms, 96% apart;
+they are one word naming two things, which is exactly what mutual exclusivity
+forbids, and a colour name like that cannot sit next to a fruit name in a
+description at all. Now the name is the first word of the answer to a
+one-field question, mutual exclusivity is judged word against word across every
+field, and the bonus is divided by the number of words said, so a name is said
+once. (Divided only when positive: saying more never softens a wrong word.)
+
+The first local checks of that rule found the same loophole one level down,
+inside the word:
+- one speaker named red `a19-a19-a19-a19-a19-a19-a19-a19-a19-a19-a19-a19`
+  beside `a19` for plum;
+- another named pear `a12` and plum `a12-a12-a12`.
+
+Edit distance reads a repeated atom as a different word (`a19` twelve times over
+is 92% unlike `a19`), and words averaged 3.7–3.9 atoms. That breaks
+composition on plain arithmetic. A turn holds 24 symbols; five words of three
+atoms need 29 (15 atoms, 10 hyphens, 4 spaces), and one twelve-atom word fills
+the turn alone.
+
+So **a name is short**: its bonus is paid in full up to
+`reward.lexicon_name_atoms` (2) atoms and shared out over the atoms beyond. As
+before, the division applies only when the bonus is positive, so it shapes
+established names and never rewards a short non-name. That keeps it clear of
+the collapse length costs cause while words are being invented, where everyone
+ends up saying the same short nothing. With it, `a19` twelve times over earns a
+sixth of what a distinct short word earns. A two-atom repetition (`a19-a19`
+beside `a19`) is still half a new word, a stepping stone rather than a
+loophole. Two atoms also leaves room for multi-atom words, which the `duality`
+experiment needs.
+
+A stricter rule was tried and dropped: counting a repetition as the *same* word,
+so it could never be a second name. It closed the quickest way to coin a new
+word from an atom already in use. Colour was at chance at the first `name-color`
+checkpoint on both local runs that had it (0.30–0.36 against 0.33), where the
+run without it was at 0.43. That is one seed each at a sixteenth of the GPU's
+episodes, so it is a hint, not a measurement, and it is why the gentler rule is
+the one kept.
+
+**A name is learned from words that have to work.** The speakers' lexicons were
+also recording what they said in rounds they opened with a gesture. With a
+gesture possible in 83% of rounds and made in 84% of those, most of a lexicon
+came from turns where the gesture did the naming and the words went unchecked.
+On 2026-09-29 those were the 23-token "names". In a local check they were worse:
+both speakers' colour "names" were all one of their fruit words, what they said
+by habit while pointing. The cross-field exclusivity rule then charged that word
+against the fruit's real name as well. Now a turn opened with a gesture teaches
+no name, to the speaker's lexicon or the community's. The bonus is still paid in
+gestured rounds, so a name stays the same with or without pointing, and that
+consistency is what makes pointing-and-saying an ostensive lesson.
+
+**Describing a thing means naming its parts.** In a round that asks for a whole
+lot — `name-all`'s open rounds, each side's lot in `mutual`, a buyer's request —
+the speaker is paid, field by field, for including its own established word for
+that field's value, and charged for including its word for a *different* value
+of that field: calling a red apple green costs what saying "red" earns.
+`reward.compose` × the mean over the five fields, so each field named is a
+fifth of it, a field with no word yet scores zero, and words that name nothing
+cost nothing here (the length costs price them from `mutual` on). It is the
+innate lexicon extended from naming a thing to describing one. Children's first
+multi-word utterances are made this way: "two red apple" is three words the
+child already says alone. Order is free; the words are the speaker's own.
+
+**Word order is consistent, and which order is learned.** Every pair of fields
+a description names is paid for coming in the speaker's usual order — its
+recent share of "f before g", minus a half — once the pair has a few
+descriptions behind it. The comparison is pair by pair so that adding a field
+never breaks the order of the ones already said: a whole-sequence comparison
+would tax every new word, which is the trap the utterance-level convention
+bonus fell into ([§6](#6-speaker-pressures-and-the-community)). This is the
+principles-and-parameters idea in miniature: the principle (phrases have a
+fixed internal order) is given, the parameter (number before noun, or after)
+is set by use. The report prints each speaker's order, `quantity < colour <
+fruit` and so on, which is where universals such as Greenberg's would show.
+
+**The innate reader** (`model.lexical_reader`) is the comprehension half, and
+the one that makes composition pay. The other party's turn is segmented where
+the medium segments it (a word is a run of atoms joined by hyphens), and each
+word is encoded from its own atoms alone, in order, with no context, so a word
+means the same thing wherever it is said. Each word is then read as a noun, an
+adjective, a numeral or none of these, and within its class as naming one
+attribute — a noun the fruit, an adjective the colour or the quality, a numeral
+the quantity or the price — and as a value of that attribute. A numeral's value
+is a place on a number line with a precision, plus whatever exceptions it
+learns, so "about four" is as easy to mean as "four". Finally a description's
+attributes are assembled from its words, each from the word that names it: an
+attention over the words by how strongly each is of that attribute's class,
+with "no word names it" as an option, so a missing attribute stays uncertain
+instead of being guessed from the others. The five readings are added to the
+five belief heads the transformer already reads (a product of experts), and
+from there reach the lineup choice, the report rungs and trading. Muted, the
+reader hears no word and adds nothing, so every channel control keeps its
+meaning. The straight-through gradient reaches the speaker's atoms through it
+too, and since the reader is context-free, that gradient says "make this word
+more like the word for red" the same way in every utterance.
+
+`tests/test_language_faculty.py` has the demonstration. A reader trained only
+on one-word utterances, one field at a time as the naming rungs teach,
+decodes five-word descriptions it has never heard, in any word order, at
+**above 0.95 per field**. It leaves a field no word names uncertain rather
+than guessing (a four-word description leaves the price below 0.5 confidence).
+Words learned alone are understood together.
+
+**Innate concepts** (`model.innate_concepts`). The perceptual side carries the
+same distinctions. Every lot field's embedding adds one learned vector for its
+kind (object, property, magnitude), so colour and quality share something
+fruit does not. Quantities and prices are also embedded through a thermometer
+code (v ≥ 1, v ≥ 2, …): neighbouring magnitudes share most of their
+representation, the way infants' approximate number sense orders numerosities
+before there is any counting word.
+
+**What this does not give.** No atom is assigned to any meaning. No word is
+given a class. No order is chosen, and nothing forces a description to name
+every field: the composition term pays for it, and the gates judge whether it
+happened. What the faculty does change is where compositionality comes from.
+The listener's side of productivity is now largely innate (a reader that
+composes understands novel combinations of known words by construction), and
+the speaker's side is biased towards it. What stays emergent and measurable is
+everything the table above leaves out: the word forms, homonymy, whether
+multi-atom words form and reuse atoms (duality of patterning, which needs the
+`duality` experiment's scarce atoms to be *necessary*), which fields get said,
+the word order, how far the two founders' words converge, and what survives
+transmission to newborns. Every mechanism can be switched off
+(`reward.compose` / `reward.word_order` = 0, `model.lexical_reader` /
+`model.innate_concepts` = false) to measure what it bought.
 
 ### Telling inherited structure from new structure
 
@@ -1022,6 +1225,22 @@ the lot alone, `name-all`'s conventions blended the answers to "what fruit?"
 and "what is it?" into one modal form. The key carries what was asked, and a
 buyer's request in the market — the whole lot, in the same layout — shares the
 convention of the `name-all` describer's whole lot.
+
+**In the naming rungs the convention is about words** (`reward.convention_words`).
+Keyed on whole utterances, the bonus paid each `name-all` describer for
+repeating the population's form for that exact lot. That form was the
+incomplete two-word description of the moment, so the bonus was paying
+speakers to stay incomplete. On 2026-09-29 utterances grew to 2.66 words at
+update 150 of the rung and fell back to 1.9 as coherence rose from 0.13 to
+0.47, with coverage flat throughout. The community's lexicon is now kept like a
+speaker's (every speaker's first words, pooled under one pseudo-speaker, from
+the first rung on). In a one-field round the bonus pays for the community's
+word for that meaning, contrastively and word against word; in a whole-lot
+round it pays for the community's words for the lot's parts, the same
+composition as `reward.compose` but against the community instead of the
+speaker. So agreement is lexical: two founders converge on the words, and a
+description in the shared words is a shared description. From `mutual` on the
+utterance-level bonus is unchanged.
 
 **The contrast subtracts the closest other form, not the average one.** Against
 the average it punished exactly what this project is for. A compositional code's
@@ -1252,8 +1471,22 @@ and `haggle` score, so naming trains reporting from the first rung instead of
 handing `mutual` five untrained heads. The old pointer is kept as the control
 (`factored_choice = false`).
 
-Sizes are a declared scale choice ([§14](#14-one-method-declared-scale)): 55k
-parameters per agent at the reference scale, up to 850k in `gpu_large`.
+**The innate reader and innate concepts** (`model.lexical_reader`,
+`model.innate_concepts`; [§5](#the-language-faculty-words-word-classes-and-composition)).
+Beside the transformer sits a second listener that reads the other party's
+words one at a time, out of context — its own atom table, a position-in-word
+gain so `a7-a2` is not `a2-a7`, and a small network per word — into a word
+class (noun, adjective, numeral, none), an attribute within the class, and a
+value, numerals on a number line. It assembles a description's attributes from
+its words and adds the result to the five belief heads. On the perceptual side,
+every lot field's embedding carries its kind of concept (object, property,
+magnitude), and quantities and prices a thermometer-coded place on a number
+line. Both are part of the architecture and so are fixed for a run
+(`ARCH_KEYS`): a snapshot records whether it had them.
+
+Sizes are a declared scale choice ([§14](#14-one-method-declared-scale)): about
+74k parameters per agent at the reference scale (55k before the reader), up to
+~900k in `gpu_large`.
 
 ### Why Gumbel-softmax
 
@@ -1607,6 +1840,32 @@ current design answers.
    and pointing that a listener can read from the first round, withdrawn as the
    rung goes on, with every gate still word-only. Whether that gets number
    words to form is the next thing to run.
+14. **It did, and then the words were never put together** (2026-09-29,
+   `gpu_community`, with gestures and the innate lexicon). All five
+   single-field rungs passed in 550 updates: `name-fruit` 100 (was 1,775),
+   `name-color` 100, `name-quality` 150, `name-quantity` 100 (was stuck at
+   chance for 850), `name-price` 100, each judged word-only. Then `name-all`
+   rose from 0.51 to 0.65 and stayed there for 1,000 updates against a 0.667
+   bar, coverage 0.20–0.29 throughout, 1.9 words per utterance, while the
+   rehearsed single fields scored 0.96–1.00. The whole-lot rounds had grown their
+   own holistic code, and a speaker's words for colour and quality appeared in 0
+   of its 760 late descriptions. The response is the language faculty
+   ([§5](#the-language-faculty-words-word-classes-and-composition)).
+   The same run found three gate holes and a display bug:
+   - the productivity test compared independent candidates with hard near
+     misses and let never-held-out quantity and price decide it;
+   - coverage was gated as a mean;
+   - light-check promotions skipped the forgetting check;
+   - the checkpoint line printed the whole names dictionary in place of the
+     greedy lexicon count, because one variable held both.
+
+   Two readings of that run's log are worth keeping. First, with gestures
+   possible in 75–100% of a naming rung's rounds, *rolling* success counts
+   gestured rounds: `name-quality` read 0.96 rolling against 0.68 word-only.
+   Second, the speakers' lexicons then mixed the words said after a gesture with
+   those said without one; a 23-token "name" is a speaker running to the buffer
+   end after its gesture took the first slot. Only the promotion checks and
+   checkpoints are word-only.
 
 ### The rest of the log
 
@@ -1682,7 +1941,7 @@ runs a checkpoint and yields the per-role, per-field evidence its gate reads;
 a snapshot of one pool comes back as one pool; the bottleneck withholds the
 combinations it says it does; the costs wait and ramp; the barn lookup is
 inactive off a barn, small at birth, and learns the lookup when told the answer.
-216 tests, about four minutes.
+358 tests, about six minutes.
 
 **Demonstrated in runs.** Founding at 2 + 2 and growing gets a lineup code off
 chance where 6 + 6 never does; the code forms suddenly and late (~300–600
@@ -1690,13 +1949,40 @@ updates on the CPU, 525–1,525 on the GPU); alternating describers are necessar
 hindsight feedback must wait; the three-field naming ladder climbs to and through
 `name-all`; `mutual` climbs once the pool is kept whole.
 
+**Also demonstrated, on a GPU (2026-09-29).** With gestures and the innate
+lexicon, all five single-field naming rungs pass, 100–150 updates each, judged
+word-only: number words form where they had sat at chance. The words then did
+not combine: `name-all` stalled at 0.65 ([§11](#11-findings-with-the-evidence),
+item 14).
+
 **Not yet validated — the open questions.**
 
-- **The five-field naming ladder has not been run on a GPU.** `name-quantity`
-  and `name-price` are new, and so are the 32-atom inventory and the 65-slot
-  layout. What is verified is that they play, score and judge correctly, and
-  (locally, at the reference scale) that the first code still forms — see the
-  end of this section.
+- **The language faculty has not been run on a GPU**
+  ([§5](#the-language-faculty-words-word-classes-and-composition)). What is
+  verified (`tests/test_language_faculty.py`):
+  - a name is a word, and repeating it does not make it another name;
+  - mutual exclusivity holds across fields, and a name is paid in full only
+    when said once;
+  - a description is paid per field for the speaker's own words and charged for
+    a wrong value's, whatever the word order, while the order term works pair by
+    pair;
+  - the reader segments words as the grammar makes them, reads a word the same
+    anywhere, reads silence as nothing, and passes a gradient to the speaker's
+    atoms;
+  - trained on single words alone, the reader decodes unheard five-word
+    descriptions above 0.95 per field;
+  - the productivity test is decided by the reserved fields alone;
+  - `name-all` needs every field;
+  - an unmeasured rehearsal is unmet.
+
+  Locally, at the reference scale on a CPU (batch 256, one seed per
+  configuration), every run passed `name-fruit` word-only at update 100
+  (0.82–0.96), with one- and two-atom names. The shipped configuration had
+  colour at 0.48–0.54 against 0.33 at `name-color`'s first checkpoint; the
+  dropped repetition rule had it at chance twice. Whether descriptions in play
+  now reuse the words, and whether `name-all` passes on words rather than on a
+  second code, is the next thing to run, on the GPU. The checkpoint line's
+  "descriptions reuse N% of fields" is where it shows first.
 - Whether the farmer learns the **lookup** in `offer` *by reinforcement*:
   finding the asked-for lot among its barn rows by content, and describing it
   from a row rather than from the naming layout. This is the one genuinely new
@@ -1712,22 +1998,11 @@ hindsight feedback must wait; the three-field naming ladder climbs to and throug
   is a candidate for a further rung rather than for quietly loosening the test.
 - The `duality` experiment (12 fruits against 8 atoms, so no atom can name a
   whole meaning — the setting where duality of patterning is *necessary*).
-- **The innate lexicon has not been run on a GPU.** Measured at the reference
-  scale on a CPU: `name-fruit` from chance to 0.98 word-only in 90 updates of
-  256; `name-quantity` from scratch separating slowly over 150 (see
-  [§5](#one-name-per-meaning-the-innate-lexicon)). Whether the five-field
-  ladder now climbs past quantity at the GPU batch is the next thing to run.
-- **Gestures and the factored listener have not been run on a GPU.** What is
-  verified (`tests/test_gesture.py`): a gesture is a symbol of its own, never a
-  word and never costed; it can only show what its maker can see; the world
-  withdraws it over a naming rung and never allows one in any measurement; the
-  token policy is not credited for the slot and a newborn is never taught to
-  emit one; on a single-field round the factored choice is that field's belief
-  head; the factored listener learns a fixed compositional code supervised;
-  every rung still plays with gestures on; switching gestures off changes no
-  parameter shape. Whether the scaffold gets number words to form in play — and
-  whether the speakers then drop it, as the cost is meant to make them — is
-  what the next run measures, in the report's §3g against the word-only gates.
+- **Whether the speakers drop the gestures.** On 2026-09-29 gestures were used
+  in 31–67% of the rounds that allowed them in the single-field rungs and 7% in
+  `name-all` (report §3g). But every naming rung restarts the gesture share at
+  100% and passes long before its 600-update withdrawal, so no naming rung has
+  yet had to do without them in training.
 
 **Do not relax a promotion criterion to make a run pass.** The thresholds are the
 experiment. Where a threshold was recalibrated here it was because the game
@@ -1856,7 +2131,8 @@ orchard/
   world.py       lots, the barn as rows, the held-out Latin square, the independence property
   economy.py     market days, seasons, lot inventories, replenishment
   env.py         episode mechanics, word parsing, trade resolution, reward
-  agents.py      the randomly-initialised transformer policies
+  agents.py      the randomly-initialised transformer policies, the innate reader
+                 (words -> word classes -> attributes) and the innate concepts
   batched.py     the tensor world and reward the training loop uses
   rollout.py     batched play (probes and evaluation)
   gumbel.py      training: straight-through Gumbel channel + REINFORCE decisions
@@ -1864,7 +2140,8 @@ orchard/
                  when the world allows it, what the listener is taught
   curriculum.py  the ladder of rungs, the lineup and report games, and promotion
   conventions.py the population's recent usage: rarity cost, convention bonus;
-                 each speaker's own lexicon and the naming objective (one name per meaning)
+                 each speaker's own lexicon of words and the community's, the naming
+                 objective (one word per meaning), composition and word order
   population.py  ageing, death, birth, generation counting, the role split
   bottleneck.py  iterated learning: frequency-skewed apprenticeship, withheld combinations
   metrics.py     success, topsim, entropy, stability, intelligibility,
@@ -1880,8 +2157,10 @@ orchard/
   hardware.py    device resolution; pins fp32 everywhere
   run.py         the CLI (also --smoke, --benchmark, --resume, --compare)
 configs/         scale presets and named experiments
-tests/           216 tests; test_config.py is the one that keeps the method honest,
-                 test_lots.py the one that keeps the lot layout and its mechanisms honest
+tests/           358 tests; test_config.py is the one that keeps the method honest,
+                 test_lots.py the one that keeps the lot layout and its mechanisms honest,
+                 test_language_faculty.py the one that keeps words, word classes and
+                 composition honest
 sweep.py         the same arm across seeds, because one run proves nothing
 compare_runs.py  two finished runs side by side, from what they recorded
 cloud_run.sh     the GPU launcher: checks the device, picks a folder, auto-resumes

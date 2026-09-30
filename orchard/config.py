@@ -306,6 +306,36 @@ class ModelConfig:
     # three candidates. Off restores the plain candidate pointer (a dot product
     # between the final state and each candidate's summed embedding).
     factored_choice: bool = True
+    # The innate reader: comprehension through a mental lexicon
+    # (`agents.LexicalReader`). The other party's words are segmented where the
+    # medium segments them (SPACE), each word is looked up *out of context* --
+    # the same word means the same thing wherever it appears -- into a word
+    # class (noun, adjective, numeral, or none) and the attribute value it
+    # names, and the attributes of the whole description are assembled from
+    # its words, each attribute from the word that names it. The result is
+    # added to the five belief heads the rest of the listener already reads, so
+    # it informs the lineup choice, the report rungs and trading alike.
+    #
+    # Why: on the 2026-09-29 run every field could be named alone at 0.96-1.00
+    # while whole lots stalled at 0.65 for 1,000 updates. The describers never
+    # put their words together -- a speaker's own name for colour appeared in
+    # 0 of its 760 late whole-lot descriptions, for quality in 0 of 760 -- and a
+    # listener that read everything through one pooled state had no reason to
+    # understand a concatenation it had never heard. A reader that composes
+    # understands "two red apple" the first time, from words it learned one at
+    # a time; that is the half of compositionality comprehension supplies.
+    # Nothing here says which atoms make which word, or which word names what.
+    lexical_reader: bool = True
+    # Innate concepts: the world arrives already sorted into the kinds of thing
+    # the reader's word classes are about -- a fruit is an *object kind*, a
+    # colour or a quality a *property*, a quantity or a price a *magnitude*
+    # (one learned embedding per kind, added to every lot field) -- and
+    # magnitudes sit on a mental number line: each quantity and price is also
+    # embedded through a thermometer code (v >= 1, v >= 2, ...), so 3 and 4
+    # share most of their representation and 3 and 8 little of it, the way
+    # infants' approximate number sense orders numerosities before any
+    # counting word exists. Structure in the concepts, none in the words.
+    innate_concepts: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -605,6 +635,23 @@ class RewardConfig:
     # (`gesture.ostensive_coef`). 0 turns it off.
     lexicon: float = 0.30
     lexicon_min_support: int = 3
+    # ...and a name is short: its bonus is paid in full up to this many atoms
+    # and shared out over the atoms beyond (only where it is positive, so a
+    # speaker with no name yet feels nothing, and the collapse the costs cause
+    # while a word is being invented -- everyone saying the same short
+    # nothing -- has nothing to feed on). Measured locally on 2026-09-30 at
+    # the reference scale: with names judged word by word but not by length,
+    # one speaker named red `a19-a19-a19-a19-a19-a19-a19-a19-a19-a19-a19-a19`
+    # beside `a19` for plum -- the repetition loophole moved from between words
+    # to inside one, since edit distance reads the two as 92% different -- and
+    # words averaged 3.87 atoms. Twelve hyphenated atoms fill a 24-symbol turn:
+    # a name like that can never sit beside another word in a description.
+    # Two atoms leaves room for multi-atom words (the `duality` experiment
+    # needs them) and none for padding. A repetition still counts as a partly
+    # different word (`a19-a19` is half like `a19`): counting it as the same
+    # word closed the quickest way to coin a second word, and colour stayed at
+    # chance on both local runs that tried it (see `conventions._word_similarity`).
+    lexicon_name_atoms: int = 2
     # The bonus compares an utterance with each meaning's *recent form
     # distribution* -- its top few forms, by recent use -- rather than with one
     # modal form. Measured: against the modal form alone, two speakers whose
@@ -637,6 +684,49 @@ class RewardConfig:
     # established name, and word-only success was 0.57 against 0.33 chance --
     # where the run without it had not left chance after 90 updates and the
     # GPU run had taken 1,775.
+    #
+    # Since 2026-09-30 a name is a *word* (atoms joined by hyphens), not a
+    # whole utterance: in a round asking about one field the name is the
+    # utterance's first word, and a speaker is paid for saying it once. The
+    # 2026-09-29 run showed why: judged on whole utterances, one speaker named
+    # banana `a16` and red `a16 a16 a16 ...` twelve times over -- the same
+    # word, which edit distance on the utterance read as two forms 96% apart --
+    # and colour names like that cannot be put next to fruit names at all.
+    # Mutual exclusivity is now judged word by word across every field.
+    #
+    # Describing a thing means naming its parts. In a round that asks for a
+    # whole lot -- `name-all`'s open rounds, each side's lot in `mutual`, a
+    # buyer's request -- the speaker is paid, per field, for including its own
+    # established name for that field's value and charged for including its
+    # name for a *different* value of that field (calling a red apple green):
+    # `compose` x the mean over the five fields. It is the innate lexicon
+    # extended from naming one thing to describing one: a child's first
+    # multi-word utterances ("two red apple") are words it already says alone.
+    # Nothing here says which words, or in what order. Measured on the run that
+    # motivated it: a speaker's own colour name appeared in 0 of its 760 late
+    # whole-lot descriptions and its quality name in 0 of 760 -- the whole-lot
+    # rounds had grown a separate, holistic code (595 words first seen there,
+    # 9% of `name-all`'s words inherited) that carried ~1.4 fields and stalled
+    # at 0.65 against a 0.667 bar for 1,000 updates. 0 turns it off.
+    compose: float = 0.30
+    # Word order is consistent: phrases have a stable internal order, and which
+    # order is learned. For every two fields a description names, the speaker
+    # is paid for putting them in the order it usually does (its recent share
+    # of "f before g", minus a half). Judged pair by pair, so adding a field
+    # never breaks the order of the ones already said -- a whole-sequence
+    # comparison would tax every new word the way the utterance-level
+    # convention bonus did. 0 turns it off.
+    word_order: float = 0.15
+    # In the naming rungs the convention bonus (`convention`) is about *words*:
+    # the community's name for each single meaning, taken over every speaker's
+    # first words, and in a whole-lot round the community's names for the
+    # lot's parts -- the same composition as `compose`, against the community
+    # rather than the speaker. Keyed on whole utterances instead, the bonus paid
+    # each describer for repeating the population's form for that exact lot,
+    # which in `name-all` is the incomplete two-word description of the moment:
+    # utterances grew to 2.66 words and fell back to 1.9 as coherence rose from
+    # 0.13 to 0.47. From `mutual` on the utterance-level bonus is unchanged.
+    convention_words: bool = True
     lexicon_mi: float = 2.0
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
@@ -744,6 +834,13 @@ class CurriculumConfig:
     # symbol slot, word position or bag of words, cross-validated over the
     # probes; see `properties.field_coverage`)
     min_field_coverage: float = 0.30
+    # ...and every field on its own, on the rungs whose job is a whole lot.
+    # A mean lets three covered fields carry two at zero. Measured by
+    # simulation on the real lineup sampler: a flawless code for quality,
+    # quantity and price alone -- no word for fruit or colour -- scored 0.79
+    # success against a 0.667 bar and field coverage 0.60 against 0.30, so the
+    # mean passed the one rung whose job is naming every field.
+    min_field_coverage_each: float = 0.25
     # Share of open lineup rounds that are "hard": one anchor plus near misses of
     # it, each differing in one field (a different field each), target uniform
     # among them, so no field can ride on the others. With three candidates at
@@ -1109,6 +1206,7 @@ SCALE_KEYS = frozenset({
 ARCH_KEYS = frozenset({
     "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
     "model.barn_lookup", "model.factored_choice",
+    "model.lexical_reader", "model.innate_concepts",
     "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
     "world.n_varieties", "world.max_qty", "world.n_quality",
     "world.n_colors", "world.n_price_bins",
@@ -1398,3 +1496,6 @@ def validate(cfg: Config) -> None:
     assert g.anneal_updates >= 0 and g.cost >= 0.0 and g.supervise_coef >= 0.0
     assert g.ostensive_coef >= 0.0
     assert cfg.reward.lexicon >= 0.0 and cfg.reward.lexicon_min_support >= 1
+    assert cfg.reward.lexicon_name_atoms >= 1
+    assert cfg.reward.compose >= 0.0 and cfg.reward.word_order >= 0.0
+    assert 0.0 <= cfg.curriculum.min_field_coverage_each <= 1.0

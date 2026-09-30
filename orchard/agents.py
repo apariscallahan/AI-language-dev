@@ -49,7 +49,191 @@ from .config import Config
 from .env import BUYER, FARMER, speaker_of_turn
 from .gesture import n_token_ids
 from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
-                    N_LOT_FIELDS, QUERY_ALL, n_cells, n_obs_slots, obs_schema)
+                    N_LOT_FIELDS, QUERY_ALL, lot_spans, n_cells, n_obs_slots, obs_schema)
+
+# Innate concepts (`model.innate_concepts`): the kind of thing each field of a lot
+# is. A fruit is an object kind, a colour or a quality a property, a quantity or
+# a price a magnitude -- the semantic categories that nouns, adjectives and
+# numerals are about. Keyed by field kind; a slot that holds no attribute of a
+# lot (the query, padding) has no entry.
+CONCEPT_OBJECT, CONCEPT_PROPERTY, CONCEPT_MAGNITUDE = 0, 1, 2
+CONCEPT_OF_KIND = {K_VARIETY: CONCEPT_OBJECT, K_COLOR: CONCEPT_PROPERTY,
+                   K_QUALITY: CONCEPT_PROPERTY, K_QTY: CONCEPT_MAGNITUDE,
+                   K_PRICE: CONCEPT_MAGNITUDE}
+# The word class that names each field of a lot, in lot order: the fruit is
+# named by a noun, colour and quality by adjectives, quantity and price by
+# numerals.
+WORD_CLASSES = ("noun", "adjective", "numeral", "none")
+CLASS_OF_FIELD = (0, 1, 1, 2, 2)
+
+
+def thermometer(values: torch.Tensor, n_values: int) -> torch.Tensor:
+    """(...,) ints -> (..., n_values - 1) floats: [v >= 1, v >= 2, ...].
+
+    The innate number line's code: two magnitudes share one feature for every
+    step they have in common, so neighbours are alike and extremes are not.
+    """
+    steps = torch.arange(1, n_values, device=values.device)
+    return (values.unsqueeze(-1) >= steps).float()
+
+
+class LexicalReader(nn.Module):
+    """Comprehension through a mental lexicon: words in, attributes out.
+
+    The innate half of the language faculty on the listening side
+    (`model.lexical_reader`). What is innate is the *architecture of
+    understanding*; everything it maps is learned:
+
+    1. **Words are units.** The other party's turn is segmented where the
+       medium segments it -- a word is a run of atoms joined by HYPHENs --
+       and each word is encoded from its own atoms alone, in order, with no
+       context. So a word means the same thing in every utterance it appears
+       in: learned alone ("apple") it is understood in company ("two red
+       apple"). This is also where duality of patterning would live: the
+       atoms are meaningless, the word built from them is not.
+    2. **Words come in classes.** Each word is read as a noun, an adjective, a
+       numeral or none of these, and within its class as naming one attribute
+       -- a noun names the kind of fruit, an adjective the colour or the
+       quality, a numeral the quantity or the price. Which words are nouns is
+       learned; that there are nouns is not.
+    3. **Numerals sit on a number line.** A numeral's meaning is a place on the
+       line and a precision, plus whatever exceptions it learns, so "about
+       four" is as easy to mean as "four", and near misses are near.
+    4. **A description is assembled from its words** (compositional semantics):
+       each attribute is read from the word that names it -- an attention over
+       the words by how strongly each is of that attribute's class, with "no
+       word names it" as an option -- and a missing attribute is left
+       uncertain rather than guessed from the others.
+
+    The output is five log-distributions, one per field of a lot, which the
+    agent adds to its five belief heads (a product of experts with the
+    context-reading transformer). Muted, the reader hears no word and returns
+    uniform distributions, so the channel controls keep their meaning.
+    """
+    MAX_ATOMS = 8            # position-in-word embeddings; longer words share the last
+
+    def __init__(self, cfg: Config, d: int):
+        super().__init__()
+        c = cfg.channel
+        self.atomic_vocab = c.atomic_vocab
+        self.hyphen_id = c.hyphen_id
+        self.spans = lot_spans(cfg.world)
+        self.atom_emb = nn.Embedding(n_token_ids(cfg), d)
+        # position in the word, as a gain on the atom's vector: a7-a2 and
+        # a2-a7 are different words
+        self.slot_gain = nn.Parameter(torch.ones(self.MAX_ATOMS, d))
+        self.norm = nn.LayerNorm(d)
+        self.encode_word = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
+        self.word_class = nn.Linear(d, len(WORD_CLASSES))
+        self.adjective_of = nn.Linear(d, 2)      # colour or quality
+        self.numeral_of = nn.Linear(d, 2)        # quantity or price
+        self.meaning = nn.ModuleList([nn.Linear(d, s) for s in self.spans])
+        self.line_place = nn.Linear(d, 2)        # where on the line (quantity, price)
+        self.line_width = nn.Linear(d, 2)        # how precisely
+        # "no word names this attribute": the score a word has to beat
+        self.unnamed = nn.Parameter(torch.zeros(N_LOT_FIELDS))
+        # how much the listener trusts its reading of the words, per field
+        self.gain = nn.Parameter(torch.ones(N_LOT_FIELDS))
+
+    def reset_innate(self) -> None:
+        """Initial values that are part of the design, set after the generic init.
+
+        A word has to be read as of an attribute's class with some confidence
+        (log p(class) above -2) before it outscores "no word names it"; the
+        number line starts broad (a numeral means "somewhere around here")
+        and sharpens as the word does.
+        """
+        with torch.no_grad():
+            self.slot_gain.copy_(1.0 + 0.1 * torch.randn_like(self.slot_gain))
+            self.unnamed.fill_(-2.0)
+            self.gain.fill_(1.0)
+            self.line_width.bias.fill_(2.0)
+
+    # ------------------------------------------------------------------
+    def segment(self, ids: torch.Tensor, heard: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Where the words are. ``ids`` (B, n) symbol ids, ``heard`` (B, n) bool.
+
+        Returns (atom mask, word index per position, position in word, number
+        of word slots). A word starts at every heard atom that is not joined
+        to the symbol before it by a HYPHEN -- the word grammar makes that
+        exactly "the first atom of the turn, or the first after a SPACE".
+        """
+        atom = heard & (ids < self.atomic_vocab)
+        prev = torch.cat([torch.full_like(ids[:, :1], -1), ids[:, :-1]], dim=1)
+        start = atom & (prev != self.hyphen_id)
+        # Positions before a row's first word get -1, clamped to word 0; none
+        # of them is an atom, so they contribute nothing wherever they point.
+        word = (start.long().cumsum(1) - 1).clamp(min=0)
+        n_words = int(word[atom].max()) + 1 if bool(atom.any()) else 0
+        rank = atom.long().cumsum(1) - 1                     # atoms so far, per position
+        # the rank of each word's first atom; everything that is not a word's
+        # start writes into a spare last column that is never read
+        B = ids.shape[0]
+        spare = torch.full_like(word, n_words)
+        first = torch.zeros((B, n_words + 1), dtype=torch.long, device=ids.device)
+        first = first.scatter(1, torch.where(start, word, spare), rank)
+        pos = (rank - first.gather(1, word)).clamp(0, self.MAX_ATOMS - 1)
+        return atom, word, pos, n_words
+
+    def forward(self, dialogue: torch.Tensor, ids: torch.Tensor,
+                heard: torch.Tensor) -> Optional[tuple[torch.Tensor, ...]]:
+        """Five (B, span) log-distributions, or None if nothing was said at all.
+
+        ``dialogue`` (B, D) ids or (B, D, V) one-hot weights (the straight-
+        through channel's, which is how a gradient reaches the speaker's
+        atoms); ``ids`` (B, D) the same symbols as ids; ``heard`` (D,) bool,
+        the dialogue slots the *other* party produced.
+        """
+        B, D = ids.shape
+        heard = heard[:D].to(ids.device).unsqueeze(0).expand(B, D)
+        if not bool((heard & (ids < self.atomic_vocab)).any()):
+            return None
+        # read no further than the last atom anyone heard in this batch
+        used = int(((heard & (ids < self.atomic_vocab)).any(0)).nonzero().max()) + 1
+        ids, heard = ids[:, :used], heard[:, :used]
+        dialogue = dialogue[:, :used]
+        atom, word, pos, W = self.segment(ids, heard)
+        d = self.atom_emb.embedding_dim
+        if dialogue.dtype == torch.long:
+            vec = self.atom_emb(dialogue)
+        else:
+            vec = dialogue @ self.atom_emb.weight
+        vec = vec * self.slot_gain[pos] * atom.unsqueeze(-1).float()
+        words = torch.zeros((B, W, d), device=ids.device, dtype=vec.dtype)
+        words = words.scatter_add(1, word.unsqueeze(-1).expand(-1, -1, d), vec)
+        # which word slots hold a word in this row (atoms counted per slot)
+        exists = torch.zeros((B, W), device=ids.device).scatter_add(1, word, atom.float()) > 0
+        v = self.encode_word(self.norm(words))                       # (B, W, d)
+
+        # word class, then which attribute within the class
+        cls = F.log_softmax(self.word_class(v), dim=-1)
+        adj = F.log_softmax(self.adjective_of(v), dim=-1)
+        num = F.log_softmax(self.numeral_of(v), dim=-1)
+        of_field = torch.stack([cls[..., 0],
+                                cls[..., 1] + adj[..., 0], cls[..., 1] + adj[..., 1],
+                                cls[..., 2] + num[..., 0], cls[..., 2] + num[..., 1]],
+                               dim=-1)                                # (B, W, 5)
+        of_field = of_field.masked_fill(~exists.unsqueeze(-1), float("-inf"))
+        none = self.unnamed.view(1, 1, N_LOT_FIELDS).expand(B, 1, N_LOT_FIELDS)
+        attend = F.log_softmax(torch.cat([of_field, none], dim=1), dim=1)   # (B, W+1, 5)
+
+        out = []
+        line_at = torch.sigmoid(self.line_place(v))                  # (B, W, 2)
+        line_w = F.softplus(self.line_width(v)) + 0.3
+        for f, span in enumerate(self.spans):
+            lg = self.meaning[f](v)                                  # (B, W, span)
+            if CLASS_OF_FIELD[f] == 2:                               # a numeral
+                j = f - 3
+                grid = torch.arange(span, device=ids.device, dtype=lg.dtype)
+                mu = line_at[..., j].unsqueeze(-1) * (span - 1)
+                width = line_w[..., j].unsqueeze(-1)
+                lg = lg - 0.5 * ((grid - mu) / width) ** 2
+            lp = F.log_softmax(lg, dim=-1)
+            flat = torch.full((B, 1, span), -math.log(span), device=ids.device, dtype=lp.dtype)
+            lp = torch.cat([lp, flat], dim=1)                        # (B, W+1, span)
+            out.append(torch.logsumexp(attend[..., f].unsqueeze(-1) + lp, dim=1))
+        return tuple(out)
 
 # Sequence layout.  The number of observation slots is whatever the world's
 # schema needs (a farm with several varieties has more to look at than a buyer
@@ -195,6 +379,19 @@ class CommNet(nn.Module):
         self.n_cells = n_cells(w)
         self.lookup_q = nn.Linear(d, d)
         self.lookup_out = nn.Linear(d, d)
+        # The innate reader (`model.lexical_reader`): the other party's words,
+        # read one at a time out of context into the attributes they name, and
+        # added to the five belief heads above.
+        self.lexical = bool(m.lexical_reader)
+        if self.lexical:
+            self.reader = LexicalReader(cfg, d)
+        # Innate concepts (`model.innate_concepts`): the kind of thing each lot
+        # field is, and a number line under quantities and prices.
+        self.innate_concepts = bool(m.innate_concepts)
+        if self.innate_concepts:
+            self.concept_emb = nn.Embedding(3, d)
+            self.qty_line = nn.Linear(w.max_qty, d, bias=False)
+            self.price_line = nn.Linear(max(1, w.n_price_bins - 1), d, bias=False)
 
         self.register_buffer("_self_mask", speaker_self_mask(cfg, role), persistent=False)
         causal = torch.triu(torch.full((self.seq_len, self.seq_len), float("-inf")), diagonal=1)
@@ -206,6 +403,13 @@ class CommNet(nn.Module):
         # network for hundreds of steps. At a tenth of the usual gain it perturbs
         # a hidden state of norm ~sqrt(d) by a few percent and learns at once.
         nn.init.xavier_uniform_(self.lookup_out.weight, gain=0.1)
+        if self.lexical:
+            self.reader.reset_innate()
+        if self.innate_concepts:
+            # On the embeddings' scale, so the number line orders the values
+            # without drowning which field the slot holds.
+            nn.init.normal_(self.qty_line.weight, mean=0.0, std=0.02)
+            nn.init.normal_(self.price_line.weight, mean=0.0, std=0.02)
 
     @staticmethod
     def _init(mod: nn.Module) -> None:
@@ -215,6 +419,22 @@ class CommNet(nn.Module):
             nn.init.xavier_uniform_(mod.weight)
             if mod.bias is not None:
                 nn.init.zeros_(mod.bias)
+
+    def _table(self, kind: int) -> nn.Embedding:
+        return {K_VARIETY: self.variety_emb, K_QTY: self.qty_emb,
+                K_QUALITY: self.quality_emb, K_PRICE: self.price_emb,
+                K_COLOR: self.color_emb, K_FIELD: self.field_emb}[kind]
+
+    def field_embed(self, kind: int, values: torch.Tensor) -> torch.Tensor:
+        """The embedding of a field value: its learned vector, plus -- for a
+        magnitude, with `model.innate_concepts` -- its place on the number line."""
+        table = self._table(kind)
+        vec = table(values)
+        if self.innate_concepts and kind == K_QTY:
+            vec = vec + self.qty_line(thermometer(values, table.num_embeddings))
+        elif self.innate_concepts and kind == K_PRICE:
+            vec = vec + self.price_line(thermometer(values, table.num_embeddings))
+        return vec
 
     def is_barn(self, schema: "list[int] | None") -> bool:
         """Does this observation layout hold the farmer's barn (lot rows)?"""
@@ -235,7 +455,7 @@ class CommNet(nn.Module):
         B = obs.shape[0]
         rows = obs[:, :4 * self.n_cells].reshape(B, self.n_cells, 4)
         key = self.variety_emb(rows[:, :, 0]) + self.color_emb(rows[:, :, 1])   # (B,C,d)
-        val = self.quality_emb(rows[:, :, 2]) + self.qty_emb(rows[:, :, 3])
+        val = self.quality_emb(rows[:, :, 2]) + self.field_embed(K_QTY, rows[:, :, 3])
         q = self.lookup_q(h)                                                    # (B,L,d)
         att = torch.softmax(torch.bmm(q, key.transpose(1, 2)) / math.sqrt(self.d_model),
                             dim=-1)                                             # (B,L,C)
@@ -275,15 +495,14 @@ class CommNet(nn.Module):
         bos = self.slot_emb.weight[SLOT_BOS] + self.role_emb.weight[self.role]
         parts.append(bos.expand(B, 1, d))
 
-        tables = {K_VARIETY: self.variety_emb, K_QTY: self.qty_emb,
-                  K_QUALITY: self.quality_emb, K_PRICE: self.price_emb,
-                  K_COLOR: self.color_emb, K_FIELD: self.field_emb}
         cols = []
         for i, kind in enumerate(schema if schema is not None else self.schema):
             if kind == K_EMPTY:
                 vec = self.empty_emb.weight[0].expand(B, d)
             else:
-                vec = tables[kind](obs[:, i])
+                vec = self.field_embed(kind, obs[:, i])
+                if self.innate_concepts and kind in CONCEPT_OF_KIND:
+                    vec = vec + self.concept_emb.weight[CONCEPT_OF_KIND[kind]]
             cols.append(vec
                         + self.slot_emb.weight[N_FIXED_SLOT_TYPES + kind]
                         + self.obs_pos_emb.weight[i])
@@ -342,23 +561,39 @@ class CommNet(nn.Module):
                         self_mask=self_mask)[:, -1]
         return self.token_head(h), self.value_head(h).squeeze(-1)
 
+    def read_words(self, dialogue: torch.Tensor, ids: Optional[torch.Tensor] = None,
+                   self_mask: Optional[torch.Tensor] = None
+                   ) -> Optional[tuple[torch.Tensor, ...]]:
+        """What the other party's words say about each field of a lot, read by
+        the innate reader -- five log-distributions -- or None (reader off, or
+        nothing heard). ``dialogue`` is (B, D) ids or (B, D, V) soft one-hots,
+        in which case ``ids`` gives the same symbols as ids."""
+        if not self.lexical:
+            return None
+        if ids is None:
+            ids = dialogue if dialogue.dtype == torch.long else dialogue.argmax(-1)
+        mine = self._self_mask if self_mask is None else self_mask
+        return self.reader(dialogue, ids, ~mine.to(ids.device))
+
     def decision_logits(self, obs: torch.Tensor, tokens: torch.Tensor, schema=None,
                         self_mask=None):
         """Every discrete head, then the value.  Order matches curriculum.py's
         head indices, so callers can slice the first N_HEADS and trust it."""
         h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)[:, -1]
-        return self.all_heads(h, obs) + (self.value_head(h).squeeze(-1),)
+        lex = self.read_words(tokens, None, self_mask)
+        return self.all_heads(h, obs, lex) + (self.value_head(h).squeeze(-1),)
 
     def decision_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return (self.accept_head(h), self.variety_head(h),
                 self.decide_qty_head(h), self.decide_price_head(h))
 
-    def belief_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return (self.belief_variety_head(h), self.belief_qty_head(h),
-                self.belief_quality_head(h), self.belief_price_head(h))
+    def belief_heads(self, h: torch.Tensor, lex=None) -> tuple[torch.Tensor, ...]:
+        """The H_BELIEF heads: (fruit, quantity, quality, price)."""
+        r = self.report_logits(h, lex)
+        return (r[0], r[3], r[2], r[4])
 
-    def report_color(self, h: torch.Tensor) -> torch.Tensor:
-        return self.belief_color_head(h)
+    def report_color(self, h: torch.Tensor, lex=None) -> torch.Tensor:
+        return self.report_logits(h, lex)[1]
 
     def candidate_embeddings(self, obs: torch.Tensor) -> torch.Tensor:
         """(B, K, d) -- each lineup candidate embedded from its own five fields.
@@ -372,8 +607,7 @@ class CommNet(nn.Module):
         """
         K = self.n_candidates
         W = N_LOT_FIELDS
-        tables = (self.variety_emb, self.color_emb, self.quality_emb, self.qty_emb,
-                  self.price_emb)
+        kinds = (K_VARIETY, K_COLOR, K_QUALITY, K_QTY, K_PRICE)
         vecs = []
         for k in range(K):
             i = W * k
@@ -387,19 +621,31 @@ class CommNet(nn.Module):
             # have to know which phase it is in.
             # a candidate is a lot: (fruit, colour, quality, quantity, price)
             vec = None
-            for j, table in enumerate(tables):
-                e = table(obs[:, i + j].clamp(0, table.num_embeddings - 1))
+            for j, kind in enumerate(kinds):
+                n = self._table(kind).num_embeddings
+                e = self.field_embed(kind, obs[:, i + j].clamp(0, n - 1))
                 vec = e if vec is None else vec + e
             vecs.append(vec)
         return torch.stack(vecs, dim=1)
 
-    def report_logits(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """The five belief heads in lot order: fruit, colour, quality, quantity, price."""
-        return (self.belief_variety_head(h), self.belief_color_head(h),
-                self.belief_quality_head(h), self.belief_qty_head(h),
-                self.belief_price_head(h))
+    def report_logits(self, h: torch.Tensor, lex=None) -> tuple[torch.Tensor, ...]:
+        """The five belief heads in lot order: fruit, colour, quality, quantity, price.
 
-    def choice_logits(self, h_last: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+        ``lex`` is the innate reader's reading of the other party's words
+        (:meth:`read_words`), added to each head: the transformer's reading of
+        the whole context and the lexicon's reading of the words, as a product
+        of experts. None leaves the heads as the transformer alone reads them.
+        """
+        out = (self.belief_variety_head(h), self.belief_color_head(h),
+               self.belief_quality_head(h), self.belief_qty_head(h),
+               self.belief_price_head(h))
+        if lex is None:
+            return out
+        g = self.reader.gain
+        return tuple(o + g[j] * lex[j] for j, o in enumerate(out))
+
+    def choice_logits(self, h_last: torch.Tensor, obs: torch.Tensor, lex=None,
+                      rep: Optional[tuple] = None) -> torch.Tensor:
         """(B, K) -- how well each candidate matches what was just heard.
 
         Two listeners, chosen by ``model.factored_choice``.
@@ -428,7 +674,7 @@ class CommNet(nn.Module):
         W = N_LOT_FIELDS
         B = h_last.shape[0]
         scores = h_last.new_zeros((B, K))
-        heads = self.report_logits(h_last)
+        heads = rep if rep is not None else self.report_logits(h_last, lex)
         for k in range(K):
             i = W * k
             if i + W - 1 >= obs.shape[1]:
@@ -441,13 +687,19 @@ class CommNet(nn.Module):
                 scores[:, k] = scores[:, k] + lp.gather(-1, v.unsqueeze(-1)).squeeze(-1)
         return scores
 
-    def all_heads(self, h: torch.Tensor, obs: Optional[torch.Tensor] = None
-                  ) -> tuple[torch.Tensor, ...]:
-        """Every discrete output, in the fixed order curriculum.py indexes."""
-        choice = (self.choice_logits(h, obs) if obs is not None
+    def all_heads(self, h: torch.Tensor, obs: Optional[torch.Tensor] = None,
+                  lex=None) -> tuple[torch.Tensor, ...]:
+        """Every discrete output, in the fixed order curriculum.py indexes.
+
+        ``lex`` (:meth:`read_words`) is the innate reader's reading of what the
+        other party said; the five belief heads -- and the lineup choice, which
+        is read through them -- include it.
+        """
+        rep = self.report_logits(h, lex)
+        choice = (self.choice_logits(h, obs, rep=rep) if obs is not None
                   else h.new_zeros((h.shape[0], self.n_candidates)))
-        return (self.decision_heads(h) + self.belief_heads(h) + (choice,)
-                + (self.report_color(h),))
+        return (self.decision_heads(h) + (rep[0], rep[3], rep[2], rep[4]) + (choice,)
+                + (rep[1],))
 
     def full_pass(self, obs: torch.Tensor, tokens: torch.Tensor,
                   read_positions: torch.Tensor, schema=None, self_mask=None):
@@ -463,7 +715,7 @@ class CommNet(nn.Module):
         tok_logits = self.token_head(hr)                    # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)
         hd = h[:, -1]
-        dec = self.all_heads(hd, obs)
+        dec = self.all_heads(hd, obs, self.read_words(tokens, None, self_mask))
         dec_value = self.value_head(hd).squeeze(-1)
         return tok_logits, tok_values, dec, dec_value
 

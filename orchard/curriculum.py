@@ -806,6 +806,15 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
                 cov == cov and cov >= c.min_field_coverage,
                 "%s of each field's information on average, need %.2f"
                 % (_fmt(cov), c.min_field_coverage))
+            # ...and each field on its own: a mean lets three carry two at zero
+            each = [_num(x) for x in (d.get("per_field_coverage") or [])]
+            if c.min_field_coverage_each > 0:
+                checks["%s describes: names each field" % label] = (
+                    len(each) == N_LOT_FIELDS
+                    and all(x == x and x >= c.min_field_coverage_each for x in each),
+                    "[%s], need %.2f each" % (
+                        ", ".join("%s %s" % (LOT_FIELDS[i], _fmt(x)) for i, x in enumerate(each))
+                        or "not measured", c.min_field_coverage_each))
         # the view in which this role is the one that has to decode
         view = next((v for v in ev.get("views", [])
                      if v.get("guesser") == label), {})
@@ -828,6 +837,12 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     for kind in phase.rehearsed:
         d = by_kind.get(kind, by_kind.get(str(kind)))
         if not d:
+            # Unmeasured is not passed. This used to `continue`, and the light
+            # check -- which promoted most rungs -- never measured the kinds at
+            # all, so no rung promoted between checkpoints was ever checked for
+            # forgetting (name-quality, name-quantity and name-price on the
+            # 2026-09-29 run).
+            checks["still names %s" % ROUND_NAMES[kind]] = (False, "not measured")
             continue
         s, ch = _num(d.get("success")), round_chance(cfg, kind)
         # A detector for forgetting, not a second promotion: the kind was
@@ -1119,6 +1134,35 @@ class ReferentialWorld:
                                              generator=self.gen)
         return perm, target
 
+    def _combo_round(self, n: int, held_out: bool) -> tuple:
+        """Candidates that differ only in their (fruit, colour, quality) combination.
+
+        The productivity test's round. Every candidate takes the same quantity
+        and price, so only the fields a reserved combination is made of can
+        tell them apart, and every candidate is a distinct combination from
+        the same pool -- all reserved, or all trained -- so neither novelty nor
+        a field that is never held out gives the target away. The earlier
+        held-out round drew candidates independently, which almost always
+        differ in quantity and price: measured on this sampler, a flawless
+        code for quantity and price *alone* scored 0.98 on reserved
+        combinations against 0.69 on trained ones, a "productivity" ratio of
+        1.43, without a word for fruit, colour or quality. Here it scores
+        chance on both, and a code that names the combination scores in full.
+        """
+        K = self._n_candidates(None)
+        pool = self.held_combos if held_out else self.train_combos
+        if pool.shape[0] < K:
+            pool = self.train_combos
+        P = pool.shape[0]
+        pick = torch.rand(n, P, device=self.device, generator=self.gen).argsort(dim=1)[:, :K]
+        combos = pool[pick]                                          # (n, K, 3), distinct
+        qty = torch.randint(0, self.spans[3], (n, 1), device=self.device, generator=self.gen)
+        price = torch.randint(0, self.spans[4], (n, 1), device=self.device, generator=self.gen)
+        cand = torch.cat([combos, qty.expand(n, K).unsqueeze(-1),
+                          price.expand(n, K).unsqueeze(-1)], dim=-1)
+        target = torch.randint(0, K, (n,), device=self.device, generator=self.gen)
+        return cand, target
+
     def _dedup(self, cand: torch.Tensor, target: torch.Tensor,
                held_out: bool = False) -> torch.Tensor:
         """Every candidate distinct, and -- in training -- none of them reserved.
@@ -1186,14 +1230,16 @@ class ReferentialWorld:
 
     def sample(self, n: int, informer: int = FARMER, held_out: bool = False,
                hard_frac: Optional[float] = None, mix: "tuple | None" = None,
-               query: "int | None" = None, mixed_query: bool = False
-               ) -> ReferentialBatch:
+               query: "int | None" = None, mixed_query: bool = False,
+               combo_only: bool = False) -> ReferentialBatch:
         """One batch of lineup rounds, mixed as the rung asks.
 
         ``mix`` weights the kinds of round -- one per lot field, then all fields
         -- and is how a rung adds a field without dropping the ones below it.
         ``query`` forces a single kind (used by the probes, which ask about one
-        field at a time).
+        field at a time). ``combo_only`` draws every whole-lot round as the
+        productivity test's (:meth:`_combo_round`): candidates that share
+        quantity and price and differ in their combination.
         """
         if query is not None:
             mix = tuple(1.0 if i == int(query) else 0.0 for i in range(N_KINDS))
@@ -1217,7 +1263,9 @@ class ReferentialWorld:
             if k <= 0:
                 continue
             sl = slice(at, at + k)
-            if kind == ASK_ALL:
+            if kind == ASK_ALL and combo_only:
+                c, t = self._combo_round(k, held_out)
+            elif kind == ASK_ALL:
                 p = (self.cfg.curriculum.hard_distractor_frac if hard_frac is None
                      else hard_frac)
                 c, t = self._open_round(k, held_out, 0.0 if held_out else p)

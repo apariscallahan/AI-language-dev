@@ -448,3 +448,13 @@ class UpdateStats:
     # under the speakers' own policies (nats) plus the mean pairwise separation
     # of the meanings' distributions (0..1), averaged over speaking roles
     naming_signal: float = 0.0
+    # describing a whole lot (`reward.compose`, `reward.word_order`): how many
+    # descriptions there were, the mean composition bonus, the share of the
+    # lots' fields a describer named with its own established word, and the
+    # share of named field pairs said in the describer's usual order
+    # (meaningful only where `descriptions` / `order_pairs` are non-zero)
+    descriptions: int = 0
+    compose_bonus: float = 0.0
+    names_reused: float = 0.0
+    order_pairs: int = 0
+    order_agreement: float = 0.0
