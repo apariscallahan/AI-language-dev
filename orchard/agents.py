@@ -118,10 +118,13 @@ class LexicalSpeaker(nn.Module):
     # on, their token heads had learned it so hard that descriptions ran to 8.5
     # words. At 5.0 both said exactly five words, one per part, by update 50.
     GO_ON_INIT = 5.0
-    # How strongly a part already named in this turn is passed over when
-    # choosing the part to name next (inhibition of return), in attention
-    # logits. Learned from there.
+    # Describing a whole lot, how strongly a part already named in this turn is
+    # passed over when choosing the part the next *word* names (inhibition of
+    # return), in attention logits. Learned from there.
     INHIBIT_INIT = 4.0
+    # Asked about one field, how strongly the lexicon attends to that field, in
+    # attention logits: answer the question you were asked. Learned from there.
+    ASK_INIT = 4.0
 
     def __init__(self, cfg: Config, d: int):
         super().__init__()
@@ -133,6 +136,7 @@ class LexicalSpeaker(nn.Module):
         self.gain = nn.Parameter(torch.ones(()))
         self.go_on = nn.Parameter(torch.tensor(self.GO_ON_INIT))
         self.inhibit = nn.Parameter(torch.tensor(self.INHIBIT_INIT))
+        self.ask = nn.Parameter(torch.tensor(self.ASK_INIT))
         push = torch.zeros(self.n_emittable)
         push[cfg.channel.end_id] = -1.0
         push[cfg.channel.space_id] = 1.0
@@ -145,25 +149,48 @@ class LexicalSpeaker(nn.Module):
         return self.say(self.norm(concepts)).argmax(-1)
 
     def forward(self, h: torch.Tensor, concepts: torch.Tensor,
-                said: Optional[torch.Tensor] = None
+                avoid: Optional[torch.Tensor] = None,
+                asked: Optional[torch.Tensor] = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """``h`` (B, d) or (B, K, d) hidden states, ``concepts`` (B, 5, d);
-        ``said`` ((B, 5) or (B, K, 5)) the parts already named in this turn.
+        ``avoid`` ((B, 5) or (B, K, 5)) parts to pass over -- describing a
+        whole lot, the ones this turn has already named, when a new word
+        starts (:meth:`CommNet.turn_so_far`); ``asked`` (B, 5) the field the
+        question asks about, if it asks about one.
 
         Returns token-logit contributions (h's shape with n_emittable last;
         zero on everything but atoms) and the attention over the five parts.
-        A part already named is passed over when choosing the next (``inhibit``):
-        made to go on without it, speakers named a second part and then said
-        its word again until the turn's cap -- `a11 a28 a28 a28 a28`.
+
+        Asked about one field, the lexicon attends to it (``ask``): it used
+        not to look at the question at all, so in `name-color` it went on
+        naming the fruit it had learned to name in `name-fruit`, and the colour
+        could only be reached further along -- words carried the fruit as well
+        as the colour (fruit 0.66 against colour 0.51 of each field's
+        information in colour rounds, on the 2026-10-01 GPU run), the same
+        word served a fruit and a colour (4 distinct names for 8 meanings),
+        and by `name-quantity` words were 11 atoms long.
+
+        Describing a whole lot, a part already named is passed over when a
+        new word starts (``inhibit``): pushed on without it, speakers named a
+        second part and then said its word again until the turn's cap --
+        `a11 a28 a28 a28 a28`. Only at a word's start, and only for a whole
+        lot: applied inside words and to one-field questions, it pushed a
+        word's second atom onto another part, so the words became chains of
+        parts, and a speaker that pointed at the quantity was pushed to say
+        anything but the quantity -- the point-and-say lesson the quantity
+        words form on.
         """
         squeeze = h.dim() == 2
         if squeeze:
             h = h.unsqueeze(1)                                           # (B, 1, d)
         q = self.query(h)                                                # (B, K, d)
         scores = torch.einsum("bkd,bfd->bkf", q, concepts) / math.sqrt(q.shape[-1])
-        if said is not None:
-            said = said.to(scores.dtype)
-            scores = scores - self.inhibit * (said.unsqueeze(1) if said.dim() == 2 else said)
+        if asked is not None:
+            asked = asked.to(scores.dtype)
+            scores = scores + self.ask * (asked.unsqueeze(1) if asked.dim() == 2 else asked)
+        if avoid is not None:
+            avoid = avoid.to(scores.dtype)
+            scores = scores - self.inhibit * (avoid.unsqueeze(1) if avoid.dim() == 2 else avoid)
         att = torch.softmax(scores, dim=-1)                              # (B, K, 5)
         mix = torch.einsum("bkf,bfd->bkd", att, concepts)                 # (B, K, d)
         atoms = self.gain * self.say(self.norm(mix))                      # (B, K, A)
@@ -710,9 +737,10 @@ class CommNet(nn.Module):
         """Token logits from hidden state(s) ``h`` ((B, d) or (B, K, d)): the
         token head's, plus -- with `model.lexical_speaker`, describing a lot --
         the mental lexicon's word for the part being named (:class:`LexicalSpeaker`).
-        ``turn`` is (push, said) from :meth:`turn_so_far`: which parts this
-        turn has named (passed over when choosing the next), and whether a
-        whole thing is being described with parts of it still unnamed (there
+        The question (the observation's query slot) is read here: asked
+        about one field, the lexicon attends to it. ``turn`` is (push, avoid)
+        from :meth:`turn_so_far`: describing a whole lot, the parts to pass
+        over as a new word starts, and whether parts are still unnamed (there
         ending loses ``go_on`` nats to going on). Every place that emits or
         scores a symbol reads this, so generation, evaluation and a newborn's
         lessons agree."""
@@ -721,8 +749,11 @@ class CommNet(nn.Module):
             concepts = self.lot_concepts(obs, schema)
             if concepts is not None:
                 lex = self.speaker_lexicon
-                push, said = turn if turn is not None else (None, None)
-                logits = logits + lex(h, concepts, said)[0]
+                push, avoid = turn if turn is not None else (None, None)
+                q = obs[:, N_LOT_FIELDS]
+                asked = (F.one_hot(q.clamp(0, N_LOT_FIELDS - 1), N_LOT_FIELDS)
+                         * (q < QUERY_ALL).unsqueeze(-1))
+                logits = logits + lex(h, concepts, avoid, asked)[0]
                 if push is not None:
                     logits = logits + (lex.go_on * push.to(logits.dtype)).unsqueeze(-1) * lex._push
         return logits
@@ -736,9 +767,12 @@ class CommNet(nn.Module):
     @torch.no_grad()
     def turn_so_far(self, obs: torch.Tensor, schema, tokens: torch.Tensor,
                     positions: Sequence[int]) -> Optional[tuple]:
-        """(push (B, P) bool, said (B, P, 5) bool) before each dialogue position
-        in ``positions``: which parts of the lot this turn has named, and is
-        this speaker describing a whole lot with some of them still unnamed?
+        """(push (B, P) bool, avoid (B, P, 5) bool) before each dialogue
+        position in ``positions``: is this speaker describing a whole lot with
+        some of its parts still unnamed, and -- if a new word starts there --
+        which parts has the turn already named? Both are empty for a question
+        about one field: there the speaker names the field it was asked about,
+        however many atoms its word has, and whatever it pointed at.
 
         The innate pragmatics of the production side -- say as much as the
         question asks (Grice's maxim of quantity). The speaker sees the question
@@ -791,7 +825,13 @@ class CommNet(nn.Module):
         n_words = cs_s[:, pos] - cs_s[:, t0]                              # (B, P)
         unnamed = N_LOT_FIELDS - said.sum(-1)
         push = whole.unsqueeze(1) & (unnamed > 0) & (n_words >= 1) & (n_words < N_LOT_FIELDS)
-        return push, said
+        # a new word starts where the symbol before is not a hyphen (the turn's
+        # start, a space, a gesture); inside a word the part stays the same
+        prev = torch.where(pos > t0, tokens[:, (pos - 1).clamp(min=0)],
+                           torch.full_like(tokens[:, :1], c.pad_id).expand(B, pos.numel()))
+        new_word = prev != c.hyphen_id
+        avoid = said & (whole.unsqueeze(1) & new_word).unsqueeze(-1)
+        return push, avoid
 
     def next_token_logits(self, obs: torch.Tensor, tokens: torch.Tensor,
                           seq_pos: int, schema=None, self_mask=None

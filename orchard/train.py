@@ -68,7 +68,8 @@ def expected_generations(cfg: Config) -> float:
 # Parameters added to a brain after snapshots of it existed, each of which has
 # an innate starting value: a snapshot without one resumes with that value
 # instead of being refused.
-LATE_PARAMETERS = frozenset({"speaker_lexicon.go_on", "speaker_lexicon.inhibit"})
+LATE_PARAMETERS = frozenset({"speaker_lexicon.go_on", "speaker_lexicon.inhibit",
+                             "speaker_lexicon.ask"})
 
 
 @dataclass

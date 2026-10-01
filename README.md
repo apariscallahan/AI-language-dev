@@ -1033,7 +1033,8 @@ to the agents.**
 | words are read one at a time, as nouns, adjectives or numerals | `model.lexical_reader` (`agents.LexicalReader`) | a listener understands a combination of words it learned one at a time |
 | a thing's parts are named through one mental lexicon | `model.lexical_speaker` (`agents.LexicalSpeaker`) | a speaker says the word it learned for a part wherever it names that part, alone or in a description |
 | say as much as the question asks | inside the production lexicon (`CommNet.turn_so_far`, `go_on`) | asked about a whole lot, a speaker is pushed past its first word while parts are unnamed; asked about one field, never |
-| a part once named is passed over | inside the production lexicon (`inhibit`) | the next word goes to a part not yet named, instead of the last one again |
+| a part once named is passed over | inside the production lexicon (`inhibit`) | describing a whole lot, the next word goes to a part not yet named, instead of the last one again |
+| answer the question asked | inside the production lexicon (`ask`) | asked about one field, the lexicon names that field |
 | numerals sit on a number line | inside the reader, and `model.innate_concepts` | numbers are magnitudes: 3 is near 4 and far from 8, in perception and in word meaning |
 | a fruit is an object, colour and quality properties, number magnitudes | `model.innate_concepts` | concepts arrive sorted into the kinds that nouns, adjectives and numerals name |
 
@@ -1219,9 +1220,33 @@ the first checkpoint ([§11](#11-findings-with-the-evidence), item 15).
 does: a speaker named a second part and then said that part's word again until
 the five-word cap, `a11 a28 a28 a28 a28`, because nothing told its choice of part
 what it had already said. The production lexicon now knows (the same record the
-push reads), and a part already named in the turn loses `inhibit` (4.0 at
-birth, learned) from its attention score: inhibition of return, the coverage
-idea from machine translation, and the plainest reading of "don't say it twice".
+push reads): describing a whole lot, when a new word starts, a part already
+named in the turn loses `inhibit` (4.0 at birth, learned) from its attention
+score. That is inhibition of return, the coverage idea from machine translation,
+and the plainest reading of "don't say it twice".
+
+**Answer the question asked.** The first GPU run with the two pieces above
+(2026-10-01) learned every single word, `name-fruit` in 100 updates as before,
+but its words went wrong from `name-color` on, and the pieces were the cause:
+
+- The production lexicon never looked at the question. Asked about a colour, it
+  went on naming the fruit it had learned to name in `name-fruit`. One speaker
+  had 4 distinct names for 8 meanings, and the colour answers carried the fruit
+  (0.66 of its information) better than the colour (0.51).
+- Inhibition of return acted everywhere, inside words and on one-field
+  questions. A word's second atom was pushed onto another part, so the only way
+  to reach the asked part was to walk through the others inside one word: atoms
+  per word went 1.0, 3.7, 3.7, then 11.2 at `name-quantity`, with the quantity
+  barely in it (0.10) and success at chance.
+- A gesture counts as naming its part, so a speaker that pointed at the
+  quantity was steered to say anything but the quantity, which is the
+  point-and-say lesson the quantity words form on.
+
+Now, asked about one field, the lexicon's attention to that field gets `ask`
+(4.0 at birth, learned): at birth it attends there 93% of the time, so the first
+atom of an answer comes from the asked field's own concept. Inhibition of return
+applies only when a new word starts in a whole-lot description; inside a word,
+and on any one-field question, nothing is passed over.
 
 **Names and word order keep their own clocks.** The speakers' lexicons learn
 names only from one-field rounds, which end with the naming rungs, and word

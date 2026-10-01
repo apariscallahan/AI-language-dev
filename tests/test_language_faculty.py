@@ -600,6 +600,74 @@ class TestTheSpeakersLexicon(unittest.TestCase):
         self.assertEqual(tuple(turn[1].shape), (64, 1, N_LOT_FIELDS))
         self.assertTrue(lex.inhibit.requires_grad)
 
+    def test_asked_about_one_field_it_names_that_field(self):
+        """Answer the question asked. The lexicon used not to look at the
+        question, so in `name-color` it went on naming the fruit it learned in
+        `name-fruit`; the 2026-10-01 GPU run's colour answers carried the fruit
+        (0.66) better than the colour (0.51), and by `name-quantity` words were
+        11 atoms long, walking through the parts to reach the one asked."""
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        c = cfg.channel
+        torch.manual_seed(3)
+        net = CommNet(cfg, FARMER)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(3))
+        ph = phase_named(cfg, "name-color").with_informer(FARMER)
+        schema = phase_schema(cfg, FARMER, ph)
+        lex = net.speaker_lexicon
+        silent = torch.full((128, c.dialogue_len), c.pad_id, dtype=torch.long)
+        for q in range(N_LOT_FIELDS):
+            obs = rw.sample(128, informer=FARMER, query=q).obs(cfg, FARMER)
+            asked = F.one_hot(obs[:, N_LOT_FIELDS].clamp(max=N_LOT_FIELDS - 1), N_LOT_FIELDS)
+            with torch.no_grad():
+                h = torch.randn(128, cfg.model.d_model)
+                _, att = lex(h, net.lot_concepts(obs, schema), None, asked)
+            self.assertGreater(float(att[:, q].mean()), 0.8,
+                               "asked about field %d, the lexicon looks elsewhere" % q)
+        self.assertTrue(lex.ask.requires_grad)
+        # and speak() reads the question off the observation itself: its
+        # lexical term is the asked field's word
+        obs = rw.sample(128, informer=FARMER, query=3).obs(cfg, FARMER)
+        with torch.no_grad():
+            h = torch.randn(128, cfg.model.d_model)
+            term = net.speak(h, obs, schema) - net.token_head(h)
+            words = lex.part_words(net.lot_concepts(obs, schema))
+        hit = term[:, :c.atomic_vocab].argmax(-1) == words[:, 3]
+        self.assertGreater(float(hit.float().mean()), 0.8)
+
+    def test_a_one_field_answer_is_never_pushed_or_steered_away(self):
+        """Inhibition of return is for choosing the next *word* of a whole-lot
+        description. Inside a word it pushed the second atom onto another part,
+        and on a one-field question it steered a speaker that had pointed at
+        the asked field away from naming it."""
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        c = cfg.channel
+        torch.manual_seed(4)
+        net = CommNet(cfg, FARMER)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(4))
+        ph = phase_named(cfg, "name-quantity").with_informer(FARMER)
+        schema = phase_schema(cfg, FARMER, ph)
+        obs = rw.sample(4, informer=FARMER, query=3).obs(cfg, FARMER)
+        w = net.speaker_lexicon.part_words(net.lot_concepts(obs, schema))
+        toks = torch.full((4, c.dialogue_len), c.pad_id, dtype=torch.long)
+        toks[:, 0] = torch.tensor([gesture_id(cfg, 3, int(v)) for v in obs[:, 3]])
+        toks[:, 1] = w[:, 3]
+        toks[:, 2] = c.hyphen_id
+        push, avoid = net.turn_so_far(obs, schema, toks, [1, 3])
+        self.assertFalse(bool(push.any()))
+        self.assertFalse(bool(avoid.any()), "pointing at the quantity steered the words off it")
+        # describing a whole lot: inside a word nothing is avoided, a new word
+        # passes over what the turn has named
+        whole = rw.sample(2, informer=FARMER, query=ASK_ALL).obs(cfg, FARMER)
+        w = net.speaker_lexicon.part_words(net.lot_concepts(whole, schema))
+        toks = torch.full((2, c.dialogue_len), c.pad_id, dtype=torch.long)
+        toks[0, :2] = torch.tensor([int(w[0, 0]), c.hyphen_id])
+        toks[1, :2] = torch.tensor([int(w[1, 0]), c.space_id])
+        _, avoid = net.turn_so_far(whole, schema, toks, [2])
+        self.assertFalse(bool(avoid[0].any()), "inside a word the part stays the same")
+        self.assertTrue(bool(avoid[1, 0, 0]), "a new word passes over the fruit just named")
+
     def test_a_barn_or_a_lineup_gets_no_lexical_term(self):
         from orchard.curriculum import phase_schema
         cfg = Config()
