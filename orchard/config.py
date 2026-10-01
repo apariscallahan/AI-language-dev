@@ -326,6 +326,23 @@ class ModelConfig:
     # a time; that is the half of compositionality comprehension supplies.
     # Nothing here says which atoms make which word, or which word names what.
     lexical_reader: bool = True
+    # The innate speaker: production through the same kind of mental lexicon
+    # (`agents.LexicalSpeaker`). Describing a lot it can see, the speaker
+    # attends to one of its parts and a shared, context-free output layer says
+    # that part's word -- added to the token logits, so the word for red is the
+    # same word asked about alone or said second about a red apple.
+    #
+    # Why: measured on 2026-09-30, two speakers taught a one-word dialect for
+    # every value (each field named alone at 0.99-1.00) went into `name-all`,
+    # grew descriptions to 2.5 words, and within 100 updates cut them back to
+    # one -- the fruit -- reusing their own words for 11% of fields. A second
+    # word came from a token head for which "the colour word, second, in a
+    # whole-lot round" was a new context: a random atom, usually some other
+    # value's name, which the composition term charged and the listener
+    # misread, so continuing was punished and they learned to stop. Which part
+    # to name, in what order, how many words and the words themselves stay
+    # learned; only "a word is the same word wherever it is said" is given.
+    lexical_speaker: bool = True
     # Innate concepts: the world arrives already sorted into the kinds of thing
     # the reader's word classes are about -- a fruit is an *object kind*, a
     # colour or a quality a *property*, a quantity or a price a *magnitude*
@@ -1013,7 +1030,15 @@ class TrainConfig:
     hindsight_from_rung: str = "mutual"
     episodes: int = 6_000_000             # the run's ceiling (~23k updates); rung budgets stop it earlier
     batch_size: int = 256                 # episodes per update (x rung_batch_scale)
-    lr: float = 3e-4
+    # Adam's step size. It was 3e-4, but below `curriculum.split_roles_at` the
+    # training step listed every pooled agent twice (farmer seat and buyer
+    # seat are one list), so each took two Adam steps per update on the same
+    # gradient -- roughly twice this, on every rung from `name-fruit` to
+    # `judge`, where every result in the README was measured. The double step
+    # is fixed (one agent, one step), and this is the step those rungs were
+    # actually taken at, so what they measured still holds. Seats after the
+    # split, which used to take the single 3e-4 step, now take this one too.
+    lr: float = 6e-4
     grad_clip: float = 1.0
     value_coef: float = 0.5
     # Measured on the lineup game, everything else held fixed: 0.05 reached 0.473
@@ -1206,7 +1231,7 @@ SCALE_KEYS = frozenset({
 ARCH_KEYS = frozenset({
     "model.d_model", "model.n_layers", "model.n_heads", "model.d_ff",
     "model.barn_lookup", "model.factored_choice",
-    "model.lexical_reader", "model.innate_concepts",
+    "model.lexical_reader", "model.innate_concepts", "model.lexical_speaker",
     "channel.atomic_vocab", "channel.max_symbols", "channel.n_turns",
     "world.n_varieties", "world.max_qty", "world.n_quality",
     "world.n_colors", "world.n_price_bins",
@@ -1445,6 +1470,39 @@ def config_from_args(args: argparse.Namespace) -> Config:
     return cfg
 
 
+def _validate_lineups(cfg: Config) -> None:
+    """Can every lineup be drawn the way its checks assume?
+
+    Three settings failed silently before. A `holdout_combo_frac` that rounds
+    to no reserved quality per lot reserved nothing, so `name-all` and
+    `mutual` compared trained combinations with trained ones and passed, and
+    `order` could never be measured. A lineup wider than the unreserved values
+    of a field put a reserved lot in as a distractor that is never the answer,
+    so it was ruled out without listening and chance was 1 in K-1, not 1 in K.
+    And one wider than a field's span could not be drawn at all.
+    """
+    from .world import ComboHoldout, lot_spans
+    w, K = cfg.world, cfg.curriculum.n_candidates
+    spans = lot_spans(w)
+    assert K <= min(spans), (
+        "curriculum.n_candidates is %d, but a lineup that varies one field cannot "
+        "be wider than that field's values (spans %s)" % (K, list(spans)))
+    if not cfg.curriculum.enabled:
+        return
+    held = ComboHoldout(w, w.holdout_combo_frac, w.holdout_seed)
+    assert len(held) >= K, (
+        "world.holdout_combo_frac %.3f reserves %d combinations; the productivity "
+        "test needs at least %d (a lineup of distinct reserved lots), i.e. "
+        "round(holdout_combo_frac x n_quality) >= 1"
+        % (w.holdout_combo_frac, len(held), K))
+    for i, name in enumerate(("fruit", "colour", "quality")):
+        room = held.open_values(i)
+        assert room >= K, (
+            "with these reserved combinations some lineups that vary %s have only "
+            "%d unreserved values, fewer than curriculum.n_candidates=%d"
+            % (name, room, K))
+
+
 def validate(cfg: Config) -> None:
     c = cfg.channel
     assert c.atomic_vocab >= 4, "need a real inventory of atoms"
@@ -1454,6 +1512,7 @@ def validate(cfg: Config) -> None:
     assert cfg.world.zipf_alpha_variety >= 0.0
     assert cfg.bottleneck.frequency_skew >= 0.0
     assert cfg.curriculum.n_candidates >= 2
+    _validate_lineups(cfg)
     assert cfg.curriculum.on_stall in ("hold", "stop")
     assert 0.0 < cfg.bottleneck.coverage <= 1.0
     assert cfg.model.d_model % cfg.model.n_heads == 0
@@ -1463,6 +1522,14 @@ def validate(cfg: Config) -> None:
     assert 0 <= w.budget_min_bin < w.n_price_bins
     p = cfg.population
     assert p.n_farmers >= 1 and p.n_buyers >= 1
+    if cfg.curriculum.enabled and cfg.curriculum.split_roles_at:
+        # One pool fills both seats until the split and is then copied whole into
+        # farmers and buyers, so the two sides are the same size; 4 farmers and
+        # 8 buyers became 8 of each and the market, sized for 4 farms, crashed.
+        assert p.n_farmers == p.n_buyers and p.founders_farmers == p.founders_buyers, (
+            "population: n_farmers/n_buyers (%d/%d) and founders (%d/%d) must match "
+            "while curriculum.split_roles_at is set -- one pool is split into both"
+            % (p.n_farmers, p.n_buyers, p.founders_farmers, p.founders_buyers))
     assert p.lifespan_min <= p.lifespan_max
     from .curriculum import phase_named
     phase_named(cfg, cfg.train.hindsight_from_rung)          # must name a rung

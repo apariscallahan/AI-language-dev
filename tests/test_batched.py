@@ -133,6 +133,8 @@ class TestResolveAgreement(unittest.TestCase):
 
         res = resolve_batch(cfg, sb, f_dec, b_dec, f_sym, b_sym,
                             f_bel=f_bel, b_bel=b_bel)
+        from orchard.batched import failure_modes
+        modes = failure_modes(res, sb)
         for i in range(n):
             sc = sb.scenario(i)
             fd = Decision(*[int(x) for x in f_dec[i]])
@@ -147,6 +149,8 @@ class TestResolveAgreement(unittest.TestCase):
             self.assertAlmostEqual(float(res["buyer_reward"][i]), o.buyer_reward,
                                    places=4, msg="buyer reward differs at %d" % i)
             self.assertEqual(bool(res["success"][i]), o.success)
+            # the failure tally names the same reason the scalar classifier does
+            self.assertEqual(modes[i], o.failure_mode, "failure mode differs at %d" % i)
             self.assertEqual(bool(res["comprehended"][i]), o.comprehended)
             self.assertEqual(bool(res["both_judged"][i]), o.both_judged_viability)
             self.assertAlmostEqual(float(res["farmer_decode"][i]), o.farmer_decode,

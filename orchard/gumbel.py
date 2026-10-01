@@ -41,9 +41,10 @@ from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, grammar_allowed, length_cost, resolve,
                   speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
-from .curriculum import (H_BELIEF, H_CHOICE, H_REPORT, N_HEADS, MutualBatch, Phase,
-                         ReferentialBatch, hindsight_applies, hindsight_targets, ladder,
-                         phase_schema, resolve_referential, resolve_reports)
+from .curriculum import (H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_REPORT, N_HEADS,
+                         MutualBatch, Phase, ReferentialBatch, hindsight_applies,
+                         hindsight_targets, ladder, phase_schema, resolve_referential,
+                         resolve_reports)
 from .gesture import (GESTURE_NONE, draw_availability, gesture_option_mask,
                       gesture_tokens_for, gestured_fields, n_token_ids,
                       without_gestures)
@@ -205,12 +206,17 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 # only the conversation so far, gathered per agent: the gathered
                 # copy is what the backward pass keeps, so it must not carry the
                 # empty remainder of the buffer
-                h = pool[a_i].net.encode(obs[ep], soft[:, :p][ep], upto=seq_pos,
-                                         schema=schema_of[role],
-                                         self_mask=mask_of[role])[:, -1]
-                logits = logits.index_copy(0, ep, pool[a_i].net.token_head(h))
+                net = pool[a_i].net
+                h = net.encode(obs[ep], soft[:, :p][ep], upto=seq_pos,
+                               schema=schema_of[role], self_mask=mask_of[role])[:, -1]
+                # which parts this turn has named, and are some still unnamed?
+                turn_st = net.turn_so_far(obs[ep], schema_of[role], tokens[ep], [p])
+                logits = logits.index_copy(
+                    0, ep, net.speak(h, obs[ep], schema_of[role],
+                                     None if turn_st is None
+                                     else (turn_st[0][:, 0], turn_st[1][:, 0])))
                 if g_logits is not None:
-                    g_logits = g_logits.index_copy(0, ep, pool[a_i].net.gesture_head(h))
+                    g_logits = g_logits.index_copy(0, ep, net.gesture_head(h))
 
             allowed = grammar_allowed(cfg, tokens[:, p - 1] if k > 0 else tokens[:, p], k)
             logits = logits.masked_fill(~allowed, MASKED)
@@ -278,12 +284,21 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     targets = (hindsight_targets(cfg, phase, scenarios)
                if use_hindsight else {FARMER: {}, BUYER: {}})
     head_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
-    # Which heads' log-probabilities to keep for a supervised term: hindsight's,
-    # and -- when the other party may have gestured -- the five report heads,
-    # one of which is taught the gestured value (see below).
+    # Which heads' log-probabilities to keep for a supervised term: hindsight's
+    # (read with the innate reader, like every decision).
+    keep_lp = {r: set(targets[r]) for r in (FARMER, BUYER)}
+    # ...and, when the other party may have gestured, the five report heads as
+    # the *transformer alone* reads them, one of which is taught the gestured
+    # value (see below). Not through the innate reader: it cannot see a
+    # gesture, so for it the lesson would be the gestured value from the words
+    # alone, on every gestured round, babble included -- hindsight by another
+    # name. Measured on `name-fruit` with fresh agents: that term alone pushed
+    # the reader's "no word names it" score up and its gain down in 10 of 12
+    # batches, several times harder than everything else put together. The
+    # reader learns words from the ostensive lesson, which waits for a name.
     supervise_gestures = train and gest_on and cfg.gesture.supervise_coef > 0
-    keep_lp = {r: set(targets[r]) | (set(H_REPORT) if supervise_gestures else set())
-               for r in (FARMER, BUYER)}
+    gest_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
+    belief_cols = set(H_BELIEF) | {H_BELIEF_COLOR}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         scored = set(phase.active_heads(role, cfg))
@@ -293,12 +308,21 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         val = torch.zeros(B, device=device)
         for a_i, ep in groups_of[role]:
             net = pool[a_i].net
-            h = net.encode(obs[ep], soft[ep], schema=schema_of[role],
+            # indexed once: the backward pass keeps what goes in, so a second
+            # gather would keep a second copy of the soft dialogue
+            soft_ep = soft[ep]
+            h = net.encode(obs[ep], soft_ep, schema=schema_of[role],
                            self_mask=mask_of[role])[:, -1]
             # the innate reader's reading of the other party's words, through
             # the same soft one-hots, so it too carries a gradient to the speaker
-            lex = net.read_words(soft[ep], tokens[ep], mask_of[role])
+            lex = net.read_words(soft_ep, tokens[ep], mask_of[role])
             heads = net.all_heads(h, obs[ep], lex=lex)
+            if supervise_gestures:
+                for col, lg in zip(H_REPORT, net.report_logits(h)):
+                    full = gest_lp[role].get(col)
+                    if full is None:
+                        full = torch.zeros((B, lg.shape[-1]), device=device)
+                    gest_lp[role][col] = full.index_copy(0, ep, F.log_softmax(lg, dim=-1))
             val = val.index_copy(0, ep, net.value_head(h).squeeze(-1))
             lps = torch.zeros(ep.shape[0], device=device)
             ents = torch.zeros(ep.shape[0], device=device)
@@ -317,7 +341,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 # The belief heads are what make "were you understood" scoreable,
                 # but they are also four more sampled actions; weighting them
                 # keeps the loop without doubling the noise on the deal decision.
-                wgt = 1.0 if col < 4 else cfg.reward.belief_grad_weight
+                # (The lineup choice is not a belief head and is not weighted.)
+                wgt = cfg.reward.belief_grad_weight if col in belief_cols else 1.0
                 lps = lps + wgt * lp.gather(-1, a.unsqueeze(-1)).squeeze(-1)
                 ents = ents + (-(lp.exp() * lp).sum(-1))
             # Entropy is averaged over the heads in play, not summed: adding heads
@@ -326,9 +351,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             logp_sum = logp_sum.index_copy(0, ep, lps)
             ent_sum = ent_sum.index_copy(0, ep, ents)
         dec_sampled[role] = out
-        # Whether to gesture is one of the speaker's decisions: it is trained on
-        # the same advantage as the rest, which includes the cost of having done it.
-        dec_logp[role] = logp_sum + gest_logp[role]
+        # Whether to gesture is one of the speaker's decisions, trained on the
+        # round's reward, which includes the cost of having done it -- but not
+        # against the value head (see the loss below), so it is kept apart.
+        dec_logp[role] = logp_sum
         dec_ent[role] = ent_sum + gest_ent[role]
         dec_value[role] = val
 
@@ -367,8 +393,8 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         f_rew = torch.zeros(B, device=device)
         b_rew = torch.zeros(B, device=device)
         for i, sc in enumerate(scenarios):
-            fd, fb = split_decision(dec_sampled[FARMER][i])
-            bd, bb = split_decision(dec_sampled[BUYER][i])
+            fd, fb = split_decision(dec_sampled[FARMER][i], cfg.reward.belief_heads)
+            bd, bb = split_decision(dec_sampled[BUYER][i], cfg.reward.belief_heads)
             o = resolve(cfg, sc, fd, bd, float(f_len[i]), float(b_len[i]),
                         f_beliefs=fb, b_beliefs=bb)
             outcomes.append(o)
@@ -407,8 +433,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         # Who spoke each episode, for the speaker's own lexicon (the innate
         # one-name-per-meaning prior, `reward.lexicon`): never gated, so it is
         # on from the first round of the first rung.
+        # (Composition and word order read the same lexicon, so each of the
+        # three needs the speakers named; gating this on `reward.lexicon` alone
+        # switched the other two off whenever the lexicon bonus was.)
         ids_of = None
-        if cfg.reward.lexicon > 0:
+        if cfg.reward.lexicon > 0 or cfg.reward.compose > 0 or cfg.reward.word_order > 0:
             ids_of = {r: [pool_of[r][i].agent_id for i in idx_of[r].tolist()]
                       for r in (FARMER, BUYER) if phase.speaks(cfg, r)}
         terms = usage.speaker_terms(phase, tokens, obs_of, rarity=g > 0,
@@ -469,14 +498,28 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         # The speaker's gradient arrives through this term: dec_logp depends on
         # the soft message, which depends on the other agent's token logits.
         loss = loss + (-(adv * dec_logp[role]).mean())
+        # The speaker's own acts -- its gesture and its symbols -- are credited
+        # against a baseline that cannot see them: the batch's mean reward. The
+        # value head is read at DECIDE, after the whole dialogue, so it sees
+        # the gesture and the words; as a baseline for them it predicts their
+        # effect and subtracts it, and once it fits, the gesture's cost and the
+        # symbols' task advantage cancel out of their own gradient.
+        adv_own = (R - R.mean()).detach()
+        loss = loss + (-(adv_own * gest_logp[role]).mean())
         vl = ((dec_value[role] - R) ** 2).mean()
         loss = loss + t.value_coef * vl
         loss = loss - ent_dec_coef * dec_ent[role].mean()
         value_loss_total += float(vl.detach())
+        # A token term is a sequence's log-probability times its advantage,
+        # summed over the tokens and averaged over the episodes. (It was the mean
+        # over whichever episodes were still talking at each step, so the one
+        # long utterance still going at step twenty weighed as much as the whole
+        # batch's first symbols.)
+        n_ep = float(max(1, B))
         if t.gumbel_mix_reinforce > 0:
             for chosen, mask in token_logp_terms[role]:
-                denom = mask.sum().clamp(min=1.0)
-                loss = loss + t.gumbel_mix_reinforce * (-(adv * chosen * mask).sum() / denom)
+                loss = loss + t.gumbel_mix_reinforce * (
+                    -(adv_own * chosen * mask).sum() / n_ep)
         if (t.shaping_reinforce > 0 or t.convention_reinforce > 0) and token_logp_terms[role]:
             # Brevity, coining and convention are the speaker's alone and depend
             # only on what it said, so they are credited to its token choices
@@ -487,11 +530,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             ag = agree[role]
             adv_c = ((ag - ag.mean()) / scale).detach()
             for chosen, mask in token_logp_terms[role]:
-                denom = mask.sum().clamp(min=1.0)
-                loss = loss + t.shaping_reinforce * (-(adv_s * chosen * mask).sum() / denom)
+                loss = loss + t.shaping_reinforce * (-(adv_s * chosen * mask).sum() / n_ep)
                 if t.convention_reinforce > 0:
                     loss = loss + t.convention_reinforce * (
-                        -(adv_c * chosen * mask).sum() / denom)
+                        -(adv_c * chosen * mask).sum() / n_ep)
 
     # hindsight feedback: every scored head is pulled towards the outcome
     if use_hindsight:
@@ -533,7 +575,15 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             if d is None or not turn_starts[other]:
                 continue
             field, value = gestured_fields(cfg, tokens, turn_starts[other])
-            lesson = d["word_used"] & (field >= 0)
+            # The name the speaker said is its name for the field it was *asked*
+            # about, so the lesson is about that field only: a speaker naming
+            # the fruit while pointing at the colour does not teach the colour.
+            # (It used to, from the fruit word, and the error reached the reader
+            # and -- through the straight-through channel -- the speaker too.)
+            asked = torch.tensor([k[0] if k is not None else -1
+                                  for k in (d.get("_lexicon_keys") or [None] * B)],
+                                 dtype=torch.long, device=device)
+            lesson = d["word_used"] & (field >= 0) & (field == asked)
             if not bool(lesson.any()):
                 continue
             words_only = without_gestures(cfg, tokens, soft, turn_starts[other])
@@ -544,10 +594,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 if sel.numel() == 0:
                     continue
                 net = pool[a_i].net
-                h = net.encode(obs[sel], words_only[sel], schema=schema_of[role],
+                w_sel = words_only[sel]           # indexed once: one copy for backward
+                h = net.encode(obs[sel], w_sel, schema=schema_of[role],
                                self_mask=mask_of[role])[:, -1]
                 heads = net.report_logits(h, net.read_words(
-                    words_only[sel], words_ids[sel], mask_of[role]))
+                    w_sel, words_ids[sel], mask_of[role]))
                 for j in range(N_LOT_FIELDS):
                     rows = field[sel] == j
                     if not bool(rows.any()):
@@ -573,23 +624,36 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 sel = field == j
                 if not bool(sel.any()):
                     continue
-                lp = head_lp[role].get(H_REPORT[j])
+                lp = gest_lp[role].get(H_REPORT[j])
                 if lp is None:
                     continue
                 tgt = value[sel].clamp(0, lp.shape[-1] - 1)
                 loss = loss + coef * F.nll_loss(lp[sel], tgt)
 
     if token_entropy_terms:
+        # Each step's entropy is already masked to the episodes whose token
+        # policy acted there, so the mean per token is the sum over the total.
+        # (It used to be re-masked by `active[:, :n_steps]`, which lines steps
+        # up with turn-0 positions: every turn after the first was compared
+        # with padding, and the second speaker's entropy was dropped.)
         ent_stack = torch.stack(token_entropy_terms, dim=1)
-        mask = active.float()[:, :ent_stack.shape[1]]
-        tok_ent = (ent_stack * mask).sum() / mask.sum().clamp(min=1.0)
+        tok_ent = ent_stack.sum() / active.float().sum().clamp(min=1.0)
         loss = loss - ent_tok_coef * tok_ent
         stats.token_entropy = float(tok_ent.detach())
 
-    seen = []
+    # Every agent that played takes one optimiser step. Below
+    # `curriculum.split_roles_at` the farmer and buyer seats are one list, so
+    # listing both seats named every agent twice, and each took two Adam steps
+    # on the same gradient -- about twice the intended step size on every
+    # pooled rung, halving at the split. (`train.lr` is now the step those
+    # rungs were run and validated at; see its comment.)
+    seen, seen_ids = [], set()
     for role in (FARMER, BUYER):
         for a_i, _ in groups_of[role]:
-            seen.append(pool_of[role][a_i])
+            a = pool_of[role][a_i]
+            if id(a) not in seen_ids:
+                seen_ids.add(id(a))
+                seen.append(a)
     for a in seen:
         a.opt.zero_grad(set_to_none=True)
     loss.backward()

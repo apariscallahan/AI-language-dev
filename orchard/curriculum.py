@@ -230,6 +230,15 @@ class Phase:
         return self.referential
 
     @property
+    def forms_words(self) -> bool:
+        """Does this rung have a field whose words are not formed yet?
+
+        The single-field naming rungs. `name-all` invents no word -- every field
+        was named below it -- only the description that puts them together.
+        """
+        return self.referential and not self.whole
+
+    @property
     def whole(self) -> bool:
         """Is this rung's own job to name a whole lot?"""
         return self.naming and self.primary >= ASK_ALL
@@ -348,7 +357,16 @@ class Phase:
         if self.use_price:
             heads.append(H_PRICE)
         if cfg.reward.belief_heads:
-            heads.extend(H_BELIEF)
+            # Exactly the belief columns the resolver scores (`batched._decode_hits`).
+            # The farmer states the whole request, colour included -- colour was
+            # scored but never trained, so it had no gradient, entropy or
+            # hindsight. The buyer states the stock, quality and reserve price of
+            # the lot it asked about; which fruit that was it chose itself, so
+            # its fruit head was sampled and reinforced with nothing reading it.
+            if role == FARMER:
+                heads.extend(tuple(H_BELIEF) + (H_BELIEF_COLOR,))
+            else:
+                heads.extend(H_BELIEF[1:])
         return heads
 
     def meaning_kind(self, role: int) -> str:
@@ -617,10 +635,43 @@ def _fmt(x: float) -> str:
 
 
 def _headroom_floor(muted: float, share: float) -> float:
-    """The score that takes ``share`` of the headroom left above silence."""
+    """The score that takes ``share`` of the headroom left above silence.
+
+    NaN when silence was not measured: a floor of 0 there let any score pass,
+    so an unmeasured baseline now fails the check it belongs to.
+    """
     if muted != muted:
-        return 0.0
+        return float("nan")
     return muted + (1.0 - muted) * share
+
+
+def _holdout_check(c, ev: dict[str, Any]) -> tuple[bool, str]:
+    """The productivity gate, per role and per field (``phase_evidence``'s numbers).
+
+    Each field's ratio is taken over the headroom above a message-blind reader
+    and the ratios are averaged per role -- never a ratio of means, which
+    weights each field by its headroom and lets the one the language learned
+    best carry two it did not -- and the weaker role is the one judged. Every
+    field is named, so the log says which one failed to generalise.
+    """
+    ratio = _num(ev.get("holdout_field_ratio"))
+    hs = _num(ev.get("holdout_fields", ev.get("holdout_field_success")))
+    seen = _num(ev.get("seen_fields", ev.get("seen_field_success")))
+    each = ev.get("holdout_field_ratios") or []
+    names = tuple(ev.get("holdout_field_names") or COMBO_FIELDS)
+    per = (" [" + ", ".join("%s %s" % (n, _fmt(_num(r))) for n, r in zip(names, each))
+           + "]") if each else ""
+    roles = ev.get("holdout_role_ratios") or {}
+    by_role = ("; by role %s" % ", ".join("%s %s" % (k, _fmt(_num(v)))
+                                           for k, v in roles.items())
+               if len(roles) > 1 else "")
+    err = ev.get("holdout_error")
+    return (ratio == ratio and ratio >= c.min_holdout_ratio,
+            "held-out %s vs seen %s per field = %s of the headroom%s%s, need %.2f "
+            "(the whole round: %s vs %s)%s"
+            % (_fmt(hs), _fmt(seen), _fmt(ratio), per, by_role, c.min_holdout_ratio,
+               _fmt(_num(ev.get("holdout_success"))), _fmt(_num(ev.get("seen_success"))),
+               "; not measured: %s" % err if err else ""))
 
 
 def _describe(names: Sequence[str]) -> str:
@@ -705,14 +756,21 @@ def evaluate_report_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         if new:
             got = _num(ev.get("%s_new" % label))
             muted = _num(ev.get("muted_%s_new" % label))
-            floor = rule.min_success if len(new) > 1 else 0.0
-            floor = max(floor, _headroom_floor(muted, c.min_field_transfer))
+            # the better of silence and a reader ignoring the message
+            base = _num(ev.get("baseline_%s_new" % label, muted))
+            # Each role's own report of the other's whole lot has its own floor
+            # on `mutual` (`mutual_min_report`); the rung's `min_success` there
+            # is the both-in-one-round bar, a quarter as high, and was being
+            # used for this by mistake.
+            own = c.mutual_min_report if phase.mutual else rule.min_success
+            head = _headroom_floor(base, c.min_field_transfer)
+            floor = max(own if len(new) > 1 else 0.0, head) if head == head else float("nan")
             what = "the other's lot" if phase.mutual else _describe(
                 [n for n in names if n in new])
             checks["%s decodes: %s arrives" % (label, what)] = (
-                got == got and got >= floor,
-                "%s exact, need %.2f (silence alone scores %s)"
-                % (_fmt(got), floor, _fmt(muted)))
+                got == got and floor == floor and got >= floor,
+                "%s exact, need %s (silence alone scores %s, a reader ignoring the "
+                "message %s)" % (_fmt(got), _fmt(floor), _fmt(muted), _fmt(base)))
 
     if phase.mutual:
         succ, chance = _num(ev.get("success")), _num(ev.get("chance"))
@@ -735,19 +793,7 @@ def evaluate_report_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     # weights each field by its headroom and lets the one the language learned
     # best carry two it did not -- and each is named, so the log says which.
     if measures_holdout(phase):
-        ratio = _num(ev.get("holdout_field_ratio"))
-        hs = _num(ev.get("holdout_fields", ev.get("holdout_field_success")))
-        seen = _num(ev.get("seen_fields", ev.get("seen_field_success")))
-        each = ev.get("holdout_field_ratios") or []
-        names = tuple(ev.get("holdout_field_names") or COMBO_FIELDS)
-        per = (" [" + ", ".join("%s %s" % (n, _fmt(_num(r))) for n, r in zip(names, each))
-               + "]") if each else ""
-        checks["describes combinations it never trained on"] = (
-            ratio == ratio and ratio >= c.min_holdout_ratio,
-            "held-out %s vs seen %s per field = %s of the headroom%s, need %.2f "
-            "(the whole round: %s vs %s)"
-            % (_fmt(hs), _fmt(seen), _fmt(ratio), per, c.min_holdout_ratio,
-               _fmt(_num(ev.get("holdout_success"))), _fmt(_num(ev.get("seen_success")))))
+        checks["describes combinations it never trained on"] = _holdout_check(c, ev)
 
     passed = all(v[0] for v in checks.values())
     return passed, {n: {"met": v[0], "detail": v[1]} for n, v in checks.items()}
@@ -836,15 +882,21 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
     by_kind = ev.get("by_kind") or {}
     for kind in phase.rehearsed:
         d = by_kind.get(kind, by_kind.get(str(kind)))
-        if not d:
+        if not d or d.get("error"):
             # Unmeasured is not passed. This used to `continue`, and the light
             # check -- which promoted most rungs -- never measured the kinds at
             # all, so no rung promoted between checkpoints was ever checked for
             # forgetting (name-quality, name-quantity and name-price on the
             # 2026-09-29 run).
-            checks["still names %s" % ROUND_NAMES[kind]] = (False, "not measured")
+            checks["still names %s" % ROUND_NAMES[kind]] = (
+                False, "not measured" + (": %s" % d["error"] if d else ""))
             continue
         s, ch = _num(d.get("success")), round_chance(cfg, kind)
+        # Each describer on its own, as everywhere else: the mean of the two
+        # views let a seat that had forgotten the word hide behind one that had
+        # not. (Older evidence without the per-view numbers reads the mean.)
+        each = [_num(x) for x in (d.get("each") or [])] or [s]
+        worst = min(each) if all(x == x for x in each) else float("nan")
         # A detector for forgetting, not a second promotion: the kind was
         # promoted at the full bar once already, and a rung spends its first
         # stretch exploring (`train.anneal_per_rung`), which shakes every word a
@@ -852,9 +904,11 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         # bar is the share of the headroom the channel checks use everywhere.
         floor = _headroom_floor(ch, c.min_channel_transfer)
         checks["still names %s" % ROUND_NAMES[kind]] = (
-            s == s and s >= floor,
-            "%s on %s rounds, need %.2f -- %.2f of the headroom over chance %.3f"
-            % (_fmt(s), ROUND_NAMES[kind], floor, c.min_channel_transfer, ch))
+            worst == worst and worst >= floor,
+            "%s on %s rounds%s, need %.2f -- %.2f of the headroom over chance %.3f"
+            % (_fmt(s), ROUND_NAMES[kind],
+               " (each describer: %s)" % " / ".join(_fmt(x) for x in each)
+               if len(each) > 1 else "", floor, c.min_channel_transfer, ch))
     if whole_thing:
         # The productivity gate, on the rungs that describe a whole lot. Every
         # candidate in a held-out round is a combination nobody ever trained on,
@@ -866,41 +920,30 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
         ratio = _num(ev.get("holdout_ratio"))
         chance = _num(ev.get("chance"))
         above_chance = chance != chance or (hs == hs and hs >= k * chance)
-        # Where the rung scores a round as a conjunction, judge the ratio on the
-        # fields, not on the conjunction (the report rungs do, in
-        # `evaluate_report_rung`; a lineup rung scores one K-way choice and has
-        # no exponent to remove, so this branch is normally the joint one).
-        # `mutual` needed three fields right on each of two novel meanings, so
-        # per-field accuracy entered this number to the sixth power -- five
-        # fields make it the tenth: a code generalising at 0.73 per field against 0.80
-        # trained -- a per-field ratio of 0.91, plainly productive -- scores
-        # 0.15 against 0.26 as a whole round, a joint ratio of 0.58 that fails
-        # a bar it should clear; and 0.60 per field reads 0.05/0.26 = 0.18,
-        # which is not distinguishable from a code that generalises not at all.
-        # The per-field ratio is the same question with the exponent removed,
-        # normalised by the headroom over a message-blind guesser so a memorised
-        # code reads 0.00 rather than the base rate it scores anyway.
-        f_ratio = _num(ev.get("holdout_field_ratio"))
-        if f_ratio == f_ratio:
-            hf, sf = _num(ev.get("holdout_fields")), _num(ev.get("seen_fields"))
-            # Per field, named: one field carrying two weak ones is exactly what
-            # this gate must not let through, and an average cannot show it.
-            each = ev.get("holdout_field_ratios") or []
-            names = tuple(ev.get("holdout_field_names") or COMBO_FIELDS)
-            per = (" [" + ", ".join("%s %s" % (n, _fmt(_num(r)))
-                                    for n, r in zip(names, each)) + "]") if each else ""
-            checks["describes combinations it never trained on"] = (
-                f_ratio >= c.min_holdout_ratio,
-                "held-out %s vs seen %s per field = %s of the headroom%s, need "
-                "%.2f (the whole round: %s vs %s)"
-                % (_fmt(hf), _fmt(sf), _fmt(f_ratio), per, c.min_holdout_ratio,
-                   _fmt(hs), _fmt(seen)))
+        # Judged on the fields, not on the whole round. The whole round cannot
+        # tell reuse of every word from reuse of one: with three candidates
+        # drawn from the reserved combinations, which differ pairwise in at
+        # least two fields, a code that carries fruit alone -- and says colour
+        # and quality with one fused word per fruit -- picks the target 0.81 of
+        # the time against 0.78 on trained combinations, a "ratio" of 1.04
+        # (and a conjunction, where the rung has one, raises every per-field
+        # shortfall to a power instead). The guesser's belief heads are what
+        # the factored choice sums, so each field is read off them
+        # (`metrics.lineup_field_scores`), against the headroom over a
+        # message-blind reader, per role, and each role has to clear the bar.
+        if ev.get("holdout_field_names"):
+            checks["describes combinations it never trained on"] = _holdout_check(c, ev)
         else:
+            # Only where the per-field reading does not exist: the pointer
+            # listener (`model.factored_choice` off) does not read the choice
+            # through the belief heads, so they say nothing about it.
+            err = ev.get("holdout_error")
             checks["describes combinations it never trained on"] = (
                 ratio == ratio and ratio >= c.min_holdout_ratio and above_chance,
-                "held-out %s vs seen %s = %s of it, need %.2f%s"
+                "held-out %s vs seen %s = %s of it, need %.2f%s%s"
                 % (_fmt(hs), _fmt(seen), _fmt(ratio), c.min_holdout_ratio,
-                   "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance))))
+                   "" if above_chance else "; and above %.1fx chance %s" % (k, _fmt(chance)),
+                   "; not measured: %s" % err if err else ""))
     passed = all(v[0] for v in checks.values())
     return passed, {name: {"met": v[0], "detail": v[1]} for name, v in checks.items()}
 

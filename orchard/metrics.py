@@ -642,7 +642,17 @@ class StabilityTracker:
         if phase is None or not phase.tuples:
             kind = "request" if role == BUYER else "barn"
             return kind, self.probes[(kind, role)]
-        return "tuple", self._tuples
+        # The same fixed lots, asked the question the rung asks
+        # (:func:`probe_query`). They were always asked for the whole lot, so on
+        # `name-fruit` .. `name-price` drift and coherence were measured on a
+        # query value the describer had never been shown. The question is part
+        # of the key, so a new rung's first checkpoint is not read as drift.
+        from .world import N_LOT_FIELDS
+        q = probe_query(phase)
+        if q is None:
+            return "tuple", self._tuples
+        probes = [t[:N_LOT_FIELDS] + (q,) + t[N_LOT_FIELDS + 1:] for t in self._tuples]
+        return "tuple/%d" % q, probes
 
     @torch.no_grad()
     def measure(self, pop: Population, world: World, device: str = "cpu",
@@ -802,6 +812,15 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
     b_decode = float(batch.buyer_decode_t.float().mean())
     extra: dict[str, Any] = {}
     res = batch.res if isinstance(batch.res, dict) else None
+    if referential and getattr(batch, "field_lp", None) is not None:
+        # Which parts of the description reached the guesser, field by field.
+        g = "farmer" if batch.phase.guesser == FARMER else "buyer"
+        acc, pairs = lineup_field_scores(batch.sb.meanings, batch.sb.target,
+                                         batch.field_lp)
+        extra["%s_lineup_fields" % g] = acc
+        extra["%s_lineup_pairs" % g] = pairs
+        extra["%s_lineup_field_names" % g] = list(LOT_FIELDS)
+        extra["%s_lineup_field_floor" % g] = [0.5] * len(LOT_FIELDS)
     if res is not None and "farmer_fields" in res:
         # A report rung: how often each role reported each field, how often it
         # got every field the rung introduced right at once, and how often it got
@@ -830,6 +849,14 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
                 floors.append(float(torch.bincount(t).max()) / max(1, int(t.numel()))
                               if t.numel() else float("nan"))
             extra["%s_field_floor" % label] = floors
+            # ...and for the conjunctions: the share of rounds whose fields are
+            # the commonest *combination*, which is the best any message-blind
+            # reader can score on getting them all at once
+            new = set(phase.new_names(role)) if phase is not None else set()
+            extra["%s_new_floor" % label] = _joint_floor(
+                [truth for name, _h, truth in spec.get(role, []) if name in new])
+            extra["%s_report_floor" % label] = _joint_floor(
+                [truth for _n, _h, truth in spec.get(role, [])])
     return {
         **extra,
         "n": n,
@@ -880,11 +907,19 @@ def zero_shot(cfg: Config, pop: Population, world: World, n: int,
     """
     base = {"n": n, "n_holdout_combos": len(world.holdout) if n_holdout is None else n_holdout,
             "context": "lineup tuples" if (phase is not None and phase.tuples) else "trades"}
+    why_not = None
     if phase is not None and phase.tuples and not n_holdout:
+        why_not = "not applicable: no lineup tuples are held out"
+    elif phase is not None and getattr(phase, "referential", False) and not phase.whole:
+        # A lineup that varies one field shows a reserved target among trained
+        # distractors, so the target is the one unfamiliar candidate and can be
+        # found by its novelty -- the cue every held-out round is built to deny.
+        why_not = "not applicable: a rung that varies one field has not been taught the rest"
+    if why_not:
         return {**base, "seen_success": float("nan"), "unseen_success": float("nan"),
                 "seen_success_on_viable": float("nan"),
                 "unseen_success_on_viable": float("nan"), "retention": float("nan"),
-                "suppressed": "not applicable: no lineup tuples are held out"}
+                "suppressed": why_not}
     f_all = list(range(len(pop.farmers)))
     b_all = list(range(len(pop.buyers)))
     seen = _play(cfg, pop, world, n, f_all, b_all, held_out=False, device=device, rng=rng,
@@ -920,6 +955,17 @@ def zero_shot(cfg: Config, pop: Population, world: World, n: int,
     }
 
 
+def _joint_floor(truths: Sequence[torch.Tensor]) -> float:
+    """Share of rounds whose values are the commonest combination of these fields."""
+    if not truths:
+        return float("nan")
+    cols = torch.stack([t.reshape(-1).long() for t in truths], dim=1)
+    if cols.shape[0] == 0:
+        return float("nan")
+    _, counts = torch.unique(cols, dim=0, return_counts=True)
+    return float(counts.max()) / float(cols.shape[0])
+
+
 def _headroom(intact: float, scrambled: float) -> float:
     """Share of the *available* improvement that the channel is responsible for.
 
@@ -933,26 +979,52 @@ def _headroom(intact: float, scrambled: float) -> float:
     return (intact - scrambled) / room
 
 
+def _above(muted: float, blind: float) -> float:
+    """The baseline a message has to beat: the better of silence and ignoring it."""
+    if muted != muted:
+        return blind
+    if blind != blind:
+        return muted
+    return max(muted, blind)
+
+
 def _report_keys(intact: dict[str, Any], muted: dict[str, Any]) -> dict[str, Any]:
     """What a report rung's ablation adds: per role, exact / per field / the new
-    fields, intact and muted, and the share of the headroom each is worth."""
+    fields, intact and muted, and the share of the headroom each is worth.
+
+    The headroom is taken above the better of two baselines: the muted channel,
+    and a reader that ignores the message and guesses the commonest value (or
+    combination). The muted turn is END in the first slot, which no speaker is
+    allowed to say, so no listener was ever trained on it, and its reading can
+    fall *below* guessing blind -- which inflated every "carries" figure: a
+    listener accepting whatever it hears in `judge` (0.68 of rounds are worth
+    doing) against a silence it reads as 50% accept "carried" 0.36 of the
+    headroom with nothing in the words.
+    """
     out: dict[str, Any] = {}
     for label in ("farmer", "buyer"):
         if "%s_report" % label not in intact:
             continue
+        floors = intact.get("%s_field_floor" % label) or []
+        base_fields = [_above(m, floors[i] if i < len(floors) else float("nan"))
+                       for i, m in enumerate(muted["%s_report_fields" % label])]
+        base_report = _above(muted["%s_report" % label],
+                             intact.get("%s_report_floor" % label, float("nan")))
+        base_new = _above(muted["%s_new" % label],
+                          intact.get("%s_new_floor" % label, float("nan")))
         out["%s_report" % label] = intact["%s_report" % label]
         out["muted_%s_report" % label] = muted["%s_report" % label]
-        out["%s_report_transfer" % label] = _headroom(intact["%s_report" % label],
-                                                      muted["%s_report" % label])
+        out["%s_report_transfer" % label] = _headroom(intact["%s_report" % label], base_report)
         out["%s_fields_intact" % label] = intact["%s_report_fields" % label]
         out["%s_fields_muted" % label] = muted["%s_report_fields" % label]
-        out["%s_field_transfer" % label] = [_headroom(a, m) for a, m in zip(
-            intact["%s_report_fields" % label], muted["%s_report_fields" % label])]
+        out["%s_fields_baseline" % label] = base_fields
+        out["%s_field_transfer" % label] = [_headroom(a, b) for a, b in zip(
+            intact["%s_report_fields" % label], base_fields)]
         out["%s_field_names" % label] = intact["%s_field_names" % label]
         out["%s_new" % label] = intact["%s_new" % label]
         out["muted_%s_new" % label] = muted["%s_new" % label]
-        out["%s_new_transfer" % label] = _headroom(intact["%s_new" % label],
-                                                   muted["%s_new" % label])
+        out["baseline_%s_new" % label] = base_new
+        out["%s_new_transfer" % label] = _headroom(intact["%s_new" % label], base_new)
     return out
 
 
@@ -1103,6 +1175,58 @@ def _report_fields(res) -> float:
         if v:
             vals.extend(float(x) for x in v)
     return sum(vals) / len(vals) if vals else float("nan")
+
+
+def lineup_field_scores(meanings: torch.Tensor, target: torch.Tensor,
+                        field_lp: torch.Tensor) -> tuple[list[float], list[int]]:
+    """Per field: did that part of the description arrive? (lineups)
+
+    For every candidate that differs from the target in a field, does the
+    guesser's belief head for that field give the target's value more weight
+    than the candidate's? The factored choice is the sum of exactly these five
+    terms, so this is the choice taken apart. A reading that ignores the message
+    scores exactly 0.5 whatever it does with the candidates it can see: given
+    the lineup, the target's place in it is uniform, so every pair of values is
+    compared once in each direction (ties count a half).
+
+    Returns (accuracy per field, pairs per field); NaN where no candidate
+    differed in that field, as quantity and price never do in a combination
+    round.
+    """
+    B, K, W = meanings.shape
+    rows = torch.arange(B, device=meanings.device)
+    t_val = meanings[rows, target]                          # (B, W)
+    t_lp = field_lp[rows, target]                           # (B, W)
+    differs = (meanings != t_val.unsqueeze(1)).float()      # (B, K, W); the target itself: 0
+    win = ((t_lp.unsqueeze(1) > field_lp).float()
+           + 0.5 * (t_lp.unsqueeze(1) == field_lp).float())
+    n = differs.sum(dim=(0, 1))
+    got = (win * differs).sum(dim=(0, 1))
+    acc = [float(g) / float(m) if m > 0 else float("nan")
+           for g, m in zip(got.tolist(), n.tolist())]
+    return acc, [int(x) for x in n.tolist()]
+
+
+def _view_name(v) -> str:
+    if getattr(v, "referential", False):
+        return "%s describes" % ("farmer" if v.informer == FARMER else "buyer")
+    return getattr(v, "name", "rung")
+
+
+def _field_rows(res, label: str, referential: bool) -> tuple[list, list, list]:
+    """(names, accuracy, floor) per field for one role, from :func:`_play`.
+
+    A report rung scores the fields each role reported; a lineup scores the
+    guesser's reading of each field (:func:`lineup_field_scores`).
+    """
+    res = res or {}
+    if referential:
+        return (list(res.get("%s_lineup_field_names" % label) or []),
+                list(res.get("%s_lineup_fields" % label) or []),
+                list(res.get("%s_lineup_field_floor" % label) or []))
+    return (list(res.get("%s_field_names" % label) or []),
+            list(res.get("%s_report_fields" % label) or []),
+            list(res.get("%s_field_floor" % label) or []))
 
 
 def _report_side(res) -> float:
@@ -1275,20 +1399,29 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["holdout_side"] = float("nan")
     out["seen_side"] = float("nan")
     out["holdout_field_ratio"] = float("nan")
-    if holdout_sampler_for is not None:
-        from .curriculum import COMBO_FIELDS
+    out["holdout_role_ratios"] = {}
+    from .curriculum import COMBO_FIELDS, measures_holdout
+    # Only where the rung is asked about it. A rung that varies one field shows
+    # a reserved target among trained distractors, so the target is the one
+    # unfamiliar candidate -- the novelty cue the held-out rounds exist to
+    # rule out -- and the number it printed meant nothing.
+    if holdout_sampler_for is not None and measures_holdout(phase):
         hs, seen = [], []
         hd, sd = [], []
-        # Per field, by name, on the fields a held-out combination is made of.
-        # Quantity and price are never held out, so their held-out accuracy is
-        # their trained accuracy and would only pad the ratio; and the two roles
-        # need not report the same fields (in `offer` the buyer reports the
-        # lot's stock, quality and price), so nothing is averaged by position.
-        acc_h: dict[str, list[float]] = {}
-        acc_s: dict[str, list[float]] = {}
-        flo_h: dict[str, list[float]] = {}
-        flo_s: dict[str, list[float]] = {}
-        for v in phase.views():
+        # Per role and per field, by name, on the fields a held-out combination
+        # is made of. Quantity and price are never held out, so their held-out
+        # accuracy is their trained accuracy and would only pad the ratio; the
+        # two roles need not report the same fields (in `offer` the buyer reports
+        # the lot's stock, quality and price), so nothing is averaged by
+        # position; and nothing is averaged over the roles either, so a seat
+        # that generalises cannot carry one that does not.
+        acc_h: dict[tuple[str, str], list[float]] = {}
+        acc_s: dict[tuple[str, str], list[float]] = {}
+        flo_h: dict[tuple[str, str], list[float]] = {}
+        flo_s: dict[tuple[str, str], list[float]] = {}
+        views = phase.views()
+        measured = 0
+        for v in views:
             sam = holdout_sampler_for(v)
             # The comparison must be the same round on trained combinations
             # (`seen_sampler_for`). It used to be the rung's ordinary sampler --
@@ -1306,63 +1439,77 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                 s = evaluate_success(cfg, pop, world, max(128, n_eval // 2),
                                      device=device, rng=rng, phase=v,
                                      sampler=lambda n, _ho=False, _p=plain: _p(n, held_out=False))
-            except Exception:
+            except Exception as exc:
+                # Recorded, not swallowed: an exception here used to become a
+                # silent "n/a", and a rung stalled on it with nothing in the log.
+                out["holdout_error"] = "%s view: %r" % (_view_name(v), exc)
                 continue
-            if h.get("n"):
-                hs.append(h["success_rate"])
-                seen.append(s["success_rate"])
-                # Where a round is scored as a conjunction, the conjunction is a
-                # terrible estimator of whether the code generalises: `mutual`
-                # wants five fields right on each of two novel lots, so a
-                # per-field shortfall is raised to the tenth power. Per-field
-                # accuracy on the same rounds answers the same question without
-                # the exponent -- the argument the report rungs already make
-                # ("which field arrived, not the conjunction").
-                for label in ("farmer", "buyer"):
-                    names = h.get("%s_field_names" % label) or []
-                    hv = h.get("%s_report_fields" % label) or []
-                    sv = s.get("%s_report_fields" % label) or []
-                    hfl = h.get("%s_field_floor" % label) or []
-                    sfl = s.get("%s_field_floor" % label) or []
-                    for i, (name, a, b) in enumerate(zip(names, hv, sv)):
-                        if name in COMBO_FIELDS:
-                            acc_h.setdefault(name, []).append(float(a))
-                            acc_s.setdefault(name, []).append(float(b))
-                            if i < len(hfl) and hfl[i] == hfl[i]:
-                                flo_h.setdefault(name, []).append(float(hfl[i]))
-                            if i < len(sfl) and sfl[i] == sfl[i]:
-                                flo_s.setdefault(name, []).append(float(sfl[i]))
-                da, db = _report_side(h), _report_side(s)
-                if da == da:
-                    hd.append(da)
-                if db == db:
-                    sd.append(db)
-        if hs:
+            if not h.get("n"):
+                continue
+            measured += 1
+            hs.append(h["success_rate"])
+            seen.append(s["success_rate"])
+            # Where a round is scored as a conjunction, the conjunction is a
+            # terrible estimator of whether the code generalises: `mutual` wants
+            # five fields right on each of two novel lots, so a per-field
+            # shortfall is raised to the tenth power. And where it is one K-way
+            # choice, a code that carries *one* of the three fields picks a
+            # reserved lot out of three about 0.81 of the time -- two reserved
+            # combinations always differ in at least two fields -- so the whole
+            # round cannot tell reuse of all three words from reuse of one.
+            # Per-field accuracy on the same rounds answers the question itself.
+            for label in ("farmer", "buyer"):
+                names, hv, hfl = _field_rows(h, label, v.referential)
+                _n2, sv, sfl = _field_rows(s, label, v.referential)
+                for i, (name, a, b) in enumerate(zip(names, hv, sv)):
+                    if name not in COMBO_FIELDS or a != a or b != b:
+                        continue
+                    key = (label, name)
+                    acc_h.setdefault(key, []).append(float(a))
+                    acc_s.setdefault(key, []).append(float(b))
+                    if i < len(hfl) and hfl[i] == hfl[i]:
+                        flo_h.setdefault(key, []).append(float(hfl[i]))
+                    if i < len(sfl) and sfl[i] == sfl[i]:
+                        flo_s.setdefault(key, []).append(float(sfl[i]))
+            da, db = _report_side(h), _report_side(s)
+            if da == da:
+                hd.append(da)
+            if db == db:
+                sd.append(db)
+        # Every view, or nothing: one view that raised used to leave the mean
+        # over whichever view survived, which is a different test.
+        complete = measured == len(views) and measured > 0
+        if hs and complete:
             out["holdout_success"] = sum(hs) / len(hs)
             base = sum(seen) / len(seen) if seen else float("nan")
             out["seen_success"] = base
             out["holdout_ratio"] = (out["holdout_success"] / base
                                     if base == base and base > 1e-9 else float("nan"))
-        if hd:
+        if hd and complete:
             out["holdout_side"] = sum(hd) / len(hd)
-        if sd:
+        if sd and complete:
             out["seen_side"] = sum(sd) / len(sd)
-        fields = [n for n in COMBO_FIELDS if acc_h.get(n) and acc_s.get(n)]
-        if fields:
+        keys = [(lbl, n) for lbl in ("farmer", "buyer") for n in COMBO_FIELDS
+                if acc_h.get((lbl, n)) and acc_s.get((lbl, n))]
+        if keys and complete:
             def mean(xs):
                 return sum(xs) / len(xs)
-            ha = [mean(acc_h[n]) for n in fields]
-            sa = [mean(acc_s[n]) for n in fields]
-            out["holdout_field_names"] = list(fields)
+            roles = sorted({lbl for lbl, _n in keys}, key=("farmer", "buyer").index)
+            ha = [mean(acc_h[k]) for k in keys]
+            sa = [mean(acc_s[k]) for k in keys]
+            # "fruit" where one seat was measured, "buyer fruit" where both were
+            out["holdout_field_names"] = [n if len(roles) == 1 else "%s %s" % (lbl, n)
+                                          for lbl, n in keys]
             out["holdout_field_acc"] = ha
             out["seen_field_acc"] = sa
             out["holdout_fields"] = out["holdout_field_success"] = mean(ha)
             out["seen_fields"] = out["seen_field_success"] = mean(sa)
-            # The floor is what a message-blind guesser gets on the pool being
-            # scored -- the commonest value's share, per field and per pool,
-            # because the reserved quarter is 16 rows of 64 and need not be
-            # balanced. A memorised code then reads 0 rather than the base rate
-            # it would score anyway.
+            # The floor is what a message-blind guesser gets on the rounds being
+            # scored. A report rung's evaluation records it per field (the
+            # commonest value's share); a lineup's per-field score is a paired
+            # comparison whose floor is exactly 0.5 (`lineup_field_scores`); the
+            # pool's marginal is the fallback. A memorised code then reads 0
+            # rather than the base rate it would score anyway.
             h_floor = s_floor = None
             if holdout_floor_for is not None:
                 got = holdout_floor_for(phase)
@@ -1379,17 +1526,14 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
             # same masking the per-role and per-kind gates already refuse --
             # "a pooled average would let a fluent farmer carry a buyer that
             # never learned to speak".
-            # The floor each side was actually played against, where the rounds
-            # said (a report rung's evaluation records it per field); the pool's
-            # marginal otherwise.
-            lo_hs = [mean(flo_h[n]) if flo_h.get(n) else _floor_of(h_floor, n)
-                     for n in fields]
-            lo_ss = [mean(flo_s[n]) if flo_s.get(n) else _floor_of(s_floor, n)
-                     for n in fields]
+            lo_hs = [mean(flo_h[k]) if flo_h.get(k) else _floor_of(h_floor, k[1])
+                     for k in keys]
+            lo_ss = [mean(flo_s[k]) if flo_s.get(k) else _floor_of(s_floor, k[1])
+                     for k in keys]
             out["holdout_field_floors"] = lo_hs
             out["seen_field_floors"] = lo_ss
             ratios = []
-            for i, name in enumerate(fields):
+            for i in range(len(keys)):
                 lo_h = lo_hs[i]
                 lo_s = lo_ss[i]
                 # A ratio between two numbers both at the floor is noise, and
@@ -1400,30 +1544,43 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                     ratios.append(max(0.0, min(1.0, (ha[i] - lo_h) / (sa[i] - lo_s))))
                 else:
                     ratios.append(float("nan"))
-            good = [r for r in ratios if r == r]
             out["holdout_field_ratios"] = ratios
-            out["holdout_field_ratio"] = sum(good) / len(good) if good else float("nan")
+            # Each role's mean over its fields, and the gate reads the weaker
+            # role: per role, never pooled.
+            per_role = {}
+            for lbl in roles:
+                good = [r for (l2, _n), r in zip(keys, ratios) if l2 == lbl and r == r]
+                per_role[lbl] = sum(good) / len(good) if good else float("nan")
+            out["holdout_role_ratios"] = per_role
+            vals = list(per_role.values())
+            out["holdout_field_ratio"] = (min(vals) if vals and all(x == x for x in vals)
+                                          else float("nan"))
     # Each kind of round in the rung's mixture, scored on its own. A rung that
     # adds colour to fruit is promoted on colour and has to show it can still do
     # fruit; one number over both would let either hide behind the other.
     out["by_kind"] = {}
     if kind_sampler_for is not None and len(getattr(phase, "kinds", ())) > 1:
         for kind in phase.kinds:
-            rates = []
-            for v in phase.views():
+            rates, errors, views = [], [], phase.views()
+            for v in views:
                 sam = kind_sampler_for(v, kind)
                 if sam is None:
                     continue
                 try:
                     r = evaluate_success(cfg, pop, world, max(128, n_eval // 3),
                                          device=device, rng=rng, phase=v, sampler=sam)
-                except Exception:
+                except Exception as exc:
+                    errors.append("%s view: %r" % (_view_name(v), exc))
                     continue
                 if r.get("n"):
                     rates.append(r["success_rate"])
-            if rates:
+            if errors:
+                out["by_kind"][int(kind)] = {"success": float("nan"), "views": len(rates),
+                                             "error": "; ".join(errors)}
+            elif rates and len(rates) == len(views):
                 out["by_kind"][int(kind)] = {"success": sum(rates) / len(rates),
-                                             "views": len(rates)}
+                                             "views": len(rates),
+                                             "each": list(rates)}
 
     if (phase.mutual or phase.order) and out["views"]:
         # no analytic chance for "report / fill a whole tuple": silence is the floor
@@ -1541,9 +1698,16 @@ def newborn_vs_veterans(cfg: Config, pop: Population, world: World, newborn: Age
 # post-hoc token semantics  (spec 6.3 / 6.4 -- inferred, never asserted)
 # ==========================================================================
 def _bin_value(cfg: Config, kind: int, value: int, n_bins: int = 5) -> int:
-    """Coarsen a field so mutual information is estimable from a few hundred samples."""
+    """Coarsen a field so mutual information is estimable from a few hundred samples.
+
+    Colour is passed through like fruit and quality. It used to fall to the
+    final ``return 0``, so every colour read as one value: no slot or word was
+    ever associated with colour, word classes never had a colour class, and a
+    perfect five-word speaker's positional structure read 0.447 instead of
+    0.556 -- on a gate (`min_positional_structure`) that `name-all` must pass.
+    """
     w = cfg.world
-    if kind in (K_VARIETY, K_QUALITY):
+    if kind in (K_VARIETY, K_QUALITY, K_COLOR):
         return int(value)
     if kind == K_QTY:
         return min(n_bins - 1, int(value * n_bins / max(w.max_qty + 1, 1)))
@@ -1744,7 +1908,10 @@ def analyse_token_semantics(cfg: Config, pop: Population, world: World, *,
                 score = mi / hy if hy > 1e-9 else 0.0
                 if best is None or score > best[1]:
                     best = (i, score)
-            used = sum(1 for t in toks_at_k if t < cfg.channel.end_id) / max(1, len(msgs))
+            # A slot is in use where an *atom* sits there: a slot that holds a
+            # SPACE or HYPHEN carries nothing by construction, and counting it
+            # at score 0 capped a flawless five-word code at 5/9.
+            used = sum(1 for t in toks_at_k if t < cfg.channel.atomic_vocab) / max(1, len(msgs))
             rows.append({"position": k, "dimension": labels[best[0]],
                          "score": round(float(best[1]), 4),
                          "distinct_tokens": len(set(toks_at_k)),

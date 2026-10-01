@@ -295,13 +295,14 @@ def _decode_hits(cfg: Config, sb: ScenarioBatch, bel: torch.Tensor,
         if col is not None:
             hits.append(col == sb.want_color)
         return torch.stack(hits, dim=1)
+    # No colour: the lot the buyer is told about is the one it asked for, so its
+    # colour is the buyer's own choice (`offered_color` *is* `want_color`), and
+    # scoring it paid a free point for copying its own observation.
     hits = [
         (q - sb.offered_stock).abs() <= R.belief_qty_tol,
         k == sb.offered_quality,
         (p - sb.reservation).abs() <= R.belief_price_tol,
     ]
-    if col is not None:
-        hits.append(col == sb.offered_color)
     return torch.stack(hits, dim=1)
 
 
@@ -423,8 +424,16 @@ def resolve_batch(cfg: Config, sb: ScenarioBatch, f_dec: torch.Tensor,
     }
 
 
-def failure_modes(res: dict[str, torch.Tensor]) -> list[str]:
-    """Primary outcome label per episode, matching the scalar classifier's order."""
+def failure_modes(res: dict[str, torch.Tensor], sb: "ScenarioBatch | None" = None) -> list[str]:
+    """Primary outcome label per episode, matching the scalar classifier's order.
+
+    With the scenarios (``sb``), a deal both sides agreed on that could not be
+    carried out is labelled with its first reason, in the scalar classifier's
+    order (`env._classify`); without them it is "infeasible_deal", which is
+    what every such round used to be called, so the failure tally on the
+    trading rungs never said whether the deal broke on stock, budget, the
+    reserve price or quality.
+    """
     n = res["success"].shape[0]
     out = ["unclassified"] * n
     succ = res["success"].tolist()
@@ -435,6 +444,16 @@ def failure_modes(res: dict[str, torch.Tensor]) -> list[str]:
     aq = res["agree_qty"].tolist()
     ap = res["agree_price"].tolist()
     both = res["both_accept"].tolist()
+    why = None
+    if sb is not None and "agreed_qty" in res:
+        q, p = res["agreed_qty"], res["agreed_price"]
+        checks = (("variety_not_stocked", ~sb.variety_ok),
+                  ("insufficient_stock", q > sb.offered_stock),
+                  ("qty_not_what_buyer_needed", q != sb.need_qty),
+                  ("over_budget", p > sb.max_price),
+                  ("below_reservation", p < sb.reservation),
+                  ("quality_below_requirement", ~sb.quality_ok))
+        why = [(name, m.tolist()) for name, m in checks]
     for i in range(n):
         if succ[i]:
             out[i] = "success"
@@ -450,6 +469,8 @@ def failure_modes(res: dict[str, torch.Tensor]) -> list[str]:
             out[i] = "qty_mismatch"
         elif both[i] and not ap[i]:
             out[i] = "price_mismatch"
+        elif why is not None:
+            out[i] = next((name for name, m in why if m[i]), "unclassified")
         else:
             out[i] = "infeasible_deal"
     return out

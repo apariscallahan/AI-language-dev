@@ -155,8 +155,12 @@ class TestTheWorldDecidesWhen(unittest.TestCase):
     def test_gestures_are_withdrawn_over_a_naming_rung_and_stay_small_afterwards(self):
         cfg = cfg_small()
         g = cfg.gesture
+        # the single-field rungs form words; `name-all` only puts them together
+        self.assertEqual([ph.name for ph in ladder(cfg) if ph.forms_words],
+                         ["name-fruit", "name-color", "name-quality", "name-quantity",
+                          "name-price"])
         for ph in ladder(cfg):
-            if ph.invents:
+            if ph.forms_words:
                 self.assertAlmostEqual(G.gesture_share(cfg, ph, 0), g.share_start)
                 self.assertAlmostEqual(G.gesture_share(cfg, ph, g.anneal_updates // 2),
                                        (g.share_start + g.share_end) / 2)

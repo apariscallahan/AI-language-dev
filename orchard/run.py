@@ -322,8 +322,10 @@ def holdout_report(cfg: Config, path: str) -> int:
     if saved:
         keep = cfg.train.device
         cfg = Config.from_dict(saved, allow_legacy=True)
-        if keep and keep != "auto":
-            cfg.train.device = keep
+        # The device is this machine's, not the snapshot's: a run pins the one
+        # it resolved ("cuda"), and scoring its snapshot on a CPU-only machine
+        # stopped there unless `--device cpu` was given.
+        cfg.train.device = keep or "auto"
     out = os.path.join(os.path.dirname(os.path.abspath(path)), "_holdout_report")
     trainer = Trainer(cfg, out, quiet=True)
     trainer.load_snapshot(path)
@@ -363,38 +365,46 @@ def holdout_report(cfg: Config, path: str) -> int:
           % (phase.name, len(trainer.referential_world.holdout.held),
              cfg.world.n_varieties * cfg.world.n_colors * cfg.world.n_quality))
     each = ev.get("holdout_field_ratios") or []
-    print("%-11s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
-    prod_h = prod_s = 1.0
+    print("%-14s %8s %8s %9s" % ("field", "held-out", "trained", "transfers"))
+    # "buyer fruit" where both roles were measured: the independent-fields
+    # product is taken per role, as the one-side conjunction below is
+    prods: dict[str, list[float]] = {}
     for i, name in enumerate(names):
         if not acc or i >= len(acc):
             break
         b = base[i] if base and i < len(base) else float("nan")
-        prod_h *= acc[i]
-        prod_s *= b
+        role = name.split(" ")[0] if " " in name else ""
+        ph, ps = prods.get(role, [1.0, 1.0])
+        prods[role] = [ph * acc[i], ps * b]
         r = ("%9.3f" % each[i] if i < len(each) and each[i] == each[i]
              else "      n/a")
         note = ""
         if acc[i] < floor_at(i, 0):
             note = ("  <- below the %.2f a message-blind guesser gets"
                     % floor_at(i, 0))
-        print("%-11s %8.3f %8.3f%s%s" % (name, acc[i], b, r, note))
+        print("%-14s %8.3f %8.3f%s%s" % (name, acc[i], b, r, note))
+    prod_h = (sum(p[0] for p in prods.values()) / len(prods)) if prods else float("nan")
+    prod_s = (sum(p[1] for p in prods.values()) / len(prods)) if prods else float("nan")
     print()
-    print("%-11s %8.3f %8.3f %9.3f   each field once, over floors of %.2f/%.2f"
+    roles = ev.get("holdout_role_ratios") or {}
+    print("%-14s %8.3f %8.3f %9.3f   each field once%s, over floors of %.2f/%.2f"
           % ("mean", ev.get("holdout_fields", float("nan")),
              ev.get("seen_fields", float("nan")),
              ev.get("holdout_field_ratio", float("nan")),
+             (" (the weaker role: %s)" % ", ".join("%s %.3f" % kv for kv in roles.items())
+              if len(roles) > 1 else ""),
              floor_mean(0), floor_mean(1)))
     print()
     # Independent fields would multiply. Where they do not, the code is right
     # about each field on its own and wrong about them together -- which is what
     # a Latin-square holdout produces: get the fruit and the colour right and
     # the training distribution has ruled out the one quality that is the answer.
-    print("%-11s %8.3f %8.3f   (one side, every field at once)"
+    print("%-14s %8.3f %8.3f   (one side, every field at once)"
           % ("conjunction", ev.get("holdout_side", float("nan")),
              ev.get("seen_side", float("nan"))))
-    print("%-11s %8.3f %8.3f   if the combination fields were independent"
+    print("%-14s %8.3f %8.3f   if the combination fields were independent"
           % ("  expected", prod_h, prod_s))
-    print("%-11s %8.3f %8.3f   (both sides, every field)"
+    print("%-14s %8.3f %8.3f   (both sides, every field)"
           % ("whole round", ev.get("holdout_success", float("nan")),
              ev.get("seen_success", float("nan"))))
     trainer.close()
@@ -434,14 +444,21 @@ def list_snapshots(where: str) -> int:
         try:
             st = torch.load(path, map_location="cpu", weights_only=False)
             i = int(st["curriculum"]["index"])
-            split = Trainer._pool_had_split(st)
+            # Only a pooled snapshot can have drifted copies. A healthy one from
+            # `haggle` on holds farmers and buyers that are *meant* to differ,
+            # and every one of them used to be reported as the old resume bug.
+            f_ids = [r["agent_id"] for r in st["farmers"]]
+            b_ids = [r["agent_id"] for r in st["buyers"]]
+            pooled = bool(st.get("shared")) or f_ids == b_ids
+            split = pooled and Trainer._pool_had_split(st)
             affected += int(split)
             print("%-34s %-12s %-9s %-9s %s"
                   % (os.path.relpath(path, where if os.path.isdir(where) else "."),
-                     names[i] if i < len(names) else i,
+                     st.get("phase_name") or (names[i] if i < len(names) else i),
                      "{:,}".format(int(st.get("updates", 0))),
                      "%d+%d" % (len(st["farmers"]), len(st["buyers"])),
-                     "two sets of copies, drifted apart" if split else "one pool"))
+                     "two sets of copies, drifted apart" if split
+                     else "one pool" if pooled else "farmers and buyers"))
         except Exception as exc:               # a half-written .pt must not stop the list
             print("%-34s %s" % (os.path.relpath(path), "unreadable: %s" % exc))
     if affected:

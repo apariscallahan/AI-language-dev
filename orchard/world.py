@@ -262,24 +262,46 @@ class ComboHoldout:
             self.held = {(rows[f], cols[c], syms[(f + c) % n])
                          for f in range(n) for c in range(n)}
             return
-        cells = [(f, c) for f in range(cfg.n_varieties) for c in range(cfg.n_colors)]
-        need = per_cell * len(cells)
-        # spread the withheld qualities evenly over the quality values
-        quals = [q for q in range(cfg.n_quality)] * (need // cfg.n_quality + 1)
-        quals = quals[:need]
-        for _ in range(200):
-            rng.shuffle(quals)
-            out, ok = set(), True
-            for i, (f, c) in enumerate(cells):
-                picks = set(quals[i * per_cell:(i + 1) * per_cell])
-                if len(picks) != per_cell:        # the same quality twice in one lot
-                    ok = False
-                    break
-                out.update((f, c, q) for q in picks)
-            if ok:
-                self.held = out
-                return
-        self.held = {(f, c, quals[i]) for i, (f, c) in enumerate(cells)}
+        # Any other shape: the same construction, stretched. Each fruit and each
+        # colour gets a residue mod n_quality, spread as evenly as the counts
+        # allow, and a lot withholds the qualities its two residues sum to. Every
+        # (fruit, colour) lot withholds exactly `per_cell` qualities, and -- what
+        # the shuffled draw this replaces did not guarantee -- every other pair of
+        # fields withholds as few values as the counts allow, so a lineup that
+        # varies one field always has enough values left that are not reserved.
+        # The `duality` preset (12 fruits) had (fruit, quality) pairs with only
+        # one colour left, so its colour rounds had to show reserved lots as
+        # distractors: never the answer, and so ruled out without listening.
+        nq = cfg.n_quality
+        fruit_res = [i % nq for i in range(cfg.n_varieties)]
+        colour_res = [i % nq for i in range(cfg.n_colors)]
+        rng.shuffle(fruit_res)
+        rng.shuffle(colour_res)
+        syms = list(range(nq))
+        rng.shuffle(syms)
+        self.held = {(f, c, syms[(fruit_res[f] + colour_res[c] + j) % nq])
+                     for f in range(cfg.n_varieties) for c in range(cfg.n_colors)
+                     for j in range(per_cell)}
+
+    def open_values(self, field: int) -> int:
+        """The fewest values of ``field`` left unreserved once the other two are fixed.
+
+        A lineup that varies one field of a combination can be no wider than
+        this without showing a reserved lot as a distractor.
+        """
+        spans = (self.cfg.n_varieties, self.cfg.n_colors, self.cfg.n_quality)
+        a, b = [i for i in range(3) if i != field]
+        worst = spans[field]
+        for x in range(spans[a]):
+            for y in range(spans[b]):
+                combo = [0, 0, 0]
+                combo[a], combo[b] = x, y
+                n_open = 0
+                for v in range(spans[field]):
+                    combo[field] = v
+                    n_open += tuple(combo) not in self.held
+                worst = min(worst, n_open)
+        return worst
 
     def __contains__(self, combo) -> bool:
         return tuple(int(x) for x in combo)[:3] in self.held

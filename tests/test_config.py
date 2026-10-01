@@ -294,5 +294,59 @@ class TestTheCodeCanForm(unittest.TestCase):
                          [])
 
 
+class TestLineupsCanBeDrawnAsTheirChecksAssume(unittest.TestCase):
+    """Three settings used to fail silently rather than at the start of a run."""
+
+    def test_a_holdout_that_reserves_nothing_is_refused(self):
+        """`name-all` and `mutual` then compared trained combinations with
+        trained ones and passed; `order` could never be measured."""
+        cfg = Config()
+        cfg.world.holdout_combo_frac = 0.1          # rounds to no quality per lot
+        with self.assertRaises(AssertionError) as got:
+            validate(cfg)
+        self.assertIn("holdout_combo_frac", str(got.exception))
+
+    def test_a_lineup_wider_than_the_open_values_is_refused(self):
+        """A fourth candidate had to be a reserved lot: never the answer, so it
+        was ruled out without listening and chance was 1/3, not 1/4."""
+        cfg = Config()
+        cfg.curriculum.n_candidates = 4
+        with self.assertRaises(AssertionError):
+            validate(cfg)
+
+    def test_one_pool_splits_into_equal_sides(self):
+        """4 farmers and 8 buyers became 8 of each, and a market sized for four
+        farms crashed."""
+        cfg = Config()
+        cfg.population.n_buyers = cfg.population.n_farmers + 2
+        with self.assertRaises(AssertionError):
+            validate(cfg)
+
+    def test_every_shape_withholds_as_little_as_it_can(self):
+        """The `duality` preset's 12 fruits left some (fruit, quality) pairs one
+        unreserved colour, so its colour rounds had to show reserved lots."""
+        from orchard.world import ComboHoldout
+        for nv in (4, 6, 12):
+            cfg = Config()
+            cfg.world.n_varieties = nv
+            h = ComboHoldout(cfg.world, cfg.world.holdout_combo_frac, cfg.world.holdout_seed)
+            self.assertEqual(len(h), nv * cfg.world.n_colors, "one quality per lot")
+            for f in range(3):
+                self.assertGreaterEqual(h.open_values(f), cfg.curriculum.n_candidates,
+                                        "%d fruits, field %d" % (nv, f))
+            counts = h.counts()
+            for name, per_value in counts.items():
+                self.assertEqual(len(set(per_value)), 1, "%s withheld unevenly: %s"
+                                 % (name, per_value))
+            validate(cfg)
+
+    def test_the_default_reserved_set_is_the_latin_square_it_always_was(self):
+        """Snapshots and results from earlier runs were measured on this set."""
+        from orchard.world import ComboHoldout
+        cfg = Config()
+        h = ComboHoldout(cfg.world, cfg.world.holdout_combo_frac, cfg.world.holdout_seed)
+        self.assertEqual(sorted(h.held)[:4], [(0, 0, 1), (0, 1, 3), (0, 2, 2), (0, 3, 0)])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

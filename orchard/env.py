@@ -114,11 +114,12 @@ def decode_hits(beliefs: Beliefs, sc: Scenario, role: int,
         ]
     # The buyer reports on the line it asked about, so stock 0 means "he does not
     # carry it" -- getting that right is itself a thing the farmer had to convey.
+    # Its colour is not asked: the line is the one the buyer chose, so the colour
+    # is its own observation, and scoring it paid a point for copying it.
     return [
         abs(beliefs.qty - sc.offered_stock) <= R.belief_qty_tol,
         beliefs.quality == sc.offered_quality,
         abs(beliefs.price - sc.farmer.reservation) <= R.belief_price_tol,
-        beliefs.color == sc.offered_color,
     ]
 
 
@@ -523,15 +524,18 @@ def parse_words(cfg: Config, symbols: "list[int]") -> list[tuple[int, ...]]:
     words: list[tuple[int, ...]] = []
     current: list[int] = []
     for sym in symbols:
-        if sym == c.space_id:
-            if current:
-                words.append(tuple(current))
-                current = []
-        elif sym == c.hyphen_id:
+        if sym == c.hyphen_id:
             continue          # joins whatever surrounds it; nothing to record
-        elif c.is_atom(sym):
+        if c.is_atom(sym):
             current.append(sym)
-        # END and PAD terminate / pad and carry no content
+            continue
+        # A space ends a word, and so does END, PAD or anything else that is not
+        # an atom. END and PAD used to be skipped, so a whole dialogue passed in
+        # one list -- [a1 SPACE a2 END PAD .. | a3 END] -- glued the last word of
+        # one turn to the first of the next: [(1,), (2, 3)].
+        if current:
+            words.append(tuple(current))
+            current = []
     if current:
         words.append(tuple(current))
     return words

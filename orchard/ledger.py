@@ -204,12 +204,20 @@ class Ledger:
             # Only the rows that are actually written get built into objects,
             # which is why a wide stride is cheap on a long run.
             tr = batch.transcript(i)
-            self.write(self.row(
+            row = self.row(
                 episode=ep, season=season, scenario=batch.scenario(i),
                 farmer=pop.farmers[int(batch.f_idx[i])],
                 buyer=pop.buyers[int(batch.b_idx[i])],
                 transcript=tr, fd=tr.farmer_decision, bd=tr.buyer_decision,
-                outcome=tr.outcome))
+                outcome=tr.outcome)
+            # The reward each side was trained on. The outcome is rebuilt by the
+            # plain resolver, which charges the length cost ungated and knows
+            # nothing of the gesture cost or the speaker's own terms, so its
+            # reward was not the one training used.
+            if getattr(batch, "f_reward", None) is not None:
+                row["farmer_reward"] = round(float(batch.f_reward[i]), 5)
+                row["buyer_reward"] = round(float(batch.b_reward[i]), 5)
+            self.write(row)
             n += 1
         return n
 

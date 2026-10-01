@@ -150,9 +150,13 @@ class TestDecodingNeedsTheChannel(unittest.TestCase):
             self.assertEqual(f, (sc.buyer.want_variety, sc.buyer.need_qty,
                                  sc.buyer.min_quality, sc.buyer.max_price))
             # the buyer is asked only about farmer-side facts: how much of the
-            # lot there is, its quality and colour, and the farmer's floor price
+            # lot there is, its quality, and the farmer's floor price. Not its
+            # colour: the lot is the one the buyer asked for, so its colour is
+            # the buyer's own request (`offered_color` is `want_color`), and
+            # scoring it paid a point for copying its own observation.
+            self.assertEqual(sc.offered_color, sc.buyer.want_color)
             hits = decode_hits(truth(sc, BUYER), sc, BUYER, cfg)
-            self.assertEqual(len(hits), 4)
+            self.assertEqual(len(hits), 3)
             self.assertTrue(all(hits))
 
     def test_tolerances_are_respected(self):

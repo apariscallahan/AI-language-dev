@@ -211,18 +211,23 @@ def gesture_tokens_for(cfg: Config, phase, role: int, obs: torch.Tensor,
 def gesture_share(cfg: Config, phase, updates_in_phase: int) -> float:
     """The share of rounds in which gesturing is possible, right now.
 
-    High at the start of a rung that still has a word to invent and withdrawn
+    High at the start of a rung that still has a word to form and withdrawn
     over ``gesture.anneal_updates`` -- a parent stops pointing once the child
     has the word, and a rung is judged word-only in any case, so a word that
     never took over from the gesture fails the gate as before. In every rung
-    that only reuses words a small standing share stays: fingers are part of a
-    market, and whether the speakers still bother with them once the words
-    work is something to measure.
+    that only reuses words -- `name-all` and up -- a small standing share
+    stays: fingers are part of a market, and whether the speakers still bother
+    with them once the words work is something to measure.
     """
     g = cfg.gesture
     if not g.enabled:
         return 0.0
-    if getattr(phase, "invents", False):
+    # Only where a field's words still have to form. `name-all` used to get
+    # the full schedule too, and its speakers pointed at one part and said one
+    # word ("[points: PEAR] a26") -- a gesture carries one field, standing in
+    # for a word the speaker already had, in the rung whose job is to put the
+    # words together.
+    if getattr(phase, "forms_words", False):
         from .rollout import anneal
         return float(anneal(g.share_start, g.share_end, updates_in_phase,
                             g.anneal_updates))

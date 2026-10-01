@@ -571,6 +571,7 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
     tok_loss_val = dec_loss_val = 0.0
     tok_acc = dec_acc = None
 
+    was_training = agent.net.training
     agent.net.train()
     for _ in range(bc.epochs):
         # every minibatch of every group, in one shuffled order
@@ -631,7 +632,9 @@ def train_newborn(cfg: Config, agent: Agent, store: TranscriptStore,
         dec_loss_val = ep_dec / max(1, n_dec_b)
         tok_acc = (tok_hit / tok_n) if tok_n else None
         dec_acc = (dec_hit / dec_n) if dec_n else None
-    agent.net.eval()
+    # Back in the mode it came in: every other agent trains in train mode, and a
+    # newborn left in eval mode would differ from them wherever dropout is on.
+    agent.net.train(was_training)
 
     # Hand the agent back a fresh RL optimiser -- the apprenticeship optimiser's
     # moments are about a different objective and should not carry over.

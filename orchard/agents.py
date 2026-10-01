@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -47,9 +47,10 @@ import torch.nn.functional as F
 
 from .config import Config
 from .env import BUYER, FARMER, speaker_of_turn
-from .gesture import n_token_ids
+from .gesture import gesture_offsets, n_token_ids
 from .world import (K_COLOR, K_EMPTY, K_FIELD, K_PRICE, K_QTY, K_QUALITY, K_VARIETY,
-                    N_LOT_FIELDS, QUERY_ALL, lot_spans, n_cells, n_obs_slots, obs_schema)
+                    LOT_KINDS, N_LOT_FIELDS, QUERY_ALL, lot_spans, n_cells, n_obs_slots,
+                    obs_schema)
 
 # Innate concepts (`model.innate_concepts`): the kind of thing each field of a lot
 # is. A fruit is an object kind, a colour or a quality a property, a quantity or
@@ -77,6 +78,101 @@ def thermometer(values: torch.Tensor, n_values: int) -> torch.Tensor:
     return (values.unsqueeze(-1) >= steps).float()
 
 
+class LexicalSpeaker(nn.Module):
+    """Production through a mental lexicon: pick a part of the thing, say its word.
+
+    The production half of the language faculty (`model.lexical_speaker`), and
+    the reader's counterpart. When a speaker is describing a lot it can see,
+    its token logits get a second term: the hidden state chooses which of the
+    lot's five parts it is naming now -- an attention over the parts' concepts,
+    each built from the field's value and kind alone -- and one shared output
+    layer turns that concept into atoms. That layer never sees the context, so
+    the word for red is the same word whether red is asked about on its own or
+    is the second thing said about a red apple: a word learned alone is
+    available in company, the production twin of the reader's out-of-context
+    lookup (Levelt's lexical access).
+
+    Why it exists: measured on 2026-09-30, speakers taught a one-word dialect
+    for every field value (each field named alone at 0.99-1.00) and put into
+    `name-all` grew descriptions to 2.5 words and then cut them back to one --
+    the fruit and nothing else -- within 100 updates, reusing their own words
+    for 11% of fields. A second word came from the transformer's token head,
+    for which "the colour word, second, in a whole-lot round" was a new
+    context: it was a random atom, usually some other value's name, charged by
+    the composition term and misread by the listener, so continuing was
+    punished and the speakers learned to stop. With the lexicon, whatever part
+    the speaker attends to, the word that comes out is that part's word.
+
+    What stays learned: which atoms name which value (the output layer), which
+    part to name first and next (the attention), how many words to say and
+    when to stop (the token head's END), and every structural choice. Where
+    the observation is not a lot -- a barn, a lineup -- the term is absent.
+    """
+
+    # How hard a speaker describing a whole thing is pushed on past a word while
+    # parts of it are still unnamed, in nats taken from ending and given to
+    # going on. Learned from there; see `CommNet.describing`. Measured with two
+    # founders drilled on "a word, then stop": at 3.0 one founder went on 99%
+    # of the time and the other 10%, so its listener never learned its longer
+    # descriptions and it stayed at one word for 100 updates; when both did go
+    # on, their token heads had learned it so hard that descriptions ran to 8.5
+    # words. At 5.0 both said exactly five words, one per part, by update 50.
+    GO_ON_INIT = 5.0
+    # How strongly a part already named in this turn is passed over when
+    # choosing the part to name next (inhibition of return), in attention
+    # logits. Learned from there.
+    INHIBIT_INIT = 4.0
+
+    def __init__(self, cfg: Config, d: int):
+        super().__init__()
+        self.atomic_vocab = cfg.channel.atomic_vocab
+        self.n_emittable = cfg.channel.n_emittable
+        self.query = nn.Linear(d, d)
+        self.norm = nn.LayerNorm(d)
+        self.say = nn.Linear(d, self.atomic_vocab)
+        self.gain = nn.Parameter(torch.ones(()))
+        self.go_on = nn.Parameter(torch.tensor(self.GO_ON_INIT))
+        self.inhibit = nn.Parameter(torch.tensor(self.INHIBIT_INIT))
+        push = torch.zeros(self.n_emittable)
+        push[cfg.channel.end_id] = -1.0
+        push[cfg.channel.space_id] = 1.0
+        self.register_buffer("_push", push, persistent=False)
+
+    @torch.no_grad()
+    def part_words(self, concepts: torch.Tensor) -> torch.Tensor:
+        """(B, 5): the atom this speaker says for each part of the lot -- what its
+        lexicon produces when it attends to that part alone."""
+        return self.say(self.norm(concepts)).argmax(-1)
+
+    def forward(self, h: torch.Tensor, concepts: torch.Tensor,
+                said: Optional[torch.Tensor] = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``h`` (B, d) or (B, K, d) hidden states, ``concepts`` (B, 5, d);
+        ``said`` ((B, 5) or (B, K, 5)) the parts already named in this turn.
+
+        Returns token-logit contributions (h's shape with n_emittable last;
+        zero on everything but atoms) and the attention over the five parts.
+        A part already named is passed over when choosing the next (``inhibit``):
+        made to go on without it, speakers named a second part and then said
+        its word again until the turn's cap -- `a11 a28 a28 a28 a28`.
+        """
+        squeeze = h.dim() == 2
+        if squeeze:
+            h = h.unsqueeze(1)                                           # (B, 1, d)
+        q = self.query(h)                                                # (B, K, d)
+        scores = torch.einsum("bkd,bfd->bkf", q, concepts) / math.sqrt(q.shape[-1])
+        if said is not None:
+            said = said.to(scores.dtype)
+            scores = scores - self.inhibit * (said.unsqueeze(1) if said.dim() == 2 else said)
+        att = torch.softmax(scores, dim=-1)                              # (B, K, 5)
+        mix = torch.einsum("bkf,bfd->bkd", att, concepts)                 # (B, K, d)
+        atoms = self.gain * self.say(self.norm(mix))                      # (B, K, A)
+        out = F.pad(atoms, (0, self.n_emittable - self.atomic_vocab))
+        if squeeze:
+            return out.squeeze(1), att.squeeze(1)
+        return out, att
+
+
 class LexicalReader(nn.Module):
     """Comprehension through a mental lexicon: words in, attributes out.
 
@@ -98,12 +194,15 @@ class LexicalReader(nn.Module):
        learned; that there are nouns is not.
     3. **Numerals sit on a number line.** A numeral's meaning is a place on the
        line and a precision, plus whatever exceptions it learns, so "about
-       four" is as easy to mean as "four", and near misses are near.
+       four" is as easy to mean as "four", and near misses are near (a
+       heavy-tailed kernel, so a far value is unlikely, never impossible).
     4. **A description is assembled from its words** (compositional semantics):
        each attribute is read from the word that names it -- an attention over
        the words by how strongly each is of that attribute's class, with "no
        word names it" as an option -- and a missing attribute is left
-       uncertain rather than guessed from the others.
+       uncertain rather than guessed from the others. No word's chance of
+       naming an attribute falls below ``ATTRIBUTION_FLOOR``, so a word filed
+       under the wrong class can still be re-filed.
 
     The output is five log-distributions, one per field of a lot, which the
     agent adds to its five belief heads (a product of experts with the
@@ -111,6 +210,7 @@ class LexicalReader(nn.Module):
     uniform distributions, so the channel controls keep their meaning.
     """
     MAX_ATOMS = 8            # position-in-word embeddings; longer words share the last
+    ATTRIBUTION_FLOOR = 0.05  # the least chance any word has of naming any attribute
 
     def __init__(self, cfg: Config, d: int):
         super().__init__()
@@ -122,6 +222,10 @@ class LexicalReader(nn.Module):
         # position in the word, as a gain on the atom's vector: a7-a2 and
         # a2-a7 are different words
         self.slot_gain = nn.Parameter(torch.ones(self.MAX_ATOMS, d))
+        # how many atoms the word has, added after pooling: the LayerNorm below
+        # removes scale, and without this `a19` and `a19-a19` differed only in
+        # scale and read as one word (cosine 0.997 at birth)
+        self.word_len = nn.Embedding(self.MAX_ATOMS + 1, d)
         self.norm = nn.LayerNorm(d)
         self.encode_word = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         self.word_class = nn.Linear(d, len(WORD_CLASSES))
@@ -141,10 +245,16 @@ class LexicalReader(nn.Module):
         A word has to be read as of an attribute's class with some confidence
         (log p(class) above -2) before it outscores "no word names it"; the
         number line starts broad (a numeral means "somewhere around here")
-        and sharpens as the word does.
+        and sharpens as the word does. The position gains start far apart --
+        each position its own random direction per dimension -- so a word's
+        atoms in a different order are a different word from birth (at
+        1 +- 0.1 `a19-a20` and `a20-a19` had cosine 0.98-0.996); the word
+        length embedding starts on the atoms' scale, so repeating an atom
+        makes another word too.
         """
         with torch.no_grad():
-            self.slot_gain.copy_(1.0 + 0.1 * torch.randn_like(self.slot_gain))
+            self.slot_gain.copy_(torch.randn_like(self.slot_gain))
+            self.word_len.weight.normal_(0.0, 0.02)
             self.unnamed.fill_(-2.0)
             self.gain.fill_(1.0)
             self.line_width.bias.fill_(2.0)
@@ -160,7 +270,11 @@ class LexicalReader(nn.Module):
         exactly "the first atom of the turn, or the first after a SPACE".
         """
         atom = heard & (ids < self.atomic_vocab)
-        prev = torch.cat([torch.full_like(ids[:, :1], -1), ids[:, :-1]], dim=1)
+        # the symbol before, as heard: a slot the listener did not hear (its own
+        # turn) cannot join its atom to the next word
+        prev = torch.cat([torch.full_like(ids[:, :1], -1),
+                          torch.where(heard[:, :-1], ids[:, :-1],
+                                      torch.full_like(ids[:, :-1], -1))], dim=1)
         start = atom & (prev != self.hyphen_id)
         # Positions before a row's first word get -1, clamped to word 0; none
         # of them is an atom, so they contribute nothing wherever they point.
@@ -202,8 +316,10 @@ class LexicalReader(nn.Module):
         vec = vec * self.slot_gain[pos] * atom.unsqueeze(-1).float()
         words = torch.zeros((B, W, d), device=ids.device, dtype=vec.dtype)
         words = words.scatter_add(1, word.unsqueeze(-1).expand(-1, -1, d), vec)
-        # which word slots hold a word in this row (atoms counted per slot)
-        exists = torch.zeros((B, W), device=ids.device).scatter_add(1, word, atom.float()) > 0
+        # atoms per word slot: which slots hold a word in this row, and how long
+        n_atoms = torch.zeros((B, W), device=ids.device).scatter_add(1, word, atom.float())
+        exists = n_atoms > 0
+        words = words + self.word_len(n_atoms.long().clamp(max=self.MAX_ATOMS))
         v = self.encode_word(self.norm(words))                       # (B, W, d)
 
         # word class, then which attribute within the class
@@ -214,6 +330,15 @@ class LexicalReader(nn.Module):
                                 cls[..., 1] + adj[..., 0], cls[..., 1] + adj[..., 1],
                                 cls[..., 2] + num[..., 0], cls[..., 2] + num[..., 1]],
                                dim=-1)                                # (B, W, 5)
+        # Every word keeps a small chance of naming every attribute. Without it
+        # a word filed under the wrong attribute early was never read as its
+        # own: its weight went to 0, so its meaning for that attribute was never
+        # trained, so there was nothing to gain by moving it back -- measured
+        # with the agents' own initialisation, words learned one at a time were
+        # read at 0.49-0.85 on some field in every seed of five.
+        floor = self.ATTRIBUTION_FLOOR
+        of_field = torch.logaddexp(of_field + math.log1p(-floor),
+                                   torch.full_like(of_field, math.log(floor)))
         of_field = of_field.masked_fill(~exists.unsqueeze(-1), float("-inf"))
         none = self.unnamed.view(1, 1, N_LOT_FIELDS).expand(B, 1, N_LOT_FIELDS)
         attend = F.log_softmax(torch.cat([of_field, none], dim=1), dim=1)   # (B, W+1, 5)
@@ -228,7 +353,12 @@ class LexicalReader(nn.Module):
                 grid = torch.arange(span, device=ids.device, dtype=lg.dtype)
                 mu = line_at[..., j].unsqueeze(-1) * (span - 1)
                 width = line_w[..., j].unsqueeze(-1)
-                lg = lg - 0.5 * ((grid - mu) / width) ** 2
+                # Heavy-tailed: near misses are near, and a far value is
+                # unlikely but not impossible. The Gaussian this replaces gave a
+                # numeral whose place had drifted to 0 at the narrowest width a
+                # penalty of ~270 nats on "seven", and nothing could move it
+                # back: the value was read as never meant.
+                lg = lg - torch.log1p(((grid - mu) / width) ** 2)
             lp = F.log_softmax(lg, dim=-1)
             flat = torch.full((B, 1, span), -math.log(span), device=ids.device, dtype=lp.dtype)
             lp = torch.cat([lp, flat], dim=1)                        # (B, W+1, span)
@@ -385,6 +515,12 @@ class CommNet(nn.Module):
         self.lexical = bool(m.lexical_reader)
         if self.lexical:
             self.reader = LexicalReader(cfg, d)
+        # ...and its production twin (`model.lexical_speaker`): the word for the
+        # part of the lot the speaker is naming, added to the token logits.
+        self.speaks_lexically = bool(m.lexical_speaker)
+        if self.speaks_lexically:
+            self.speaker_lexicon = LexicalSpeaker(cfg, d)
+            self._gesture_offsets = gesture_offsets(cfg)
         # Innate concepts (`model.innate_concepts`): the kind of thing each lot
         # field is, and a number line under quantities and prices.
         self.innate_concepts = bool(m.innate_concepts)
@@ -553,13 +689,120 @@ class CommNet(nn.Module):
         return run(tokens)
 
     # ------------------------------------------------------------------
+    def lot_concepts(self, obs: torch.Tensor, schema=None) -> Optional[torch.Tensor]:
+        """(B, 5, d): the speaker's own lot, field by field, as concepts -- each
+        field's value and kind, with no context -- or None where the
+        observation is not a lot to describe (a barn, a lineup)."""
+        s = schema if schema is not None else self.schema
+        n = N_LOT_FIELDS
+        if len(s) <= n or tuple(s[:n]) != tuple(LOT_KINDS) or s[n] != K_FIELD:
+            return None
+        vecs = []
+        for i, kind in enumerate(LOT_KINDS):
+            v = self.field_embed(kind, obs[:, i]) + self.slot_emb.weight[N_FIXED_SLOT_TYPES + kind]
+            if self.innate_concepts:
+                v = v + self.concept_emb.weight[CONCEPT_OF_KIND[kind]]
+            vecs.append(v)
+        return torch.stack(vecs, dim=1)
+
+    def speak(self, h: torch.Tensor, obs: torch.Tensor, schema=None,
+              turn: Optional[tuple] = None) -> torch.Tensor:
+        """Token logits from hidden state(s) ``h`` ((B, d) or (B, K, d)): the
+        token head's, plus -- with `model.lexical_speaker`, describing a lot --
+        the mental lexicon's word for the part being named (:class:`LexicalSpeaker`).
+        ``turn`` is (push, said) from :meth:`turn_so_far`: which parts this
+        turn has named (passed over when choosing the next), and whether a
+        whole thing is being described with parts of it still unnamed (there
+        ending loses ``go_on`` nats to going on). Every place that emits or
+        scores a symbol reads this, so generation, evaluation and a newborn's
+        lessons agree."""
+        logits = self.token_head(h)
+        if self.speaks_lexically:
+            concepts = self.lot_concepts(obs, schema)
+            if concepts is not None:
+                lex = self.speaker_lexicon
+                push, said = turn if turn is not None else (None, None)
+                logits = logits + lex(h, concepts, said)[0]
+                if push is not None:
+                    logits = logits + (lex.go_on * push.to(logits.dtype)).unsqueeze(-1) * lex._push
+        return logits
+
+    def describing(self, obs: torch.Tensor, schema, tokens: torch.Tensor,
+                   positions: Sequence[int]) -> Optional[torch.Tensor]:
+        """(B, P) bool: the push part of :meth:`turn_so_far`."""
+        got = self.turn_so_far(obs, schema, tokens, positions)
+        return None if got is None else got[0]
+
+    @torch.no_grad()
+    def turn_so_far(self, obs: torch.Tensor, schema, tokens: torch.Tensor,
+                    positions: Sequence[int]) -> Optional[tuple]:
+        """(push (B, P) bool, said (B, P, 5) bool) before each dialogue position
+        in ``positions``: which parts of the lot this turn has named, and is
+        this speaker describing a whole lot with some of them still unnamed?
+
+        The innate pragmatics of the production side -- say as much as the
+        question asks (Grice's maxim of quantity). The speaker sees the question
+        (the query slot: one field, or all of it) and monitors its own turn: a
+        part counts as named once the turn holds that part's word (what the
+        lexicon says for it, :meth:`LexicalSpeaker.part_words`) or a gesture at
+        it. Asked for a whole lot, it is pushed on while any part is unnamed,
+        and never past one word per part; asked for one field, never.
+
+        Why it exists: measured on 2026-09-30, speakers who could name every
+        field alone, and whose next word -- when made to go on -- named a
+        different part of the lot 99-100% of the time, went on after their first
+        word 0.02-0.03% of the time. One-field rounds teach "a word, then stop",
+        nothing in a whole-lot round says there is more to say, and a
+        continuation that is never tried cannot be learned. How hard the push
+        is (`go_on`) is learned like everything else.
+
+        None where it does not apply: no production lexicon, or not a lot.
+        """
+        if not self.speaks_lexically:
+            return None
+        concepts = self.lot_concepts(obs, schema)
+        if concepts is None:
+            return None
+        c = self.cfg.channel
+        L, A = c.max_msg_len, c.atomic_vocab
+        B, D = tokens.shape
+        whole = obs[:, N_LOT_FIELDS] >= QUERY_ALL                       # (B,)
+        words = self.speaker_lexicon.part_words(concepts)               # (B, 5)
+        is_atom = tokens < A
+        names = is_atom.unsqueeze(-1) & (tokens.unsqueeze(-1) == words.unsqueeze(1))
+        # a gesture names the part it points at
+        g = tokens - c.n_symbol_ids
+        offs = torch.tensor(self._gesture_offsets, device=tokens.device)
+        in_g = (g >= 0) & (g < int(sum(lot_spans(self.cfg.world))))
+        g_field = (torch.bucketize(g.clamp(min=0), offs, right=True) - 1).clamp(0, N_LOT_FIELDS - 1)
+        names = names | (in_g.unsqueeze(-1)
+                         & (g_field.unsqueeze(-1) == torch.arange(N_LOT_FIELDS, device=tokens.device)))
+        prev = torch.cat([torch.full_like(tokens[:, :1], c.pad_id), tokens[:, :-1]], dim=1)
+        at_turn_start = (torch.arange(D, device=tokens.device) % L == 0).unsqueeze(0)
+        prev = torch.where(at_turn_start, torch.full_like(prev, c.pad_id), prev)
+        starts = is_atom & (prev != c.hyphen_id)
+        zero_n = torch.zeros((B, 1, N_LOT_FIELDS), dtype=torch.long, device=tokens.device)
+        zero_s = torch.zeros((B, 1), dtype=torch.long, device=tokens.device)
+        cs_n = torch.cat([zero_n, names.long().cumsum(1)], dim=1)       # (B, D+1, 5)
+        cs_s = torch.cat([zero_s, starts.long().cumsum(1)], dim=1)      # (B, D+1)
+        pos = torch.as_tensor(list(positions), dtype=torch.long, device=tokens.device).clamp(0, D)
+        t0 = (pos // L) * L
+        said = (cs_n[:, pos] - cs_n[:, t0]) > 0                           # (B, P, 5)
+        n_words = cs_s[:, pos] - cs_s[:, t0]                              # (B, P)
+        unnamed = N_LOT_FIELDS - said.sum(-1)
+        push = whole.unsqueeze(1) & (unnamed > 0) & (n_words >= 1) & (n_words < N_LOT_FIELDS)
+        return push, said
+
     def next_token_logits(self, obs: torch.Tensor, tokens: torch.Tensor,
                           seq_pos: int, schema=None, self_mask=None
                           ) -> tuple[torch.Tensor, torch.Tensor]:
         """Logits for the token that will occupy ``seq_pos``, plus that state's value."""
         h = self.encode(obs, tokens, upto=seq_pos, schema=schema,
                         self_mask=self_mask)[:, -1]
-        return self.token_head(h), self.value_head(h).squeeze(-1)
+        turn = self.turn_so_far(obs, schema, tokens, [seq_pos - dialogue_offset(self.cfg)])
+        return (self.speak(h, obs, schema, None if turn is None
+                           else (turn[0][:, 0], turn[1][:, 0])),
+                self.value_head(h).squeeze(-1))
 
     def read_words(self, dialogue: torch.Tensor, ids: Optional[torch.Tensor] = None,
                    self_mask: Optional[torch.Tensor] = None
@@ -712,7 +955,11 @@ class CommNet(nn.Module):
         """
         h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)   # (B, L, d)
         hr = h[:, read_positions]                           # (B, K, d)
-        tok_logits = self.token_head(hr)                    # (B, K, V+1)
+        # the dialogue position each of those states emits into
+        turn = (self.turn_so_far(obs, schema, tokens,
+                                 (read_positions - dialogue_offset(self.cfg) + 1).tolist())
+                if read_positions.numel() else None)
+        tok_logits = self.speak(hr, obs, schema, turn)      # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)
         hd = h[:, -1]
         dec = self.all_heads(hd, obs, self.read_words(tokens, None, self_mask))

@@ -82,6 +82,15 @@ class TestSymbolStream(unittest.TestCase):
         self.assertEqual(parse_words(cfg, [E]), [])
         self.assertEqual(parse_words(cfg, [S, S, H, 4, E]), [(4,)])   # malformed, still fine
 
+    def test_a_turn_ends_its_last_word(self):
+        """A whole dialogue passed in one list glued the last word of one turn
+        to the first word of the next: [a1 a2 END PAD .. | a3 END] -> (2, 3)."""
+        cfg = small_cfg()
+        c = cfg.channel
+        H, S, E, P = c.hyphen_id, c.space_id, c.end_id, c.pad_id
+        self.assertEqual(parse_words(cfg, [1, S, 2, E, P, P, 3, E]), [(1,), (2,), (3,)])
+        self.assertEqual(parse_words(cfg, [1, H, 2, P, 3]), [(1, 2), (3,)])
+
     def test_open_vocabulary_is_actually_open(self):
         """The point of the redesign: more words than there are atoms."""
         cfg = small_cfg()

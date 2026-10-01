@@ -12,8 +12,15 @@ What each class protects:
   `mutual`, a buyer's request -- never a one-field round, the guesser or a barn;
 * the innate reader segments words as the word grammar makes them, ignores the
   listener's own words and gestures, reads a muted turn as uniform, passes a
-  gradient to the speaker's atoms -- and understands a five-word description
-  made of words it only ever learned one at a time;
+  gradient to the speaker's atoms -- and, built as a brain builds it, on three
+  seeds, understands a five-word description made of words it only ever
+  learned one at a time;
+* the production lexicon says a part's word in a context it never trained in;
+  asked about a whole lot a speaker is pushed on while parts are unnamed (never
+  past one word per part, never on a one-field question), and a part once named
+  is passed over;
+* names and word order keep their own clocks, a split twin speaks its
+  original's words, and a speaker with none describes with the community's;
 * innate concepts: the number line orders magnitudes, and switching the faculty
   off restores the plain brain;
 * the productivity test is decided by the reserved fields alone, and is
@@ -382,13 +389,21 @@ class TestTheInnateReader(unittest.TestCase):
         """The point of the faculty. Trained only on one-word utterances -- one
         field at a time, as the naming rungs teach -- the reader decodes
         five-word descriptions it has never heard, in any word order, and says
-        "don't know" about a field no word names."""
+        "don't know" about a field no word names.
+
+        The agents' own reader, initialised as a brain is (a bare
+        `LexicalReader` with PyTorch's defaults passed this while the real one
+        read some field at 0.49-0.85 in every seed: words filed under the
+        wrong attribute early were never re-filed). Three seeds."""
+        for seed in range(3):
+            self._composes(seed)
+
+    def _composes(self, seed: int) -> None:
         cfg = Config()
         c = cfg.channel
         spans = lot_spans(cfg.world)
-        torch.manual_seed(0)
-        reader = LexicalReader(cfg, 48)
-        reader.reset_innate()
+        torch.manual_seed(seed)
+        reader = CommNet(cfg, BUYER).reader
         opt = torch.optim.Adam(reader.parameters(), lr=3e-3)
         D = c.max_msg_len
         heard = torch.ones(D, dtype=torch.bool)
@@ -398,7 +413,7 @@ class TestTheInnateReader(unittest.TestCase):
             for ws in words_per_row:
                 rows.append(turn(cfg, utter(cfg, *ws), D=D))
             return torch.stack(rows)
-        g = torch.Generator().manual_seed(1)
+        g = torch.Generator().manual_seed(1 + seed)
         for _ in range(400):
             f = torch.randint(0, N_LOT_FIELDS, (128,), generator=g)
             v = torch.stack([torch.randint(0, spans[int(x)], (1,), generator=g)[0] for x in f])
@@ -424,8 +439,8 @@ class TestTheInnateReader(unittest.TestCase):
             lp = reader(ids, ids, heard)
         for f in range(N_LOT_FIELDS):
             acc = float((lp[f].argmax(-1) == lots[:, f]).float().mean())
-            self.assertGreater(acc, 0.95, "field %d read at %.2f from a five-word description"
-                               % (f, acc))
+            self.assertGreater(acc, 0.95, "seed %d: field %d read at %.2f from a five-word "
+                               "description" % (seed, f, acc))
         # a description that leaves the price out: price is left uncertain
         rows = [[code(cfg, f, lots[i, f]) for f in range(4)] for i in range(n)]
         ids = batch_of(rows)
@@ -434,6 +449,250 @@ class TestTheInnateReader(unittest.TestCase):
         self.assertLess(float(lp[4].exp().max(-1).values.mean()), 0.5,
                         "a field no word names should not be read as if it were")
         self.assertGreater(float((lp[0].argmax(-1) == lots[:, 0]).float().mean()), 0.95)
+
+
+# ==========================================================================
+class TestTheSpeakersLexicon(unittest.TestCase):
+    """The production half: a word learned alone is available in company."""
+
+    def test_a_word_learned_alone_is_said_in_company(self):
+        """Taught only one-field rounds -- the naming rungs -- a speaker asked
+        for a whole lot, a context it never trained in, still says the word
+        for one of that lot's parts. Measured without the lexicon on two
+        seeds: 0.22 and 0.75; with it, 1.00 and 1.00."""
+        from orchard.agents import dialogue_offset
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        spans = lot_spans(cfg.world)
+        off = offsets(cfg)
+        c = cfg.channel
+        torch.manual_seed(0)
+        net = CommNet(cfg, FARMER)
+        self.assertTrue(net.speaks_lexically)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
+        ph = phase_named(cfg, "name-all").with_informer(FARMER)
+        schema, mask, pos = phase_schema(cfg, FARMER, ph), ph.self_mask(cfg, FARMER), dialogue_offset(cfg)
+        opt = torch.optim.Adam(net.parameters(), lr=3e-3)
+        silent = torch.full((64, c.dialogue_len), c.pad_id, dtype=torch.long)
+        for _ in range(120):
+            rb = rw.sample(64, informer=FARMER, mix=(0.2,) * N_LOT_FIELDS + (0.0,))
+            lg, _ = net.next_token_logits(rb.obs(cfg, FARMER), silent, pos, schema=schema,
+                                          self_mask=mask)
+            f = rb.query.clamp(max=N_LOT_FIELDS - 1)
+            tgt = torch.tensor([off[int(x)] for x in f]) + rb.true_meaning[torch.arange(64), f]
+            opt.zero_grad()
+            F.cross_entropy(lg, tgt).backward()
+            opt.step()
+        with torch.no_grad():
+            rb = rw.sample(256, informer=FARMER, query=ASK_ALL)
+            obs = rb.obs(cfg, FARMER)
+            h = net.encode(obs, silent[:1].expand(256, -1), upto=pos, schema=schema,
+                           self_mask=mask)[:, -1]
+            words = torch.stack([off[f] + rb.true_meaning[:, f] for f in range(N_LOT_FIELDS)], 1)
+            said = net.speak(h, obs, schema)[:, :c.atomic_vocab].argmax(-1)
+            lex, att = net.speaker_lexicon(h, net.lot_concepts(obs, schema))
+            alone = lex[:, :c.atomic_vocab].argmax(-1)
+        self.assertGreater(float((said.unsqueeze(1) == words).any(1).float().mean()), 0.9,
+                           "the first word of a whole-lot description names none of its parts")
+        self.assertGreater(float((alone.unsqueeze(1) == words).any(1).float().mean()), 0.9)
+        self.assertTrue(torch.allclose(att.sum(-1), torch.ones(256), atol=1e-5))
+
+    def test_the_word_depends_on_the_part_not_the_context(self):
+        """Whatever the hidden state, attending to one part says that part's
+        word: the output layer never sees the context."""
+        from orchard.agents import LexicalSpeaker
+        cfg = Config()
+        torch.manual_seed(1)
+        spk = LexicalSpeaker(cfg, 16)
+        concepts = torch.randn(2, N_LOT_FIELDS, 16)
+        concepts[1, 2] = concepts[0, 2]                 # the same colour, other parts differ
+        with torch.no_grad():
+            spk.query.weight.zero_()
+            spk.query.bias.zero_()
+            # a query that picks out part 2 in both rows
+            spk.query.bias.copy_(concepts[0, 2] * 50.0)
+            out, att = spk(torch.randn(2, 16), concepts)
+        self.assertGreater(float(att[0, 2]), 0.99)
+        self.assertGreater(float(att[1, 2]), 0.99)
+        self.assertTrue(torch.allclose(out[0], out[1], atol=1e-3))
+        self.assertTrue(bool((out[:, cfg.channel.atomic_vocab:] == 0).all()),
+                        "only atoms are ever pushed")
+
+    def test_asked_for_the_whole_lot_it_goes_on_until_every_part_is_named(self):
+        """Say as much as the question asks. Measured before this existed:
+        speakers whose next word, when made to go on, named a different part
+        99-100% of the time went on after their first word 0.02-0.03% of the
+        time, so combining was never tried and could not be learned."""
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        c = cfg.channel
+        S = c.space_id
+        torch.manual_seed(0)
+        net = CommNet(cfg, FARMER)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(0))
+        ph = phase_named(cfg, "name-all").with_informer(FARMER)
+        schema = phase_schema(cfg, FARMER, ph)
+        obs = rw.sample(3, informer=FARMER, query=ASK_ALL).obs(cfg, FARMER)
+        w = net.speaker_lexicon.part_words(net.lot_concepts(obs, schema))
+        toks = torch.full((3, c.dialogue_len), c.pad_id, dtype=torch.long)
+
+        def put(row, seq):
+            toks[row, :len(seq)] = torch.tensor(seq)
+        # one part named; every part named; a gesture for the fruit and four words
+        put(0, [int(w[0, 0])])
+        put(1, sum([[int(w[1, f]), S] for f in range(N_LOT_FIELDS)], [])[:-1])
+        put(2, [gesture_id(cfg, 0, int(obs[2, 0]))]
+            + sum([[int(w[2, f]), S] for f in range(1, N_LOT_FIELDS)], [])[:-1])
+        named_all = {1: 2 * N_LOT_FIELDS - 1, 2: 2 * (N_LOT_FIELDS - 1)}
+        push = net.describing(obs, schema, toks, range(12))
+        self.assertFalse(bool(push[:, 0].any()), "nothing to push before the first word")
+        self.assertTrue(bool(push[0, 1:].all()), "one part named of five: go on")
+        for row, end in named_all.items():
+            names = len(set(int(x) for x in w[row].tolist()))
+            if names == N_LOT_FIELDS:            # distinct words: all named at the end
+                self.assertFalse(bool(push[row, end]), "every part named: free to stop")
+        # never past one word per part, even saying one word over and over
+        toks[0] = c.pad_id
+        put(0, sum([[int(w[0, 0]), S] for _ in range(N_LOT_FIELDS)], [])[:-1])
+        push = net.describing(obs, schema, toks, [2 * N_LOT_FIELDS - 1])
+        self.assertFalse(bool(push[0, 0]))
+        # asked about one field, never
+        one = rw.sample(3, informer=FARMER, query=1).obs(cfg, FARMER)
+        self.assertFalse(bool(net.describing(one, schema, toks, range(12)).any()))
+        # the push moves ending's weight to a new word, nothing else, and is learned
+        h = torch.randn(3, cfg.model.d_model)
+        with torch.no_grad():
+            d = (net.speak(h, obs, schema, (torch.ones(3, dtype=torch.bool), None))
+                 - net.speak(h, obs, schema))
+        g = float(net.speaker_lexicon.go_on.detach())
+        self.assertAlmostEqual(float(d[0, c.end_id]), -g, places=5)
+        self.assertAlmostEqual(float(d[0, c.space_id]), g, places=5)
+        self.assertAlmostEqual(float(d[0].abs().sum()), 2 * g, places=4)
+        self.assertTrue(net.speaker_lexicon.go_on.requires_grad)
+
+    def test_a_part_already_named_is_passed_over(self):
+        """Inhibition of return. Pushed on without it, speakers named a second
+        part and then said its word until the cap: `a11 a28 a28 a28 a28`."""
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        c = cfg.channel
+        torch.manual_seed(2)
+        net = CommNet(cfg, FARMER)
+        rw = ReferentialWorld(cfg, generator=torch.Generator().manual_seed(2))
+        ph = phase_named(cfg, "name-all").with_informer(FARMER)
+        schema = phase_schema(cfg, FARMER, ph)
+        obs = rw.sample(64, informer=FARMER, query=ASK_ALL).obs(cfg, FARMER)
+        concepts = net.lot_concepts(obs, schema)
+        h = torch.randn(64, cfg.model.d_model)
+        lex = net.speaker_lexicon
+        with torch.no_grad():
+            _, free = lex(h, concepts)
+            top = free.argmax(-1)                                    # the part it would name
+            said = F.one_hot(top, N_LOT_FIELDS).bool()
+            _, after = lex(h, concepts, said)
+        rows = torch.arange(64)
+        self.assertTrue(bool((after[rows, top] < free[rows, top]).all()))
+        self.assertLess(float(after[rows, top].mean()), 0.2,
+                        "a named part still draws the attention")
+        # and it runs through speak(): the push and the parts said, together
+        toks = torch.full((64, c.dialogue_len), c.pad_id, dtype=torch.long)
+        turn = net.turn_so_far(obs, schema, toks, [0])
+        self.assertEqual(tuple(turn[1].shape), (64, 1, N_LOT_FIELDS))
+        self.assertTrue(lex.inhibit.requires_grad)
+
+    def test_a_barn_or_a_lineup_gets_no_lexical_term(self):
+        from orchard.curriculum import phase_schema
+        cfg = Config()
+        net = CommNet(cfg, FARMER)
+        order = phase_named(cfg, "order")
+        barn = phase_schema(cfg, FARMER, order)
+        guess = phase_schema(cfg, BUYER, phase_named(cfg, "name-all").with_informer(FARMER))
+        obs = torch.zeros((2, len(barn)), dtype=torch.long)
+        self.assertIsNone(net.lot_concepts(obs, barn))
+        self.assertIsNone(net.lot_concepts(torch.zeros((2, len(guess)), dtype=torch.long), guess))
+
+
+# ==========================================================================
+class TestTheLexiconKeepsItsWords(unittest.TestCase):
+    """Names and word order run on their own clocks, travel with an agent, and a
+    speaker with none describes with the community's."""
+
+    def setUp(self):
+        self.cfg = roomy()
+        self.cfg.reward.lexicon_min_support = 3
+        self.cfg.reward.usage_half_life_updates = 10
+        self.lex = SpeakerLexicon(self.cfg)
+        for f, span in enumerate(lot_spans(self.cfg.world)):
+            for v in range(span):
+                teach(self.lex, 1, (f, v), utter(self.cfg, code(self.cfg, f, v)))
+        self.lot = (1, 2, 3, 4, 5)
+
+    def test_names_do_not_expire_where_nothing_can_teach_them(self):
+        """A single clock expired every name ~750 updates after `name-all`, and
+        composition stopped paying half-way through `mutual`."""
+        n = len(self.lex.names(1))
+        self.lex._decay(500, names=False, orders=True)
+        self.assertEqual(len(self.lex.names(1)), n)
+        self.lex._decay(500, names=True, orders=False)
+        self.assertEqual(self.lex.names(1), {}, "and they do age where they can be taught")
+
+    def test_word_order_keeps_its_own_clock(self):
+        for _ in range(10):
+            self.lex.observe_orders([1], [[3, 1, 0]])
+        before = self.lex.order_count(1, 3, 1)
+        self.lex._decay(50, names=True, orders=False)
+        self.assertAlmostEqual(self.lex.order_count(1, 3, 1), before, places=6)
+        self.lex._decay(10, names=False, orders=True)
+        self.assertAlmostEqual(self.lex.order_count(1, 3, 1), before / 2, places=5)
+
+    def test_a_twin_speaks_its_originals_words(self):
+        self.lex.observe_orders([1] * 5, [[0, 1]] * 5)
+        self.lex.copy_speaker(1, 7)
+        self.assertEqual(self.lex.names(7), self.lex.names(1))
+        self.assertAlmostEqual(self.lex.order_count(7, 0, 1), self.lex.order_count(1, 0, 1))
+        words = utter(self.cfg, *[code(self.cfg, f, self.lot[f]) for f in range(N_LOT_FIELDS)])
+        ct = self.lex.compose_terms([7], [self.lot], [words], coef=1.0)
+        self.assertAlmostEqual(ct["bonus"][0], 1.0, places=6)
+
+    def test_a_speaker_with_no_names_describes_with_the_communitys(self):
+        community = SpeakerLexicon(self.cfg)
+        for f, span in enumerate(lot_spans(self.cfg.world)):
+            for v in range(span):
+                teach(community, POPULATION, (f, v), utter(self.cfg, code(self.cfg, f, v)))
+        words = utter(self.cfg, *[code(self.cfg, f, self.lot[f]) for f in range(N_LOT_FIELDS)])
+        alone = self.lex.compose_terms([42], [self.lot], [words], coef=1.0)
+        self.assertEqual(alone["bonus"], [0.0])
+        helped = self.lex.compose_terms([42], [self.lot], [words], coef=1.0, fallback=community)
+        self.assertAlmostEqual(helped["bonus"][0], 1.0, places=6)
+        self.assertEqual(helped["stats"]["fields_reused"], N_LOT_FIELDS)
+
+    def test_a_new_field_in_a_description_is_not_taxed(self):
+        """Pairs with no history are left out of the average, not counted as 0."""
+        for _ in range(10):
+            self.lex.observe_orders([1], [[3, 1, 0]])
+        said = [utter(self.cfg, *[code(self.cfg, f, self.lot[f]) for f in fs])
+                for fs in ([3, 1, 0], [3, 1, 0, 2], [3, 1, 0, 2, 4])]
+        ct = self.lex.compose_terms([1] * 3, [self.lot] * 3, said, coef=0.0, order_coef=1.0)
+        self.assertAlmostEqual(ct["order"][0], 0.5, places=6)
+        self.assertAlmostEqual(ct["order"][1], 0.5, places=6)
+        self.assertAlmostEqual(ct["order"][2], 0.5, places=6)
+
+    def test_the_trainer_copies_lexicons_to_the_twins_at_the_split(self):
+        from orchard.train import Trainer
+        cfg = Config()
+        cfg.model.d_model, cfg.model.n_layers, cfg.model.d_ff = 32, 1, 64
+        cfg.train.batch_size, cfg.train.device, cfg.log.plot = 32, "cpu", False
+        with tempfile.TemporaryDirectory() as tmp:
+            tr = Trainer(cfg, tmp, quiet=True)
+            try:
+                a = tr.pop.farmers[0]
+                teach(tr.usage.lexicon, a.agent_id, (0, 1), utter(cfg, (3,)))
+                tr.maybe_split_roles(phase_named(cfg, "haggle"), log=lambda *_: None)
+                twin = tr.pop.buyers[0]
+                self.assertNotEqual(twin.agent_id, a.agent_id)
+                self.assertEqual(tr.usage.lexicon.names(twin.agent_id), {(0, 1): (3,)})
+            finally:
+                tr.close()
 
 
 # ==========================================================================
@@ -553,11 +812,26 @@ class TestTheProductivityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tr = Trainer(cfg, tmp, quiet=True)
             try:
-                tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("name-all")
+                names = [p.name for p in tr.curriculum.phases]
+                tr.curriculum.index = names.index("name-all")
                 ev = tr.gather_evidence(tr.curriculum.phase, light=True)
                 self.assertEqual(ev["holdout_success"], ev["holdout_success"], "held-out not measured")
                 self.assertEqual(ev["seen_success"], ev["seen_success"], "comparison not measured")
                 self.assertEqual(sorted(int(k) for k in ev["by_kind"]), list(range(N_LOT_FIELDS + 1)))
+                self.assertTrue(all(len(d.get("each", [])) == 2 for d in ev["by_kind"].values()),
+                                "each describer is scored on its own")
+                # field by field, per guesser: the whole round cannot tell reuse
+                # of all three words from reuse of one
+                self.assertEqual(sorted(ev["holdout_field_names"]),
+                                 sorted("%s %s" % (r, n) for r in ("farmer", "buyer")
+                                        for n in ("fruit", "colour", "quality")))
+                self.assertEqual(set(ev["holdout_role_ratios"]), {"farmer", "buyer"})
+                self.assertNotIn("holdout_error", ev)
+                # a one-field rung is not asked, and prints no number
+                tr.curriculum.index = names.index("name-color")
+                ev = tr.gather_evidence(tr.curriculum.phase, light=True)
+                self.assertNotEqual(ev["holdout_success"], ev["holdout_success"])
+                self.assertNotIn("holdout_field_names", ev)
             finally:
                 tr.close()
 

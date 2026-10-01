@@ -122,8 +122,9 @@ class BatchRollout:
         if self.outcomes:
             return self.outcomes[i]
         from .env import resolve
-        fd, fb = split_decision(self.f_dec[i])
-        bd, bb = split_decision(self.b_dec[i])
+        bel = bool(self.cfg_ref.reward.belief_heads)
+        fd, fb = split_decision(self.f_dec[i], bel)
+        bd, bb = split_decision(self.b_dec[i], bel)
         return resolve(self.cfg_ref, self.sb.scenario(i), fd, bd,
                        float(self.f_cost[i]), float(self.b_cost[i]),
                        f_beliefs=fb, b_beliefs=bb)
@@ -132,6 +133,11 @@ class BatchRollout:
     # The curriculum phase this batch was played under (with its informer, for a
     # swap rung). Whose words are whose depends on it.
     phase: Any = None
+    # Lineups only: (B, K, 5) the log-probability the guesser's belief head for
+    # each field gives each candidate's value of that field -- what the factored
+    # choice sums. Read field by field, it says which parts of a description
+    # arrived (:func:`orchard.metrics.lineup_field_scores`).
+    field_lp: torch.Tensor | None = None
 
     def own_positions(self, role: int) -> list[int]:
         """Dialogue slots ``role`` produced in this batch."""
@@ -144,10 +150,16 @@ class BatchRollout:
                           scenario=self.scenario(i),
                           farmer_decision=split_decision(self.f_dec[i])[0],
                           buyer_decision=split_decision(self.b_dec[i])[0],
-                          farmer_beliefs=split_decision(self.f_dec[i])[1],
-                          buyer_beliefs=split_decision(self.b_dec[i])[1],
+                          farmer_beliefs=split_decision(
+                              self.f_dec[i], self._beliefs_on)[1],
+                          buyer_beliefs=split_decision(
+                              self.b_dec[i], self._beliefs_on)[1],
                           outcome=(self.outcomes[i] if self.outcomes
                                    else (self.outcome(i) if self.res is not None else None)))
+
+    @property
+    def _beliefs_on(self) -> bool:
+        return bool(self.cfg_ref.reward.belief_heads) if self.cfg_ref is not None else True
 
     def obs_for_role(self, role: int) -> torch.Tensor:
         return self.f_obs if role == FARMER else self.b_obs
@@ -170,11 +182,16 @@ def n_outputs(cfg) -> int:
     return 8 if cfg.reward.belief_heads else 4
 
 
-def split_decision(row) -> tuple[Decision, Optional[Beliefs]]:
-    """Unpack one agent's discrete outputs into a deal and (maybe) a belief."""
+def split_decision(row, beliefs: bool = True) -> tuple[Decision, Optional[Beliefs]]:
+    """Unpack one agent's discrete outputs into a deal and (maybe) a belief.
+
+    ``beliefs`` is ``reward.belief_heads``: with it off the batched resolver is
+    given no beliefs and pays no decode terms, and the per-episode paths that
+    unpack through here must not pay them either.
+    """
     from .curriculum import H_BELIEF_COLOR
     v = [int(x) for x in row]
-    if len(v) < 8:
+    if len(v) < 8 or not beliefs:
         return Decision(*v[:4]), None
     colour = v[H_BELIEF_COLOR] if len(v) > H_BELIEF_COLOR else 0
     return Decision(*v[:4]), Beliefs(*v[4:8], color=colour)
@@ -260,9 +277,10 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
     if channel_mode not in ("intact", "scrambled", "muted"):
         raise ValueError("unknown channel_mode %r" % (channel_mode,))
     from .batched import ScenarioBatch, resolve_batch
-    from .curriculum import (H_BELIEF, H_CHOICE, N_HEADS, MutualBatch,
+    from .curriculum import (H_BELIEF, H_CHOICE, H_REPORT, N_HEADS, MutualBatch,
                              ReferentialBatch, ladder, phase_schema,
                              resolve_referential, resolve_reports)
+    from .world import N_LOT_FIELDS
     c = cfg.channel
     if phase is None:
         phase = ladder(cfg)[-1]
@@ -332,16 +350,24 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
                 if channel_mode == "scrambled":
                     noise = torch.randint(0, c.atomic_vocab, (B,), device=device,
                                           generator=generator)
-                    # keep the shape (where it stopped), destroy the content
-                    views[other][:, p] = torch.where(
-                        tok == c.pad_id, torch.full_like(tok, c.pad_id),
-                        torch.where(tok == c.end_id, tok, noise))
+                    # Keep the shape -- where it stopped *and* where its words
+                    # break -- and destroy the content: only atoms are replaced.
+                    # Replacing the hyphens and spaces too made every atom its
+                    # own word, in sequences the grammar never produces, so the
+                    # word reader was handed something no speaker can say and
+                    # "what length alone carries" was measured on it.
+                    views[other][:, p] = torch.where(tok < c.atomic_vocab, noise, tok)
                 else:                              # muted: heard as immediate silence
                     views[other][:, p] = torch.full_like(
                         tok, c.end_id if k == 0 else c.pad_id)
             alive = alive & (tok != c.eos_id)
 
     decs: dict[int, torch.Tensor] = {}
+    field_lp = None
+    if referential and cfg.model.factored_choice:
+        # (the pointer listener does not read the choice through these heads)
+        K = scenarios.meanings.shape[1]
+        field_lp = torch.zeros((B, K, N_LOT_FIELDS), device=device)
     for role in (FARMER, BUYER):
         pool = farmers if role == FARMER else buyers
         idx = f_idx if role == FARMER else b_idx
@@ -351,6 +377,12 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
             heads = pool[a_i].net.decision_logits(
                 obs[ep], views[role][ep], schema=schema_of[role],
                 self_mask=mask_of[role])[:N_HEADS]
+            if field_lp is not None and role == phase.guesser:
+                cand = scenarios.meanings[ep]                       # (b, K, 5)
+                for j, col in enumerate(H_REPORT):
+                    lp = F.log_softmax(heads[col], dim=-1)
+                    v = cand[:, :, j].clamp(0, lp.shape[-1] - 1)
+                    field_lp[ep, :, j] = lp.gather(1, v)
             for col, lg in enumerate(heads):
                 if greedy:
                     out[ep, col] = lg.argmax(dim=-1)
@@ -390,8 +422,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         f_rew = torch.zeros(B)
         b_rew = torch.zeros(B)
         for i, sc in enumerate(scenarios):
-            fd, fb = split_decision(decs[FARMER][i])
-            bd, bb = split_decision(decs[BUYER][i])
+            fd, fb = split_decision(decs[FARMER][i], cfg.reward.belief_heads)
+            bd, bb = split_decision(decs[BUYER][i], cfg.reward.belief_heads)
             o = resolve(cfg, sc, fd, bd, float(f_len[i]), float(b_len[i]),
                         f_beliefs=fb, b_beliefs=bb)
             outcomes.append(o)
@@ -406,7 +438,8 @@ def run_episodes(cfg: Config, scenarios: Sequence[Scenario],
         f_reward=f_rew, b_reward=b_rew,
         outcomes=outcomes, f_emitted=f_emitted, b_emitted=b_emitted,
         f_cost=f_len, b_cost=b_len,
-        res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg, phase=phase)
+        res=res, sb=scenarios if tensor_in else None, n=B, cfg_ref=cfg, phase=phase,
+        field_lp=field_lp)
 
 
 # --------------------------------------------------------------------------

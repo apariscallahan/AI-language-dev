@@ -96,15 +96,23 @@ class Population:
             return 0
         pool = self.farmers
         farmers, buyers = [], []
+        # (original id, twin id): whatever is kept per agent id outside the
+        # population -- each speaker's lexicon -- belongs to the twin as well
+        self.split_pairs = []
         for slot, a in enumerate(pool):
             twin = _copy.deepcopy(a)
             twin.agent_id = self._next_id
             self._next_id += 1
             twin.role = BUYER
             twin.net.role = BUYER
+            # Its own remaining life: a copy that kept the original's lifespan and
+            # update count died in the same update as it, so every death at the
+            # market came as a farmer and its buyer twin at once.
+            twin.lifespan = twin.updates + self._sample_lifespan(False)
             a.slot = twin.slot = slot
             farmers.append(a)
             buyers.append(twin)
+            self.split_pairs.append((a.agent_id, twin.agent_id))
         self.farmers, self.buyers = farmers, buyers
         self.shared = False
         return len(pool)

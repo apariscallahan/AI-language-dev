@@ -65,6 +65,12 @@ def expected_generations(cfg: Config) -> float:
     return (cfg.train.episodes / max(1, cfg.train.batch_size)) / max(1.0, mean_life)
 
 
+# Parameters added to a brain after snapshots of it existed, each of which has
+# an innate starting value: a snapshot without one resumes with that value
+# instead of being refused.
+LATE_PARAMETERS = frozenset({"speaker_lexicon.go_on", "speaker_lexicon.inhibit"})
+
+
 @dataclass
 class History:
     episodes: list[int] = field(default_factory=list)
@@ -133,7 +139,6 @@ class Trainer:
         self.cfg = cfg
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
-        cfg.to_json(os.path.join(out_dir, "config.json"))
 
         torch.manual_seed(cfg.train.seed)
         from .hardware import setup as hw_setup
@@ -141,6 +146,10 @@ class Trainer:
         # Pin the resolved device back onto the config so everything downstream --
         # agents, the tensor world, saved config.json -- agrees on one answer.
         cfg.train.device = str(dev)
+        # Written after that, so it records the device the run used rather than
+        # "auto" (and rewritten by `load_snapshot` once the snapshot has decided
+        # the architecture): the report calls this file the exact configuration.
+        cfg.to_json(os.path.join(out_dir, "config.json"))
         self.torch_device = dev
         self.rng = random.Random(cfg.train.seed)
         self.device = str(dev)
@@ -156,6 +165,7 @@ class Trainer:
         self.promotion_log = JsonlLog(out_dir, "promotions.jsonl")
         # set by load_snapshot; named here so the banner never depends on a resume
         self._stale_forms = 0
+        self._told_late = False
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # Training scenarios are drawn on device, a whole batch at a time. The
@@ -261,6 +271,19 @@ class Trainer:
         self._headline: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
+    def _reset_rung_stats(self) -> None:
+        """The rolling numbers that describe *this* rung start again with it.
+
+        They were never reset, so a rung with no whole-lot descriptions (the
+        `mutual` barn side, a trading rung without orders) kept printing the
+        last value from `name-all` -- a frozen "descriptions in usual order"
+        that looked like a measurement.
+        """
+        self.rung_success = RollingStat(window=2000)
+        for k in ("_gesture_recent", "_naming_recent", "_words_used_recent",
+                  "_reused_recent", "_order_recent", "_compose_recent"):
+            setattr(self, k, RollingStat(window=getattr(self, k).buf.maxlen))
+
     def gesture_share_now(self) -> float:
         """The share of this update's rounds in which a speaker may gesture."""
         return gesture_share(self.cfg, self.curriculum.phase,
@@ -619,16 +642,12 @@ class Trainer:
         if passed:
             done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
-            self.rung_success = RollingStat(window=2000)
+            self._reset_rung_stats()
             self._costs_ramp_from = None
             self.update_cost_gate()
             cur.transitions[-1]["episodes_in_previous_phase"] = done_in
             cur.transitions[-1]["updates_in_previous_phase"] = done_updates
             cur.transitions[-1]["update"] = self.updates
-            try:
-                cur.transitions[-1]["snapshot"] = self.save_snapshot("after-" + phase.name)
-            except Exception as exc:          # a snapshot must never kill a run
-                self.log("  [snapshot] skipped: %s" % exc)
             cur.transitions[-1]["evidence"] = slim
             A = L.always
             A("")
@@ -642,6 +661,14 @@ class Trainer:
                 A("      met: %-40s %s" % (name, c["detail"]))
             A("    the population carries its weights forward; nothing is reinitialised.")
             self.maybe_split_roles(nxt, A)
+            # The snapshot comes after the split: `after-judge.pt` used to hold a
+            # pooled population with the curriculum already at `haggle`, and a
+            # resume of it never split -- buyers came back as copies of the
+            # farmers, same ids, farmer role embedding.
+            try:
+                cur.transitions[-1]["snapshot"] = self.save_snapshot("after-" + phase.name)
+            except Exception as exc:          # a snapshot must never kill a run
+                A("  [snapshot] skipped: %s" % exc)
             A("")
             return
 
@@ -729,6 +756,12 @@ class Trainer:
                       "meaning_counts": dict(self.store.meaning_counts)},
             "newborn_reports": self.newborn_reports,
             "totals": self.totals, "failure_counts": self.failure_counts,
+            # The rung by name as well as by position, so a ladder that has
+            # changed since cannot land a resume on the wrong rung.
+            "phase_name": self.curriculum.phase.name,
+            # the combinations this population was never trained on
+            "holdout": sorted(self.world.holdout.held),
+            "run": self._run_state(),
         }
         d = os.path.join(self.out_dir, "snapshots")
         os.makedirs(d, exist_ok=True)
@@ -737,6 +770,121 @@ class Trainer:
         torch.save(state, tmp)
         os.replace(tmp, path)
         return path
+
+    def _run_state(self) -> dict[str, Any]:
+        """The run's own records and random state, for a resume to carry on from.
+
+        A resume used to keep the population and lose the run: `cloud_run.sh`
+        resumes into the same folder, and the history behind the plots, the
+        metrics rows behind the scorecard, word provenance, the example archive
+        and the stability baseline all started again from nothing -- provenance
+        then stamped every word as first seen in the resumed rung, so the report
+        read 0% inherited, the very claim that section exists to test. Every
+        generator restarted from its seed as well, so each resumed segment
+        replayed the same stream of rounds and the same newborn lifespans.
+        """
+        pv = self.provenance
+        forms = None
+        if self.forms is not None:
+            f = self.forms
+            forms = {"history": dict(f.history), "events": list(f.events),
+                     "last": dict(f._last), "drift_sum": dict(f._drift_sum),
+                     "drift_n": dict(f._drift_n), "changed": dict(f._changed),
+                     "regime": f._regime, "regime_changes": list(f.regime_changes)}
+        gens = {"tensor_world": getattr(self.tensor_world, "gen", None),
+                "referential": getattr(self.referential_world, "gen", None)}
+        rng = {"trainer": self.rng.getstate(), "world": self.world.rng.getstate(),
+               "population": self.pop.rng.getstate(),
+               "economy": self.economy.rng.getstate(),
+               "bottleneck": self.bottleneck_rng.getstate(),
+               "eval": self.eval_rng.getstate(),
+               "torch": torch.get_rng_state(),
+               "generators": {k: g.get_state() for k, g in gens.items() if g is not None}}
+        if torch.cuda.is_available():
+            try:
+                rng["cuda"] = torch.cuda.get_rng_state_all()
+            except Exception:
+                pass
+        e = self.economy
+        return {
+            "history": self.history.to_dict(),
+            "metrics_rows": list(self.metrics_log.rows),
+            "provenance": {"first_phase": dict(pv.first_phase),
+                           "first_episode": dict(pv.first_episode),
+                           "counts_by_phase": {k: dict(v) for k, v in pv.counts_by_phase.items()},
+                           "settled_phase": dict(pv.settled_phase)},
+            "archive": list(self.archive),
+            "stability_last": dict(self.stability.last),
+            "forms": forms,
+            "rng": rng,
+            "economy": {"day": e.day, "season": e.season, "restocks": e.restocks,
+                        "soldouts": e.soldouts, "inventories": list(e.inventories)},
+            "rolling": {k: list(getattr(self, k).buf) for k in
+                        ("rung_success", "train_success", "train_reward",
+                         "train_comprehension")},
+        }
+
+    def _restore_run_state(self, run: dict[str, Any], upto_episode: int) -> None:
+        """The inverse of :meth:`_run_state`; anything missing keeps its fresh value."""
+        from collections import Counter
+        if not run:
+            return
+        h = run.get("history") or {}
+        for k, v in h.items():
+            if hasattr(self.history, k):
+                setattr(self.history, k, list(v))
+        rows = [r for r in (run.get("metrics_rows") or [])
+                if int(r.get("episode", 0) or 0) <= upto_episode]
+        self.metrics_log.rows = rows
+        pv = run.get("provenance") or {}
+        if pv:
+            self.provenance.first_phase = dict(pv.get("first_phase") or {})
+            self.provenance.first_episode = dict(pv.get("first_episode") or {})
+            for k, v in (pv.get("counts_by_phase") or {}).items():
+                self.provenance.counts_by_phase[k] = Counter(v)
+            self.provenance.settled_phase = dict(pv.get("settled_phase") or {})
+        self.archive = list(run.get("archive") or [])
+        self.stability.last = dict(run.get("stability_last") or {})
+        f = run.get("forms")
+        if f and self.forms is not None:
+            from collections import defaultdict
+            self.forms.history = defaultdict(list, f.get("history") or {})
+            self.forms.events = list(f.get("events") or [])
+            self.forms._last = dict(f.get("last") or {})
+            self.forms._drift_sum = dict(f.get("drift_sum") or self.forms._drift_sum)
+            self.forms._drift_n = dict(f.get("drift_n") or self.forms._drift_n)
+            self.forms._changed = dict(f.get("changed") or self.forms._changed)
+            self.forms._regime = f.get("regime")
+            self.forms.regime_changes = list(f.get("regime_changes") or [])
+        rng = run.get("rng") or {}
+        for key, obj in (("trainer", self.rng), ("world", self.world.rng),
+                         ("population", self.pop.rng), ("economy", self.economy.rng),
+                         ("bottleneck", self.bottleneck_rng), ("eval", self.eval_rng)):
+            if key in rng:
+                obj.setstate(rng[key])
+        try:
+            if "torch" in rng:
+                torch.set_rng_state(rng["torch"])
+            if "cuda" in rng and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng["cuda"])
+            gens = {"tensor_world": getattr(self.tensor_world, "gen", None),
+                    "referential": getattr(self.referential_world, "gen", None)}
+            for k, state in (rng.get("generators") or {}).items():
+                if gens.get(k) is not None:
+                    gens[k].set_state(state)
+        except Exception as exc:
+            # A generator from another device cannot take the state; the stream
+            # restarts from its seed, which is what every resume did before.
+            self.log.always("  [resume] random state not restored (%s); the streams "
+                            "restart from their seeds" % str(exc).splitlines()[0][:100])
+        e = run.get("economy") or {}
+        if e and len(e.get("inventories") or []) == self.economy.n_farms:
+            self.economy.day, self.economy.season = e["day"], e["season"]
+            self.economy.restocks, self.economy.soldouts = e["restocks"], e["soldouts"]
+            self.economy.inventories = list(e["inventories"])
+        for k, buf in (run.get("rolling") or {}).items():
+            if hasattr(self, k):
+                getattr(self, k).extend(buf)
 
     def _adopt_architecture(self, st: dict) -> None:
         """Take the shape-deciding settings from the snapshot, not from the CLI.
@@ -755,7 +903,8 @@ class Trainer:
         # Brain parts added after a snapshot was written: the snapshot was
         # trained without them, so that is the architecture it resumes with.
         # (Predating any other setting just means it was never different.)
-        absent_means_off = {"model.lexical_reader", "model.innate_concepts"}
+        absent_means_off = {"model.lexical_reader", "model.innate_concepts",
+                            "model.lexical_speaker"}
         for key in sorted(ARCH_KEYS):
             try:
                 was, now = config_get(old, key), config_get(self.cfg, key)
@@ -797,14 +946,16 @@ class Trainer:
             if len(rest) > 12:
                 self.log.always("    ... and %d more" % (len(rest) - 12))
 
-    def _rebuild_world(self) -> None:
-        """Rebuild everything `__init__` derived from the settings just adopted."""
+    def _rebuild_world(self, holdout=None) -> None:
+        """Rebuild everything `__init__` derived from the settings just adopted
+        (and, given ``holdout``, around those reserved combinations)."""
         from .batched import TensorWorld
         cfg, dev = self.cfg, self.device
-        self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
+        self.world = World(cfg.world, random.Random(cfg.train.seed + 1), holdout=holdout)
+        holdout = self.world.holdout
         g = torch.Generator(device=dev)
         g.manual_seed(cfg.train.seed + 11)
-        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g)
+        self.tensor_world = TensorWorld(cfg, device=str(dev), generator=g, holdout=holdout)
         self.economy = Economy(cfg, self.world, random.Random(cfg.train.seed + 3),
                                n_farms=cfg.population.n_farmers)
         self.stability = StabilityTracker(cfg, self.world, cfg.log.stability_probes,
@@ -814,7 +965,44 @@ class Trainer:
         if cfg.curriculum.enabled:
             g = torch.Generator(device=dev)
             g.manual_seed(cfg.train.seed + 13)
-            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g)
+            self.referential_world = ReferentialWorld(cfg, device=str(dev), generator=g,
+                                                      holdout=holdout)
+        # The ladder reads the channel (a trading rung's turns come from
+        # `channel.n_turns`) and the trading rungs' chance rate reads the world;
+        # both were left as `__init__` built them from the settings replaced.
+        self.curriculum.phases = ladder(cfg)
+        self.chance = chance_success_rate(cfg, self.world)
+
+    def _adopt_holdout(self, st: dict) -> None:
+        """Measure held-out combinations against the set the snapshot trained around.
+
+        The productivity test is only a test if nobody ever trained on the
+        combinations it asks about, and the set is derived from the code as
+        well as the config: on 2026-09-30 the construction for worlds that are
+        not n x n x n changed (the `duality` preset's 12 fruits). A snapshot
+        records its set, and a resume keeps it.
+        """
+        held = st.get("holdout")
+        mine = set(self.world.holdout.held)
+        if held is None:
+            w = self.cfg.world
+            if not (w.n_varieties == w.n_colors == w.n_quality):
+                self.log.always(
+                    "  [resume] this snapshot does not record which combinations it was "
+                    "never trained on, and for a %dx%dx%d world the way they are chosen "
+                    "changed on 2026-09-30: its held-out numbers may include combinations "
+                    "it trained on. A fresh run is the clean comparison."
+                    % (w.n_varieties, w.n_colors, w.n_quality))
+            return
+        saved = {tuple(int(x) for x in c) for c in held}
+        if saved == mine:
+            return
+        from .world import ComboHoldout
+        h = ComboHoldout(self.cfg.world, 0.0)
+        h.held = saved
+        self._rebuild_world(holdout=h)
+        self.log.always("  [resume] keeping the snapshot's %d reserved combinations; this "
+                        "build would have reserved a different set" % len(saved))
 
     def _check_shapes(self, st: dict) -> None:
         """Refuse a snapshot whose weights do not fit, naming the setting.
@@ -832,7 +1020,8 @@ class Trainer:
                            generation=0, birth_episode=0, lifespan=1, device="cpu")
         live = {k: tuple(v.shape) for k, v in probe.net.state_dict().items()}
         saved = {k: tuple(getattr(v, "shape", ())) for k, v in recs[0]["net"].items()}
-        bad = sorted(k for k in set(live) | set(saved) if live.get(k) != saved.get(k))
+        bad = sorted(k for k in set(live) | set(saved) if live.get(k) != saved.get(k)
+                     and not (k in LATE_PARAMETERS and k not in saved))
         if not bad:
             return
         lines = ["this snapshot's weights do not fit the configuration given.",
@@ -878,14 +1067,26 @@ class Trainer:
         cur.index = names.index(rung)
         cur.episodes_in_phase = 0
         cur.updates_in_phase = 0
-        self.rung_success = RollingStat(window=2000)
+        self._reset_rung_stats()
         self._costs_ramp_from = None
         self.cost_gate = 0.0
         self.update_cost_gate()
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
-        # Both depend on which rung is running, and the rung just changed.
-        self.pop.shared = pooled_at(self.cfg, cur.phase)
-        self.maybe_split_roles(cur.phase, log=lambda *_: None)
+        # Both depend on which rung is running, and the rung just changed. The
+        # flag alone is not the pool: a split population cannot be shared by
+        # saying so (`pair` would find two lists and stop), and a pooled one is
+        # split by `maybe_split_roles`, not by clearing the flag.
+        if pooled_at(self.cfg, cur.phase) and not self.pop.shared:
+            self.pop.buyers = self.pop.farmers
+            self.pop.shared = True
+            self.log.always("  [resume] `%s` pools both seats, but this population had "
+                            "split; keeping the farmers in both seats" % rung)
+        elif not pooled_at(self.cfg, cur.phase) and self.pop.shared:
+            self.maybe_split_roles(cur.phase)
+        # Nobody has died below the turnover rung; the restagger that spreads
+        # the first deaths out has to run again when the run gets back there.
+        if not turnover_applies(self.cfg, cur.phase):
+            self._turnover_started = False
         self.log.always("  [resume] wound back from `%s` to `%s`; its clocks "
                         "restart, the weights and the community do not" % (was, rung))
         # The header is the line that says where the run actually is, and
@@ -910,12 +1111,29 @@ class Trainer:
         # has both. It also loaded every agent's weights and Adam state onto the
         # card at once, which is the largest allocation a resume makes.
         st = torch.load(path, map_location="cpu", weights_only=False)
-        # Before anything reads the config: the file decides the architecture.
+        # Before anything reads the config: the file decides the architecture,
+        # and which combinations were held out of its training.
         self._adopt_architecture(st)
         self._check_shapes(st)
+        self._adopt_holdout(st)
+        # config.json was written in `__init__`, before the architecture above
+        # was taken from the file; it has to say what this run trains with.
+        self.cfg.to_json(os.path.join(self.out_dir, "config.json"))
         self.episode = int(st["episode"])
         cur = self.curriculum
         cur.index = int(st["curriculum"]["index"])
+        names = [p.name for p in cur.phases]
+        saved_name = st.get("phase_name")
+        if saved_name in names and names.index(saved_name) != cur.index:
+            # By name, not position: the ladder has changed since this was written.
+            self.log.always("  [resume] rung %s is number %d on this ladder, not %d; "
+                            "resuming it by name" % (saved_name, names.index(saved_name) + 1,
+                                                     cur.index + 1))
+            cur.index = names.index(saved_name)
+        elif saved_name is not None and saved_name not in names:
+            self.log.always("  [resume] this snapshot was on rung %r, which this ladder "
+                            "does not have; resuming at position %d (%s)"
+                            % (saved_name, cur.index + 1, cur.phase.name))
         cur.episodes_in_phase = int(st["curriculum"]["episodes_in_phase"])
         # Snapshots from before everything counted updates: one batch was one
         # update, so the counts convert through that run's batch size.
@@ -946,7 +1164,17 @@ class Trainer:
                            birth_episode=rec["birth_episode"], lifespan=rec["lifespan"],
                            device=self.device)
             try:
-                a.net.load_state_dict(rec["net"])
+                have, saved = set(a.net.state_dict()), set(rec["net"])
+                late = LATE_PARAMETERS & (have - saved)
+                # a parameter added since this snapshot was written keeps its
+                # innate starting value; anything else missing is a real mismatch
+                exact = not late or bool((have - saved) - late) or bool(saved - have)
+                a.net.load_state_dict(rec["net"], strict=exact)
+                if late and not self._told_late:
+                    self._told_late = True
+                    self.log.always("  [resume] added since this snapshot was written, "
+                                    "starting at their innate values: %s"
+                                    % ", ".join(sorted(late)))
             except RuntimeError as exc:
                 raise SystemExit(
                     "%s was written by a version with a different observation layout "
@@ -954,8 +1182,15 @@ class Trainer:
                     "a fresh run." % (path, str(exc).splitlines()[0][:160]))
             try:
                 a.opt.load_state_dict(rec["opt"])
-            except Exception:
-                pass                    # e.g. a changed learning rate: fresh moments
+            except Exception as exc:
+                self.log.always("  [resume] %s's optimiser state did not fit (%s); it "
+                                "starts with fresh moments"
+                                % (rec.get("agent_id"), str(exc).splitlines()[0][:100]))
+            # Loading an optimiser's state restores its learning rate too, so a
+            # resume under a different `train.lr` kept the old one for every
+            # restored agent (while newborns got the new one). This run's rate.
+            for g in a.opt.param_groups:
+                g["lr"] = self.cfg.train.lr
             for k in ("age", "days_alive", "n_success", "n_episodes", "reward_sum"):
                 setattr(a, k, rec[k])
             a.updates = int(rec.get("updates", 0))
@@ -972,7 +1207,13 @@ class Trainer:
         # list did not have. Whether the pool is shared is decided by this
         # run's config and the rung being resumed into, not by the snapshot,
         # because a resumed run runs under the configuration it is given.
-        self.pop.shared = pooled_at(self.cfg, cur.phase)
+        # A snapshot whose two seats are the same agents was written pooled --
+        # including a promotion snapshot taken just before the split, which the
+        # split at the end of this load then performs, instead of restoring two
+        # copies of every founder that share ids and the farmer's role.
+        saved_pooled = ([r["agent_id"] for r in st["buyers"]]
+                        == [r["agent_id"] for r in st["farmers"]])
+        self.pop.shared = pooled_at(self.cfg, cur.phase) or saved_pooled
         self.pop.farmers = [restore(r) for r in st["farmers"]]
         if self.pop.shared:
             saved = [r["agent_id"] for r in st["buyers"]]
@@ -1046,14 +1287,21 @@ class Trainer:
                             % stray)
         self.store._pos = int(so["pos"]) % max(1, self.store.capacity)
         self.store.total_added = int(so["total_added"])
-        self.store.meaning_counts = Counter(so["meaning_counts"])
+        # Counted from what was kept: transcripts from rungs this ladder does not
+        # have, or past the capacity, were dropped above, and their meanings'
+        # counts would otherwise stay on as phantoms in the sampling weights.
+        self.store.meaning_counts = Counter(it.meaning for it in self.store._buf
+                                            if it is not None)
         self.newborn_reports = list(st["newborn_reports"])
         self.totals = dict(st["totals"])
         self.failure_counts = dict(st["failure_counts"])
+        # the run's records and random state (snapshots from before they were
+        # written start those afresh, as every resume used to)
+        self._restore_run_state(st.get("run") or {}, self.episode)
         self._next_check = self.updates + self.cfg.curriculum.check_every_updates
         self._episode_at_start = self.episode
         self._beat = (time.time(), self.episode)
-        self.maybe_split_roles(cur.phase, log=lambda *_: None)
+        self.maybe_split_roles(cur.phase)
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
                                ("; dropped %d conventions recorded under the older "
@@ -1117,6 +1365,10 @@ class Trainer:
         if phase.index < names.index(at):
             return
         n = self.pop.split_roles(self.episode)
+        # A twin is the same agent in the other seat: it speaks the same words.
+        # (With a new id and no lexicon, composition never paid a buyer again.)
+        for src, dst in getattr(self.pop, "split_pairs", ()):
+            self.usage.lexicon.copy_speaker(src, dst)
         say = log or self.log.always
         say("    *** roles split at `%s`: each of the %d agents is now a farmer "
             "and a buyer, both carrying the language the pool learned ***" % (phase.name, n))
@@ -1582,7 +1834,10 @@ class Trainer:
             "quantity_encoding_live": qty_live,
             "usage": self.usage.summary(),
             "speaker_cost_gate": self.cost_gate,
-            "speaker_lexicons": self.usage.lexicon.summary(),
+            # the living speakers only: the dead linger in the lexicon until
+            # their counts decay, and would print as empty entries
+            "speaker_lexicons": self.usage.lexicon.summary(
+                only={a.agent_id for a in self.pop.all_agents()}),
             "naming": {"signal_recent": (self._naming_recent.mean
                                          if len(self._naming_recent) else float("nan")),
                        "words_used_recent": (self._words_used_recent.mean
@@ -2192,7 +2447,7 @@ class Trainer:
             lineup_like = phase.referential or phase.mutual or phase.order
             if batch.res is not None and not lineup_like:
                 from .batched import failure_modes
-                for mode in failure_modes(batch.res):
+                for mode in failure_modes(batch.res, batch.sb):
                     self.failure_counts[mode] = self.failure_counts.get(mode, 0) + 1
                 succ = batch.success_t
                 self.totals["trades"] += int(succ.sum())
@@ -2268,7 +2523,10 @@ class Trainer:
                     try:
                         self.save_snapshot("latest")
                     except Exception as exc:
-                        self.log("  [snapshot] skipped: %s" % exc)
+                        # always shown: under --quiet a snapshot failing at every
+                        # checkpoint was only in run.log, until a pre-emption lost
+                        # the run
+                        self.log.always("  [snapshot] skipped: %s" % exc)
                 next_ckpt += every
             else:
                 self.maybe_check_promotion()

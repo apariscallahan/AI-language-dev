@@ -307,9 +307,12 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
     zs, zr = _latest(rows, lambda r: _num(r["zero_shot"]["retention"])
                      if (r.get("zero_shot") or {}).get("context") == "lineup tuples" else None)
     ts, _ = _latest(rows, lambda r: _num((r.get("compositionality") or {}).get("mean")))
-    # The report rungs measure the same thing per field, over the headroom above
-    # a message-blind guesser (`metrics.phase_evidence`), and they come after
-    # the lineup, so a later checkpoint's per-field ratio is the number to read.
+    # The rungs' own evidence measures the same thing per field and per role,
+    # over the headroom above a message-blind reader (`metrics.phase_evidence`)
+    # -- on `name-all` from the guesser's reading of each field -- so the
+    # latest per-field ratio is the number to read. The lineup's whole-round
+    # retention cannot tell a code that reuses all three words from one that
+    # reuses one: that code picks a reserved lot out of three 0.81 of the time.
     fr, frow = _latest(rows, lambda r: _num((r.get("rung_evidence") or {})
                                             .get("holdout_field_ratio")))
     if fr is not None and (zs is None or (frow or {}).get("update", -1)
@@ -319,9 +322,9 @@ def scorecard(cfg: Config, rows: Sequence[dict], curriculum: dict,
         names = (frow.get("rung_evidence") or {}).get("holdout_field_names") or []
         per = ", ".join("%s %s" % (n, ("%.2f" % x) if x == x else "n/a")
                         for n, x in zip(names, each))
-        add("productivity", "held-out (fruit, colour, quality) combinations reported "
+        add("productivity", "held-out (fruit, colour, quality) combinations understood "
             "as well as trained ones, per field, as a share of the headroom above "
-            "a message-blind guesser (report rung %s)" % frow.get("phase", "?"), fr, v,
+            "a message-blind reader, weaker role (rung %s)" % frow.get("phase", "?"), fr, v,
             ("per field: %s; " % per if per else "")
             + "topsim %.3f at the same point" % (ts if ts is not None else float("nan")))
     elif zs is None:

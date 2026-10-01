@@ -58,10 +58,19 @@ again.
 September 2026 or earlier that has `ask-qty` or `quote` in its ladder) cannot be
 resumed: the observation layout, the query embedding and the atom inventory all
 changed, and the loader stops with a message saying so. Snapshots written before
-the language faculty (2026-09-30: the innate reader and innate concepts) *do*
-resume, but without it: the file decides the architecture, and a brain trained
-without a reader is resumed without one (the `[resume]` line says so). To run the
-faculty, start fresh. The naming rungs took about 45 minutes on a 4090.
+the language faculty (2026-09-30: the innate reader, the speaker's production
+lexicon and innate concepts) *do* resume, but without it: the file decides the
+architecture, and a brain trained without a reader is resumed without one (the
+`[resume]` line says so). To run the faculty, start fresh. The naming rungs took
+about 45 minutes on a 4090.
+
+**Start fresh for the 2026-09-30 fixes too.** Until then every agent below the
+role split took two optimiser steps per update; `train.lr` was doubled (3e-4 to
+6e-4) when that was fixed, so the step is what the naming rungs were validated
+at, but a run resumed from an older snapshot changes its dynamics mid-rung. The
+config check now also refuses settings that used to fail silently: a
+`world.holdout_combo_frac` that reserves nothing, `curriculum.n_candidates`
+wider than a field's unreserved values, and unequal farmer and buyer counts.
 
 ---
 
@@ -178,7 +187,10 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
   2026-09-29 — a speaker's own colour word appeared in 0 of 760 descriptions —
   and it should climb towards 100% before success does. The full checkpoint
   block in `run.log` lists each speaker's words field by field and its usual
-  order (`quantity < colour < fruit`, say);
+  order (`quantity < colour < fruit`, say). With the speaker's production
+  lexicon the first word of a description should be one of the lot's words from
+  the start; what has to be learned is going on to a second part, so
+  **words per utterance** is the number that shows it;
 - the **final verdict** and the report path.
 
 ### Reading the rungs
@@ -187,7 +199,7 @@ the naming rungs at 2,000–4,000 episodes per second with two founders and
 |---|---|
 | `name-fruit` | does it leave chance (0.333) at all, and when? This is the one rung that invents a code from nothing. Hindsight and the speaker costs are both off here. If it sits at chance past ~1,500 updates, nothing above it will work. `coherence 0.500` through the single-field rungs is expected: the two founders each keep a dialect the other can read, and converge from `name-all` on. The rolling success on the status line and the checkpoint's success should agree roughly — both are fruit rounds between two different agents — so a wide gap means training and measurement are asking different questions. (From `name-color` on, the rolling number also counts the easier rehearsal rounds and runs higher; the checkpoint measures only the new field.) |
 | `name-color`, `name-quality`, `name-quantity`, `name-price` | these start from a population that already has words, so they should be *faster* than `name-fruit`. Each also prints a `still names fruit` / `still names colour` / … check: a rung whose own kind climbs while a rehearsed one falls back to chance is forgetting, not learning. Quantity has nine values (0 is "none of that") and price six; a colour round and a quantity round both have three candidates, so chance is 0.333 throughout. `name-quantity` is where the 2026-09-24 run stalled at chance for 850 updates; the gesture channel exists for it. Watch `gestures possible` fall over the rung's first 600 updates and the word-only success rise as it does; if success is still at chance when `possible` reaches 0, the scaffold did not transfer to the words. |
-| `name-all` | the hard one: five fields in one utterance. Watch **descriptions reuse** climb first — the describers saying the words they already have — then **words per utterance** toward 5 and **coverage** on every field: the rung needs 0.30 on average *and* 0.25 on each field (`names each field` in the promotion block). A run that sticks at ~2 words with coverage ~0.25 and reuse near zero has grown a second code for whole lots instead of combining its words: that is how the 2026-09-29 run stalled at 0.65 for 1,000 updates. `held-out vs trained` is measured on rounds only fruit, colour and quality can decide (every candidate shares one quantity and price), so the two should be close for a code that combines its words, and the held-out number collapses towards 0.33 for one that does not. The convention bonus comes on here and agrees with the community's *words*, so `coherence` should rise from 0.5 as the two founders converge on one word per meaning. |
+| `name-all` | the hard one: five fields in one utterance. Watch **descriptions reuse** climb first — the describers saying the words they already have — then **words per utterance** toward 5 and **coverage** on every field: the rung needs 0.30 on average *and* 0.25 on each field (`names each field` in the promotion block). A run that sticks at ~2 words with coverage ~0.25 and reuse near zero has grown a second code for whole lots instead of combining its words: that is how the 2026-09-29 run stalled at 0.65 for 1,000 updates. `held-out vs trained` is measured on rounds only fruit, colour and quality can decide (every candidate shares one quantity and price), and the gate reads it **per field and per guesser** (`per field ... [farmer fruit 0.97/0.98, ...]`): how often the guesser's reading of each field prefers the target's value to a candidate's, over the 0.5 any message-blind reading scores. The whole round cannot tell reuse of all three words from reuse of one — a code that carries only the fruit still picks a reserved lot 0.81 of the time — so it is printed but no longer judged. The convention bonus comes on here and agrees with the community's *words*, so `coherence` should rise from 0.5 as the two founders converge on one word per meaning. |
 | `mutual` | both report the other's lot, all five fields, with the five belief heads `haggle` will use. Newcomers, deaths and hindsight feedback all switch on here, and the founders' dialects should merge — **coherence** is the number to watch. The speaker costs come on partway through, once the rung reaches its floor (`[costs]` in the log), and are ramped in over 200 updates: `atoms/word` and `words/utterance` should settle without success dropping. The held-out gate here is per field: `held-out 0.58 vs trained 0.80` is the mean per-field accuracy on reserved combinations against trained ones. |
 | `order` | the buyer's request is a lot in the naming layout, so the buyer says exactly what it said in `name-all`; what is new is the farmer reporting it while looking at a barn of sixteen rows. Every field is `still carries`; if one falls to chance the farmer is not finding it among the rows. |
 | `offer` | the farmer answers about the lot that was asked for — `stock`, `lot-quality`, `reservation` — and the buyer reports that. This is the first rung where a farmer has to **find a lot in its barn** by the words it heard; `stock arrives` is the number to watch, and stock 0 ("none of that") is a value it has to be able to say. |
@@ -210,8 +222,13 @@ Run folders are named for their start time in UTC and the preset:
 A snapshot of the whole community — weights, optimiser state, recent usage, the
 transcript store, the curriculum record, the cost ramp — is written to
 `<run>/snapshots/latest.pt` at every checkpoint and to `after-<rung>.pt` at every
-promotion. `cloud_run.sh` resumes automatically when `latest.pt` exists, so on a
-spot or pre-emptible instance, rerun it pointing `RUN` at the same folder:
+promotion. Since 2026-09-30 it also carries the run's own records (the history
+behind the plots, the metrics rows behind the scorecard, word provenance, the
+example archive), every random generator's state, the market's day and stock,
+and the reserved combinations, so a resumed run's report covers the whole run
+and a pre-empted run does not replay the same rounds. `cloud_run.sh` resumes
+automatically when `latest.pt` exists, so on a spot or pre-emptible instance,
+rerun it pointing `RUN` at the same folder:
 
 ```bash
 RUN=runs/2026-09-18_14-03-12UTC_orchard bash cloud_run.sh
@@ -306,8 +323,9 @@ nobody trained on — without the whole suite:
 python -m orchard.run --holdout-report runs/<run>/snapshots/after-mutual.pt
 ```
 
-It scores the snapshot under the config stored in it (the holdout is derived from
-the world's field sizes) and prints, per field, held-out against trained
+It scores the snapshot under the config stored in it and against the reserved
+combinations stored in it, on this machine's device, and prints, per field (and
+per role where both are measured), held-out against trained
 accuracy and how much of the headroom over a message-blind guesser transfers;
 then the one-sided conjunction beside what independent fields would predict, and
 the whole round. On the run that first promoted out of `mutual` the three
@@ -378,7 +396,7 @@ python -m orchard.run --config runs/<run>/config.json --out runs/rerun --seed 9
 | `curriculum.split_roles_at` | the rung where the one pool becomes farmers and buyers (`haggle`). Everything below it is one language in two seats, the report rungs included -- they run in both directions. |
 | `curriculum.hard_distractor_frac` | share of open lineup rounds built as one-field near misses (0.9), the field drawn uniformly, so every field has to be named. |
 | `world.holdout_combo_frac` | share of (fruit, colour, quality) combinations reserved and never trained on (0.25, a Latin square). |
-| `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones (0.60): whole-round in the lineup, per field on a report rung. The productivity gate. |
+| `curriculum.min_holdout_ratio` | how well a rung must do on those, as a share of how well it does on trained ones over the headroom a message-blind reader leaves (0.60): per field and per role everywhere, and the weaker role is judged. The productivity gate. |
 | `curriculum.min_field_transfer`, `curriculum.min_field_coverage` | every field is checked for every role; coverage is what catches a code that names one field in every slot. |
 | `curriculum.mutual_min_report`, `curriculum.order_min_success` | the floor for reporting the other's whole lot exactly (0.25 for five fields) and for the fields a report rung introduced arriving together (0.25). |
 | `bottleneck.meaning_holdout` | the share of the (fruit, colour, quality) combinations a newborn is not shown at all (0.25): the bottleneck proper. 0 makes a newborn a near-clone. |
@@ -576,7 +594,7 @@ grep -E "rung|PHASE" runs/<run>/run.log | tail -20
 python -m unittest discover -s tests
 ```
 
-358 tests, about six minutes. Worth doing on the GPU box, not just locally:
+396 tests, about ten minutes on a CPU. Worth doing on the GPU box, not just locally:
 `tests/test_batched.py` asserts the fast tensor path agrees **exactly** with the
 readable scalar one, `tests/test_config.py` that there is one configuration and
 no device-specific arithmetic, and `tests/test_lots.py` that every report rung's
