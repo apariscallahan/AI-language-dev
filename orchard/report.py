@@ -975,7 +975,52 @@ def write_report(cfg: Config, out_dir: str, *, final: dict[str, Any],
     A("| attributes are matched one by one | `model.factored_choice` %s | the lineup "
       "choice is read through the five belief heads |"
       % ("on" if m.factored_choice else "off"))
+    cu = cfg.curriculum
+    A("| every meaning has a word of its own | `reward.lexicon_exclusive` %.1f | each "
+      "speaker's lexicon is held to the nearest one in which no two meanings, in any "
+      "field, share a word; which word names what is the speaker's own |"
+      % r.lexicon_exclusive)
+    A("| a learner takes its elders' words | `reward.lexicon_imitate` %.1f | a listener "
+      "that understood an elder's one-field answer remembers the word (half-life %d "
+      "updates) and moves its own word for that meaning towards it |"
+      % (r.lexicon_imitate, r.lexicon_imitate_half_life_updates))
+    A("| a number word is exact | `curriculum.numeral_near_frac` %.2f | in that share of "
+      "the rounds on a quantity or a price the wrong candidates are the nearest values, "
+      "and a rung that plays them needs %.2f on those alone |"
+      % (cu.numeral_near_frac, cu.numeral_min_near))
+    A("| say as much as was asked, then stop | a scaffold, withdrawn in `%s` | answer "
+      "the question asked, go on until every part is named, never twice, then stop: "
+      "given from outside below that rung, withdrawn during it while the speakers' own "
+      "policy is trained to do the same (`train.scaffold_distil` %.1f), absent in every "
+      "rung above |" % (cu.scaffold_fade_rung or "-", cfg.train.scaffold_distil))
+    A("| the faculty works in the market | `model.lexical_barn` %s, "
+      "`model.heard_meaning` %s | a farmer finds the lot it was asked about through its "
+      "reader and names that row's parts with its lexicon; what a listener understood "
+      "of each word reaches its own state |"
+      % ("on" if m.lexical_barn else "off", "on" if m.heard_meaning else "off"))
     A("")
+    voc = final.get("vocabulary") or {}
+    if voc.get("agents"):
+        am = voc.get("agreement_min", float("nan"))
+        A("**The vocabulary at the end**, measured on what each agent says when asked "
+          "about one field, greedily and word-only: the speaker with the fewest has "
+          "**%d distinct words for %d meanings**%s; a word is the same whatever the rest "
+          "of the lot %.0f%% of the time. On the 2026-10-01 run -- before every meaning "
+          "was held to a word of its own -- each founder left the naming ladder with 8 "
+          "words for 27 meanings and the two shared none."
+          % (voc.get("distinct_fewest", 0), voc.get("meanings", 0),
+             (", and two speakers say the same word for **%.0f%%** of meanings on average "
+              "(%.0f%% for the pair furthest apart)"
+              % (100 * voc.get("agreement_mean", float("nan")), 100 * am))
+             if am == am else "", 100 * voc.get("consistency", float("nan"))))
+        A("")
+    sc = final.get("scaffold") or {}
+    if sc:
+        left = sc.get("left", float("nan"))
+        A("The description scaffold was **%s** at the end of the run."
+          % ("gone: every description above was the speakers' own" if left <= 0
+             else "still %.0f%% on" % (100 * left)))
+        A("")
     lex = final.get("speaker_lexicons") or {}
     if lex:
         A("Each speaker's words at the end, by the class of meaning they name -- "

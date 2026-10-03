@@ -736,7 +736,8 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
           device: str = "cpu", rng: Optional[random.Random] = None,
           scenarios: Optional[Sequence[Scenario]] = None,
           pairing: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-          channel_mode: str = "intact", phase=None, sampler=None) -> dict[str, Any]:
+          channel_mode: str = "intact", phase=None, sampler=None,
+          greedy: bool = False) -> dict[str, Any]:
     if not f_sel or not b_sel or n <= 0:
         return {"n": 0, "success_rate": float("nan"), "mean_reward": float("nan")}
     rng = rng or random.Random(0)
@@ -764,7 +765,7 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
         f_idx = torch.tensor(f_list, dtype=torch.long)
         b_idx = torch.tensor(b_list, dtype=torch.long)
     batch = run_episodes(cfg, scen, pop.farmers, pop.buyers, f_idx, b_idx, device=device,
-                         channel_mode=channel_mode, phase=phase)
+                         channel_mode=channel_mode, phase=phase, greedy=greedy)
     # Tensor views, so a 4096-episode evaluation is a few reductions rather than
     # 4096 attribute lookups on dataclasses that had to be built first.
     succ_t = batch.success_t
@@ -876,6 +877,70 @@ def _play(cfg: Config, pop: Population, world: World, n: int,
         "scenarios": scen,
         "pairing": (f_idx, b_idx),
     }
+
+
+def price_habit(values: Sequence[float], viable: torch.Tensor, floor: torch.Tensor,
+                limit: torch.Tensor, f_price: torch.Tensor, b_price: torch.Tensor
+                ) -> dict[str, Any]:
+    """Is the price worked out from the two limits, or one price whatever they are?
+
+    Over the rounds with a deal to be had (``viable``), per side: the price it
+    names most often and that price's share of those rounds; how often its
+    price lies inside both limits (``floor`` <= price <= ``limit``, as bins);
+    and ``follows`` -- in the rounds where its commonest price does *not* fit,
+    how often it names one that does. 0 is one price said whatever the limits
+    are; 1 is a price that follows them. ``nan`` where the commonest price
+    always fits and the question cannot be asked.
+    """
+    viable = viable.bool()
+    out: dict[str, Any] = {"n": int(viable.sum())}
+    if not out["n"]:
+        return out
+    lo, hi = floor[viable].long(), limit[viable].long()
+    for label, price in (("farmer", f_price), ("buyer", b_price)):
+        p = price[viable].long().clamp(min=0)
+        counts = torch.bincount(p, minlength=len(values))
+        mode = int(counts.argmax())
+        off = (lo > mode) | (hi < mode)          # the habit would not fit this round
+        fits = (p >= lo) & (p <= hi)
+        out[label] = {
+            "commonest": float(values[mode]) if mode < len(values) else float("nan"),
+            "commonest_share": float(counts[mode]) / float(p.numel()),
+            "distinct": int((counts > 0).sum()),
+            "fits": float(fits.float().mean()),
+            "off_share": float(off.float().mean()),
+            "follows": float(fits[off].float().mean()) if bool(off.any()) else float("nan"),
+        }
+    return out
+
+
+def price_convention(cfg: Config, pop: Population, world: World, n: int, *,
+                     device: str = "cpu", rng: Optional[random.Random] = None,
+                     phase=None, sampler=None) -> dict[str, Any]:
+    """:func:`price_habit` on ``n`` rounds of a rung in which a deal is named.
+
+    A trade needs both sides to name the same price, and one price said
+    whatever the limits are is the cheapest way to agree. On the first local
+    run to reach `haggle` (2026-10-01) both sides named 2.50 in 99-100% of
+    rounds, with the farmer's floor anywhere from 1.00 to 3.00 and the buyer's
+    limit from 1.50 to 3.50: that fits 0.84 of the deals that exist, agrees
+    every time, and is not bargaining. Success cannot tell the two apart.
+
+    Played greedily, unlike the success it sits beside: the question is what
+    the policy is, not how it explores (sampled, every price is named some of
+    the time and ``follows`` is never 0).
+    """
+    r = _play(cfg, pop, world, n, list(range(len(pop.farmers))),
+              list(range(len(pop.buyers))), device=device, rng=rng, phase=phase,
+              sampler=sampler, greedy=True)
+    batch = r.get("batch")
+    sb = getattr(batch, "sb", None)
+    if sb is None or not hasattr(sb, "viable"):
+        return {"n": 0, "error": "no deal is named in this rung"}
+    out = price_habit(cfg.world.price_values, sb.viable, sb.reservation, sb.max_price,
+                      batch.f_dec[:, 3], batch.b_dec[:, 3])
+    out["success_on_viable"] = r.get("success_rate_on_viable", float("nan"))
+    return out
 
 
 def evaluate_success(cfg: Config, pop: Population, world: World, n: int,
@@ -1330,7 +1395,8 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                    holdout_sampler_for=None,
                    holdout_floor_for=None,
                    kind_sampler_for=None,
-                   seen_sampler_for=None) -> dict[str, Any]:
+                   seen_sampler_for=None,
+                   near_sampler_for=None) -> dict[str, Any]:
     """Everything :func:`orchard.curriculum.evaluate_rung` needs, per view and per role.
 
     * per view (both describers, in a swap rung): intact / muted success and the
@@ -1582,6 +1648,42 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
                                              "views": len(rates),
                                              "each": list(rates)}
 
+    # Number rounds whose wrong candidates are the nearest values: whether a
+    # number word is exact, which rounds with candidates drawn at random barely
+    # ask (`curriculum.numeral_near_frac`). Each describer on its own.
+    out["near_miss"] = {}
+    if near_sampler_for is not None and getattr(phase, "referential", False):
+        from .curriculum import NUMERAL_FIELDS
+        for kind in phase.kinds:
+            if kind not in NUMERAL_FIELDS:
+                continue
+            rates, errors, views = [], [], phase.views()
+            for v in views:
+                sam = near_sampler_for(v, kind)
+                if sam is None:
+                    continue
+                try:
+                    r = evaluate_success(cfg, pop, world, max(128, n_eval // 3),
+                                         device=device, rng=rng, phase=v, sampler=sam)
+                except Exception as exc:
+                    errors.append("%s view: %r" % (_view_name(v), exc))
+                    continue
+                if r.get("n"):
+                    rates.append(r["success_rate"])
+            if errors:
+                out["near_miss"][int(kind)] = {"success": float("nan"),
+                                               "error": "; ".join(errors)}
+            elif rates and len(rates) == len(views):
+                out["near_miss"][int(kind)] = {"success": sum(rates) / len(rates),
+                                               "each": list(rates)}
+    # What the speakers say for each meaning, and whether they say the same.
+    if getattr(phase, "referential", False):
+        try:
+            out["vocabulary"] = vocabulary(cfg, pop, device=device,
+                                           max_agents=cfg.log.max_agents_probed)
+        except Exception as exc:
+            out["vocabulary"] = {"error": repr(exc)}
+
     if (phase.mutual or phase.order) and out["views"]:
         # no analytic chance for "report / fill a whole tuple": silence is the floor
         out["chance"] = out["views"][0]["muted_success"]
@@ -1609,6 +1711,131 @@ def phase_evidence(cfg: Config, pop: Population, world: World, phase, *,
     out["topsim"] = comp.get("mean", float("nan"))
     out["null"] = comp.get("null_mean", float("nan"))
     out["_compositionality"] = comp
+    return out
+
+
+# ---- the vocabulary: what each agent says for each meaning ----------------
+@torch.no_grad()
+def vocabulary(cfg: Config, pop: Population, *, device: str = "cpu",
+               n_contexts: int = 6, seed: int = 0,
+               max_agents: Optional[int] = None, source: str = "said") -> dict[str, Any]:
+    """What each agent's word is for every value of every field of a lot: is
+    there a word of its own for each meaning, and do the agents use the same
+    ones?
+
+    ``source="said"`` (the gate's): each agent is asked, greedily and
+    word-only, about every (field, value) in ``n_contexts`` different lots;
+    its word for the meaning is the first word it says most often there. Read
+    off what is *said*, not off the lexicon's weights, so it holds whatever
+    produces the word (and for words of more than one atom).
+
+    ``source="lexicon"``: the word each agent's production lexicon holds for
+    the meaning (:meth:`orchard.agents.CommNet.lexicon_table`), with
+    ``consistency`` the mean probability it gives that word. For the rungs
+    above `name-all`, where nobody is asked about one field any more: there a
+    speaker's own policy is practised on whole lots only, and once the
+    scaffold that made it answer the question is gone, *asking* it about one
+    field measures a skill the ladder has stopped using, not its words --
+    measured in `mutual` with a third of the scaffold left, four speakers whose
+    lexicons were identical read "17 of 27 words, 63% shared" when asked.
+
+      ``distinct_min`` / ``distinct_fewest``  the agent with the fewest distinct
+                         words: its share of the meanings, and the count
+      ``agreement_min`` / ``agreement_mean``  over pairs of agents, the share of
+                         meanings the two name with the same word
+      ``consistency``    how often an agent's word for a meaning is the same
+                         whatever the rest of the lot (mean over agents)
+
+    Why it exists: on the 2026-10-01 run every naming rung passed at its first
+    check with 8 distinct words for 27 meanings per founder and not one word in
+    common, and nothing that was measured said so.
+    """
+    from .curriculum import ASK_ALL, ReferentialWorld, phase_named, phase_schema
+    from .env import parse_words, word_text
+    from .world import N_LOT_FIELDS, lot_spans, n_obs_slots
+    agents = pop.all_agents()
+    if max_agents is not None and len(agents) > max_agents:
+        agents = agents[:max_agents]
+    spans = lot_spans(cfg.world)
+    meanings = [(f, v) for f in range(N_LOT_FIELDS) for v in range(spans[f])]
+    out: dict[str, Any] = {"meanings": len(meanings), "speakers": len(agents), "agents": {},
+                           "distinct_min": float("nan"), "distinct_fewest": 0,
+                           "agreement_min": float("nan"), "agreement_mean": float("nan"),
+                           "consistency": float("nan"), "source": source}
+    if not agents:
+        return out
+    if source == "lexicon":
+        words, steady = {}, []
+        for a in agents:
+            if not getattr(a.net, "speaks_lexically", False):
+                continue
+            p = torch.softmax(a.net.lexicon_table().float(), dim=-1)
+            top, atom = p.max(dim=-1)
+            mine = [(int(x),) for x in atom.tolist()]
+            words[a.agent_id] = mine
+            steady.append(float(top.mean()))
+            out["agents"][a.agent_id] = {
+                "distinct": len(set(mine)), "consistency": steady[-1],
+                "words": {"%s=%d" % (LOT_FIELDS[f], v): word_text(cfg, w)
+                          for (f, v), w in zip(meanings, mine)}}
+        if not words:
+            return {**out, "error": "no agent has a production lexicon"}
+        return _vocabulary_summary(out, words, steady, len(meanings))
+    try:
+        ph = phase_named(cfg, "name-all").with_informer(FARMER)
+    except KeyError:
+        return {**out, "error": "no rung describes a lot one field at a time"}
+    g = torch.Generator()
+    g.manual_seed(seed)
+    rw = ReferentialWorld(cfg, device="cpu", generator=g)
+    width = n_obs_slots(cfg.world, cfg)
+    rows = []
+    for f, v in meanings:
+        lots = rw._draw(n_contexts).tolist()
+        for lot in lots:
+            lot = list(lot)
+            lot[f] = v
+            row = lot + [f]
+            rows.append(row + [0] * (width - len(row)))
+    words: dict[int, list] = {}
+    steady = []
+    for a in agents:
+        utts = utterances_for_meanings(cfg, a, rows, device=device, phase=ph, role=FARMER)
+        if utts is None:
+            continue
+        mine, same = [], 0.0
+        for i in range(len(meanings)):
+            firsts = []
+            for u in utts[i * n_contexts:(i + 1) * n_contexts]:
+                ws = parse_words(cfg, u)
+                firsts.append(ws[0] if ws else None)
+            word, n = Counter(firsts).most_common(1)[0]
+            mine.append(word)
+            same += n / float(n_contexts)
+        words[a.agent_id] = mine
+        steady.append(same / len(meanings))
+        names = len({w for w in mine if w is not None})
+        out["agents"][a.agent_id] = {
+            "distinct": names, "consistency": steady[-1],
+            "words": {"%s=%d" % (LOT_FIELDS[f], v): (word_text(cfg, w) if w is not None else "")
+                      for (f, v), w in zip(meanings, mine)}}
+    if not words:
+        return {**out, "error": "nobody describes a lot"}
+    return _vocabulary_summary(out, words, steady, len(meanings))
+
+
+def _vocabulary_summary(out: dict, words: dict, steady: list, n: int) -> dict:
+    """The fewest distinct words any agent has, and how far pairs of agents agree."""
+    fewest = min(d["distinct"] for d in out["agents"].values())
+    out["distinct_fewest"] = fewest
+    out["distinct_min"] = fewest / float(n)
+    out["consistency"] = sum(steady) / len(steady)
+    ids = sorted(words)
+    pairs = [sum(1 for x, y in zip(words[i], words[j]) if x is not None and x == y)
+             / float(n) for k, i in enumerate(ids) for j in ids[k + 1:]]
+    if pairs:
+        out["agreement_min"] = min(pairs)
+        out["agreement_mean"] = sum(pairs) / len(pairs)
     return out
 
 

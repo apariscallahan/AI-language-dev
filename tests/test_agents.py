@@ -146,9 +146,9 @@ class TestRollout(unittest.TestCase):
             orig = agent.net.embed
             role = agent.role
 
-            def wrapper(obs, tokens, schema=None, self_mask=None, upto=None):
+            def wrapper(obs, tokens, schema=None, self_mask=None, upto=None, **kw):
                 seen[role].append(obs.clone())
-                return orig(obs, tokens, schema, self_mask, upto)
+                return orig(obs, tokens, schema, self_mask, upto, **kw)
             agent.net.embed = wrapper
 
         for a in farmers + buyers:
@@ -187,9 +187,9 @@ class TestRollout(unittest.TestCase):
         def patch(agent, label):
             orig = agent.net.embed
 
-            def wrapper(obs, tokens, schema=None, self_mask=None, upto=None):
+            def wrapper(obs, tokens, schema=None, self_mask=None, upto=None, **kw):
                 seen[label].append(tokens.clone())
-                return orig(obs, tokens, schema, self_mask, upto)
+                return orig(obs, tokens, schema, self_mask, upto, **kw)
             agent.net.embed = wrapper
 
         patch(farmers[0], "farmer")
@@ -218,9 +218,9 @@ class TestRollout(unittest.TestCase):
         heard = []
         orig = farmers[0].net.embed
 
-        def wrapper(obs, tokens, schema=None, self_mask=None, upto=None):
+        def wrapper(obs, tokens, schema=None, self_mask=None, upto=None, **kw):
             heard.append(tokens.clone())
-            return orig(obs, tokens, schema, self_mask, upto)
+            return orig(obs, tokens, schema, self_mask, upto, **kw)
         farmers[0].net.embed = wrapper
         batch = run_episodes(cfg, scen, farmers, buyers, f_idx, b_idx,
                              channel_mode="scrambled")

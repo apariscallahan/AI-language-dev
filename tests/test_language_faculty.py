@@ -394,9 +394,44 @@ class TestTheInnateReader(unittest.TestCase):
         The agents' own reader, initialised as a brain is (a bare
         `LexicalReader` with PyTorch's defaults passed this while the real one
         read some field at 0.49-0.85 in every seed: words filed under the
-        wrong attribute early were never re-filed). Three seeds."""
+        wrong attribute early were never re-filed). Three seeds.
+
+        Taught as the naming rungs teach: the value from the round's outcome,
+        and that the answer names the field that was asked about
+        (`train.answer_class_coef`). Without the second, one seed in eight left
+        two quality words filed as a quantity and a fruit -- each still
+        answered its own question, so nothing moved it -- and quality was read
+        at 0.84 from a five-word description."""
         for seed in range(3):
             self._composes(seed)
+
+    def test_an_answer_is_read_as_naming_what_was_asked(self):
+        """The lesson itself: a word the reader files under the wrong class is
+        re-filed by it, where the reading alone leaves it there."""
+        cfg = Config()
+        torch.manual_seed(0)
+        reader = CommNet(cfg, BUYER).reader
+        D = cfg.channel.max_msg_len
+        heard = torch.ones(D, dtype=torch.bool)
+        ids = torch.stack([turn(cfg, utter(cfg, code(cfg, 2, 1)), D=D)] * 4)   # a quality word
+        with torch.no_grad():                    # filed, firmly, as a numeral
+            reader.word_class.weight.zero_()
+            reader.word_class.bias.copy_(torch.tensor([0.0, 0.0, 12.0, 0.0]))
+        fields, _, said, first, spoke = reader.read(ids, ids, heard)
+        self.assertTrue(bool(spoke.all()))
+        self.assertLess(float(first[:, 2].exp().max()), 1e-4)
+        # the reading of the quality barely pulls on the class (the floor's
+        # share of it); the lesson pulls in full
+        g_read = torch.autograd.grad(-fields[2][:, 0].mean(), reader.word_class.bias,
+                                     retain_graph=True)[0]
+        g_lesson = torch.autograd.grad(-first[:, 2].mean(), reader.word_class.bias)[0]
+        self.assertLess(float(g_read.abs().max()), 0.01)
+        self.assertGreater(float(g_lesson.abs().max()), 0.5)
+        self.assertLess(float(g_lesson[1]), 0.0, "the lesson does not raise 'adjective'")
+        # a row in which nothing was heard is marked, not read
+        silent = torch.full((2, D), cfg.channel.pad_id, dtype=torch.long)
+        mixed = torch.cat([ids[:1], silent[:1]])
+        self.assertEqual(reader.read(mixed, mixed, heard)[4].tolist(), [True, False])
 
     def _composes(self, seed: int) -> None:
         cfg = Config()
@@ -418,8 +453,8 @@ class TestTheInnateReader(unittest.TestCase):
             f = torch.randint(0, N_LOT_FIELDS, (128,), generator=g)
             v = torch.stack([torch.randint(0, spans[int(x)], (1,), generator=g)[0] for x in f])
             ids = batch_of([[code(cfg, int(a), int(b))] for a, b in zip(f, v)])
-            lp = reader(ids, ids, heard)
-            loss = 0.0
+            lp, _, _, first, _ = reader.read(ids, ids, heard)
+            loss = -cfg.train.answer_class_coef * first.gather(1, f.unsqueeze(1)).mean()
             for j in range(N_LOT_FIELDS):
                 sel = f == j
                 if bool(sel.any()):
@@ -506,11 +541,13 @@ class TestTheSpeakersLexicon(unittest.TestCase):
         spk = LexicalSpeaker(cfg, 16)
         concepts = torch.randn(2, N_LOT_FIELDS, 16)
         concepts[1, 2] = concepts[0, 2]                 # the same colour, other parts differ
+        spk.BOUND = 1e6            # (the choice is bounded in use; here it is made outright)
         with torch.no_grad():
             spk.query.weight.zero_()
-            spk.query.bias.zero_()
-            # a query that picks out part 2 in both rows
-            spk.query.bias.copy_(concepts[0, 2] * 50.0)
+            # a query that picks out part 2 in both rows: far up, the rest far down
+            want = torch.full((N_LOT_FIELDS,), -200.0)
+            want[2] = 200.0
+            spk.query.bias.copy_(torch.linalg.pinv(spk.part_key) @ want * 4.0)
             out, att = spk(torch.randn(2, 16), concepts)
         self.assertGreater(float(att[0, 2]), 0.99)
         self.assertGreater(float(att[1, 2]), 0.99)
@@ -568,7 +605,9 @@ class TestTheSpeakersLexicon(unittest.TestCase):
         self.assertAlmostEqual(float(d[0, c.end_id]), -g, places=5)
         self.assertAlmostEqual(float(d[0, c.space_id]), g, places=5)
         self.assertAlmostEqual(float(d[0].abs().sum()), 2 * g, places=4)
-        self.assertTrue(net.speaker_lexicon.go_on.requires_grad)
+        # the scaffold's strength is given, not learned: what is learned is the
+        # policy that has to do without it (tests/test_vocabulary.py)
+        self.assertFalse(net.speaker_lexicon.go_on.requires_grad)
 
     def test_a_part_already_named_is_passed_over(self):
         """Inhibition of return. Pushed on without it, speakers named a second
@@ -598,7 +637,7 @@ class TestTheSpeakersLexicon(unittest.TestCase):
         toks = torch.full((64, c.dialogue_len), c.pad_id, dtype=torch.long)
         turn = net.turn_so_far(obs, schema, toks, [0])
         self.assertEqual(tuple(turn[1].shape), (64, 1, N_LOT_FIELDS))
-        self.assertTrue(lex.inhibit.requires_grad)
+        self.assertFalse(lex.inhibit.requires_grad)
 
     def test_asked_about_one_field_it_names_that_field(self):
         """Answer the question asked. The lexicon used not to look at the
@@ -624,13 +663,13 @@ class TestTheSpeakersLexicon(unittest.TestCase):
                 _, att = lex(h, net.lot_concepts(obs, schema), None, asked)
             self.assertGreater(float(att[:, q].mean()), 0.8,
                                "asked about field %d, the lexicon looks elsewhere" % q)
-        self.assertTrue(lex.ask.requires_grad)
+        self.assertFalse(lex.ask.requires_grad)
         # and speak() reads the question off the observation itself: its
         # lexical term is the asked field's word
         obs = rw.sample(128, informer=FARMER, query=3).obs(cfg, FARMER)
         with torch.no_grad():
             h = torch.randn(128, cfg.model.d_model)
-            term = net.speak(h, obs, schema) - net.token_head(h)
+            term = net.speak(h, obs, schema) - lex.gate(net.token_head(h))
             words = lex.part_words(net.lot_concepts(obs, schema))
         hit = term[:, :c.atomic_vocab].argmax(-1) == words[:, 3]
         self.assertGreater(float(hit.float().mean()), 0.8)
@@ -655,7 +694,8 @@ class TestTheSpeakersLexicon(unittest.TestCase):
         toks[:, 1] = w[:, 3]
         toks[:, 2] = c.hyphen_id
         push, avoid = net.turn_so_far(obs, schema, toks, [1, 3])
-        self.assertFalse(bool(push.any()))
+        self.assertFalse(bool((push > 0).any()), "a one-field answer was pushed on")
+        self.assertEqual(push.tolist(), [[0, -1]] * 4, "one word answers one field: then hold")
         self.assertFalse(bool(avoid.any()), "pointing at the quantity steered the words off it")
         # describing a whole lot: inside a word nothing is avoided, a new word
         # passes over what the turn has named

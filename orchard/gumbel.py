@@ -35,22 +35,22 @@ from typing import Optional, Sequence
 import torch
 import torch.nn.functional as F
 
-from .agents import Agent, dialogue_offset
+from .agents import Agent, dialogue_offset, lexicon_offsets
 from .config import Config
 from .env import (BUYER, FARMER, MASKED, Beliefs, Decision, Outcome, buyer_obs,
                   farmer_obs, grammar_allowed, length_cost, resolve,
                   speaker_of_turn)
 from .batched import ScenarioBatch, resolve_batch
-from .curriculum import (H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_REPORT, N_HEADS,
+from .curriculum import (H_BELIEF, H_BELIEF_COLOR, H_CHOICE, H_REPORT, LOT_FIELD_OF, N_HEADS,
                          MutualBatch, Phase, ReferentialBatch, hindsight_applies,
-                         hindsight_targets, ladder, phase_schema, resolve_referential,
-                         resolve_reports)
+                         hindsight_targets, ladder, phase_schema, report_spec,
+                         resolve_referential, resolve_reports)
 from .gesture import (GESTURE_NONE, draw_availability, gesture_option_mask,
                       gesture_tokens_for, gestured_fields, n_token_ids,
                       without_gestures)
 from .rollout import (BatchRollout, UpdateStats, anneal, belief_columns,
                       group_by_agent, n_outputs, split_decision)
-from .world import N_LOT_FIELDS, Scenario
+from .world import N_LOT_FIELDS, Scenario, lot_spans
 
 
 def _count(content: torch.Tensor, positions: list[int]) -> torch.Tensor:
@@ -182,6 +182,27 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             if phase.speaks(cfg, r):
                 mi_keys[r] = naming_keys(cfg, phase, r, obs_of[r])
 
+    # ---- the description scaffold, and the habit it leaves --------------------
+    # While any of the scaffold is left (`agents.LexicalSpeaker`), each symbol a
+    # scaffolded speaker emits is also a lesson for its own unscaffolded policy
+    # (`train.scaffold_distil`): where a word starts, which part of the lot to
+    # name; after a word, whether to go on, start another or stop. Never which
+    # atom -- the words are the lexicon's. Read once per update, not per symbol.
+    #
+    # The lesson runs to the end of the rung the scaffold is withdrawn in, not
+    # only until the scaffold reaches zero: how long a habit takes to form is
+    # not something a schedule knows, and a speaker left without support before
+    # it has one stays without one. The rung cannot be passed until the scaffold
+    # is gone, so what is measured there is still the speakers' own; and every
+    # rung above has neither the scaffold nor the lesson.
+    distil_on = (train and t.scaffold_distil > 0 and any(
+        a.net.speaks_lexically for a in list(farmers) + list(buyers)) and (
+        phase.name == cfg.curriculum.scaffold_fade_rung
+        or any(a.net.speaks_lexically and float(a.net.speaker_lexicon.scaffold) > 0
+               for a in list(farmers) + list(buyers))))
+    distil_terms: list[torch.Tensor] = []
+    distil_n = torch.zeros((), device=device)
+
     # ---- the conversation ------------------------------------------------
     # Phases that use fewer turns simply leave the later dialogue slots empty,
     # which keeps one sequence layout -- and therefore one set of weights -- valid
@@ -190,6 +211,13 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         role = phase.speaker_of_turn(turn)
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
         alive = torch.ones(B, dtype=torch.bool, device=device)
+        # What each speaker has made of the conversation so far. Nothing the
+        # other party said changes during a speaker's own turn, so it listens
+        # once, here, rather than at every symbol.
+        t0 = turn * c.max_msg_len
+        heard_by = {a_i: (pool[a_i].net.listen(soft[:, :t0][ep], tokens[:, :t0][ep],
+                                               mask_of[role]) if turn > 0 else None)
+                    for a_i, ep in groups_of[role]}
 
         turn_starts[role].append(turn * c.max_msg_len)
         for k in range(c.max_msg_len):
@@ -200,6 +228,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             p = turn * c.max_msg_len + k
             seq_pos = dialogue_offset(cfg) + p
             logits = torch.zeros((B, c.n_emittable), device=device)
+            plain = torch.zeros((B, c.n_emittable), device=device) if distil_on else None
+            plan = plain
+            part_own = torch.full((B, N_LOT_FIELDS), 1.0 / N_LOT_FIELDS, device=device)
+            part_asked = part_own
+            has_plain = torch.zeros(B, dtype=torch.bool, device=device)
             g_logits = (torch.zeros((B, 1 + N_LOT_FIELDS), device=device)
                         if gest_on and k == 0 else None)
             for a_i, ep in groups_of[role]:
@@ -207,14 +240,25 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 # copy is what the backward pass keeps, so it must not carry the
                 # empty remainder of the buffer
                 net = pool[a_i].net
+                hd = heard_by[a_i]
                 h = net.encode(obs[ep], soft[:, :p][ep], upto=seq_pos,
-                               schema=schema_of[role], self_mask=mask_of[role])[:, -1]
+                               schema=schema_of[role], self_mask=mask_of[role],
+                               heard=hd)[:, -1]
                 # which parts this turn has named, and are some still unnamed?
                 turn_st = net.turn_so_far(obs[ep], schema_of[role], tokens[ep], [p])
-                logits = logits.index_copy(
-                    0, ep, net.speak(h, obs[ep], schema_of[role],
-                                     None if turn_st is None
-                                     else (turn_st[0][:, 0], turn_st[1][:, 0])))
+                said = net.speak(h, obs[ep], schema_of[role],
+                                 None if turn_st is None
+                                 else (turn_st[0][:, 0], turn_st[1][:, 0]),
+                                 heard=None if hd is None else hd.fields, habit=distil_on)
+                if distil_on:
+                    said, own = said
+                    if own is not None:
+                        plain = plain.index_copy(0, ep, own[0])
+                        part_own = part_own.index_copy(0, ep, own[1])
+                        part_asked = part_asked.index_copy(0, ep, own[2].detach())
+                        plan = plan.index_copy(0, ep, own[3].detach())
+                        has_plain = has_plain.index_fill(0, ep, True)
+                logits = logits.index_copy(0, ep, said)
                 if g_logits is not None:
                     g_logits = g_logits.index_copy(0, ep, net.gesture_head(h))
 
@@ -261,6 +305,22 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             tokens[:, p] = tok.detach()
             active[:, p] = acted
             lp = F.log_softmax(logits, dim=-1)
+            if distil_on:
+                # KL(what the scaffold asks for || what the speaker would do
+                # alone). Where an atom is due, over the five parts it could
+                # name; where a word has just been said, over what the grammar
+                # allows next (go on in the word, start another, or stop).
+                lp_plan = F.log_softmax(plan.masked_fill(~allowed, MASKED), dim=-1)
+                lp_own = F.log_softmax(plain.masked_fill(~allowed, MASKED), dim=-1)
+                gap = torch.where(allowed, lp_plan - lp_own, torch.zeros_like(lp_own))
+                after_word = (lp_plan.exp() * gap).sum(-1)
+                which_part = (part_asked * ((part_asked + 1e-9).log()
+                                            - (part_own + 1e-9).log())).sum(-1)
+                atom_due = allowed[:, 0]
+                asks = atom_due | (plan.abs().sum(-1) > 0)     # the scaffold has a say here
+                w = (acted & has_plain & asks).float()
+                distil_terms.append(torch.where(atom_due, which_part, after_word) * w)
+                distil_n = distil_n + w.sum()
             if mi_on and role in mi_keys and k <= 1:
                 take = acted & ~have_first[role]
                 first_lp[role] = torch.where(take.unsqueeze(-1), lp, first_lp[role])
@@ -298,6 +358,16 @@ def run_and_update_gumbel(cfg: Config, scenarios,
     # reader learns words from the ostensive lesson, which waits for a name.
     supervise_gestures = train and gest_on and cfg.gesture.supervise_coef > 0
     gest_lp: dict[int, dict[int, torch.Tensor]] = {FARMER: {}, BUYER: {}}
+    # the word each listener took to name each field of what it heard (its
+    # first atom; -1 where it took none to): what it remembers, where it
+    # understood (`reward.lexicon_imitate`)
+    took = {r: torch.full((B, N_LOT_FIELDS), -1, dtype=torch.long, device=device)
+            for r in (FARMER, BUYER)}
+    # ...and what each listener read the *first* word it heard as naming, for
+    # the lesson that an answer names what was asked (`train.answer_class_coef`)
+    class_on = train and referential and t.answer_class_coef > 0
+    first_names = torch.zeros((B, N_LOT_FIELDS), device=device)
+    first_heard = torch.zeros(B, dtype=torch.bool, device=device)
     belief_cols = set(H_BELIEF) | {H_BELIEF_COLOR}
     for role in (FARMER, BUYER):
         pool, idx, obs = pool_of[role], idx_of[role], obs_of[role]
@@ -311,11 +381,17 @@ def run_and_update_gumbel(cfg: Config, scenarios,
             # indexed once: the backward pass keeps what goes in, so a second
             # gather would keep a second copy of the soft dialogue
             soft_ep = soft[ep]
-            h = net.encode(obs[ep], soft_ep, schema=schema_of[role],
-                           self_mask=mask_of[role])[:, -1]
             # the innate reader's reading of the other party's words, through
             # the same soft one-hots, so it too carries a gradient to the speaker
-            lex = net.read_words(soft_ep, tokens[ep], mask_of[role])
+            hd = net.listen(soft_ep, tokens[ep], mask_of[role])
+            lex = hd.fields if hd is not None else None
+            if hd is not None and hd.said is not None:
+                took[role] = took[role].index_copy(0, ep, hd.said)
+                if class_on and role == phase.guesser:
+                    first_names = first_names.index_copy(0, ep, hd.first)
+                    first_heard = first_heard.index_copy(0, ep, hd.spoke)
+            h = net.encode(obs[ep], soft_ep, schema=schema_of[role],
+                           self_mask=mask_of[role], heard=hd)[:, -1]
             heads = net.all_heads(h, obs[ep], lex=lex)
             if supervise_gestures:
                 for col, lg in zip(H_REPORT, net.report_logits(h)):
@@ -595,10 +671,10 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                     continue
                 net = pool[a_i].net
                 w_sel = words_only[sel]           # indexed once: one copy for backward
+                hd = net.listen(w_sel, words_ids[sel], mask_of[role])
                 h = net.encode(obs[sel], w_sel, schema=schema_of[role],
-                               self_mask=mask_of[role])[:, -1]
-                heads = net.report_logits(h, net.read_words(
-                    w_sel, words_ids[sel], mask_of[role]))
+                               self_mask=mask_of[role], heard=hd)[:, -1]
+                heads = net.report_logits(h, hd.fields if hd is not None else None)
                 for j in range(N_LOT_FIELDS):
                     rows = field[sel] == j
                     if not bool(rows.any()):
@@ -630,6 +706,118 @@ def run_and_update_gumbel(cfg: Config, scenarios,
                 tgt = value[sel].clamp(0, lp.shape[-1] - 1)
                 loss = loss + coef * F.nll_loss(lp[sel], tgt)
 
+    # The answer to a question about a field is a word for that field
+    # (`train.answer_class_coef`): in a round about one field, the listener's
+    # reader is taught to read the first word it heard as naming that field.
+    if class_on:
+        asked = scenarios.query
+        w = ((asked < N_LOT_FIELDS) & first_heard).float()
+        nll = -first_names.gather(1, asked.clamp(max=N_LOT_FIELDS - 1).unsqueeze(1)).squeeze(1)
+        loss = loss + t.answer_class_coef * (nll * w).sum() / w.sum().clamp(min=1.0)
+
+    # Every agent that played, once. Below `curriculum.split_roles_at` the
+    # farmer and buyer seats are one list, so listing both seats names every
+    # agent twice.
+    seen, seen_ids = [], set()
+    for role in (FARMER, BUYER):
+        for a_i, _ in groups_of[role]:
+            a = pool_of[role][a_i]
+            if id(a) not in seen_ids:
+                seen_ids.add(id(a))
+                seen.append(a)
+
+    # The habit the scaffold leaves (`train.scaffold_distil`): the speaker's own
+    # policy, towards what the scaffold asked of it at each symbol.
+    if distil_terms:
+        distil = torch.stack(distil_terms, dim=1).sum() / distil_n.clamp(min=1.0)
+        loss = loss + t.scaffold_distil * distil
+        stats.scaffold_distil = float(distil.detach())
+
+    # One dialect (`reward.lexicon_imitate`): a listener that understood what
+    # an elder said remembers the word it heard for that meaning. The memory
+    # fades by the update, whoever spoke.
+    #
+    # In a round about one field the word is the answer's first, and
+    # understanding is having picked the lot that was meant. In a description
+    # of a whole lot -- a lineup's open round, each side's lot in `mutual`, a
+    # request or an answer in the market -- it is, field by field, the word the
+    # listener itself took to name that field (`Heard.said`), where what it made
+    # of the field was right. A wrong guess at which word named a field lands
+    # on a word that goes with another field's value, a different one every
+    # time; the right one is there every time the value is. So the memory
+    # peaks on the right word even for a listener guessing which is which --
+    # cross-situational learning -- and a newcomer that never plays a
+    # one-field round still takes its elders' words.
+    speakers = [a for a in seen if a.net.speaks_lexically]
+    R = cfg.reward
+    if R.lexicon_imitate > 0 and speakers:
+        keep = 0.5 ** (1.0 / max(1, int(R.lexicon_imitate_half_life_updates)))
+        offs = torch.tensor(lexicon_offsets(cfg), device=device)
+        spans = torch.tensor(lot_spans(cfg.world), device=device)
+
+        def seniority(agents):       # elder: born earlier, or the earlier of two born together
+            return torch.tensor([int(a.birth_episode) * 1_000_000 + int(a.agent_id)
+                                 for a in agents], dtype=torch.long, device=device)
+        rank = {r: seniority(pool_of[r])[idx_of[r]] for r in (FARMER, BUYER)}
+
+        def remember(lis, f, value, atom, ok):
+            """Listeners in seat ``lis`` heard ``atom`` for (field ``f``, ``value``)."""
+            spk = BUYER if lis == FARMER else FARMER
+            ok = (ok & (atom >= 0) & (atom < c.atomic_vocab) & (rank[spk] < rank[lis])
+                  & (value >= 0) & (value < spans[f])).float()
+            row = offs[f] + value.clamp(0, int(spans[f]) - 1)
+            atom = atom.clamp(0, c.atomic_vocab - 1)
+            for a_i, ep in groups_of[lis]:
+                net = pool_of[lis][a_i].net
+                if net.speaks_lexically:
+                    net.speaker_lexicon.heard.index_put_((row[ep], atom[ep]), ok[ep],
+                                                         accumulate=True)
+        with torch.no_grad():
+            for a in speakers:
+                a.net.speaker_lexicon.heard.mul_(keep)
+            if referential:
+                spk, lis = phase.informer, phase.guesser
+                first = phase.own_positions(cfg, spk)[:c.max_msg_len]
+                seg = tokens[:, first]                                  # the describer's turn
+                is_atom = seg < c.atomic_vocab
+                at = is_atom.float().argmax(dim=1)                       # its first atom
+                opening = torch.where(is_atom.any(dim=1),
+                                      seg.gather(1, at.unsqueeze(1)).squeeze(1),
+                                      torch.full_like(at, -1))
+                truth = scenarios.true_meaning
+                one = scenarios.query < N_LOT_FIELDS
+                for f in range(N_LOT_FIELDS):
+                    remember(lis, f, truth[:, f], opening,
+                             res["success"] & one & (scenarios.query == f))
+                    remember(lis, f, truth[:, f], took[lis][:, f], res["success"] & ~one)
+            elif phase.reporting and batched:
+                for lis, rows in report_spec(cfg, phase, scenarios).items():
+                    for name, head, truth in rows:
+                        f = LOT_FIELD_OF.get(name)
+                        if f is not None:
+                            remember(lis, f, truth, took[lis][:, f],
+                                     dec_sampled[lis][:, head] == truth)
+
+    # One word per meaning, and the elders' word for it: each speaker's own
+    # lexicon table (`reward.lexicon_exclusive`, `reward.lexicon_imitate`).
+    if (R.lexicon_exclusive > 0 or R.lexicon_imitate > 0) and speakers:
+        from .conventions import imitation_loss, lexicon_exclusivity
+        ex_total = im_total = 0.0
+        for a in speakers:
+            table = a.net.lexicon_table()
+            if R.lexicon_exclusive > 0:
+                # a word heard from an elder has first claim on its atom
+                ex = lexicon_exclusivity(
+                    table, a.net.speaker_lexicon.heard if R.lexicon_imitate > 0 else None)
+                loss = loss + R.lexicon_exclusive * ex
+                ex_total += float(ex.detach())
+            if R.lexicon_imitate > 0:
+                im = imitation_loss(table, a.net.speaker_lexicon.heard)
+                loss = loss + R.lexicon_imitate * im
+                im_total += float(im.detach())
+        stats.lexicon_exclusive = ex_total / len(speakers)
+        stats.lexicon_imitate = im_total / len(speakers)
+
     if token_entropy_terms:
         # Each step's entropy is already masked to the episodes whose token
         # policy acted there, so the mean per token is the sum over the total.
@@ -641,19 +829,11 @@ def run_and_update_gumbel(cfg: Config, scenarios,
         loss = loss - ent_tok_coef * tok_ent
         stats.token_entropy = float(tok_ent.detach())
 
-    # Every agent that played takes one optimiser step. Below
-    # `curriculum.split_roles_at` the farmer and buyer seats are one list, so
-    # listing both seats named every agent twice, and each took two Adam steps
-    # on the same gradient -- about twice the intended step size on every
-    # pooled rung, halving at the split. (`train.lr` is now the step those
-    # rungs were run and validated at; see its comment.)
-    seen, seen_ids = [], set()
-    for role in (FARMER, BUYER):
-        for a_i, _ in groups_of[role]:
-            a = pool_of[role][a_i]
-            if id(a) not in seen_ids:
-                seen_ids.add(id(a))
-                seen.append(a)
+    # Every agent that played takes one optimiser step -- one each (`seen`):
+    # naming both seats' lists used to give each pooled agent two Adam steps on
+    # the same gradient, about twice the intended step size on every pooled
+    # rung, halving at the split. (`train.lr` is now the step those rungs were
+    # run and validated at; see its comment.)
     for a in seen:
         a.opt.zero_grad(set_to_none=True)
     loss.backward()

@@ -106,6 +106,11 @@ FIELD_HEADS = {
     "stock": H_BELIEF[1], "lot-quality": H_BELIEF[2], "reservation": H_BELIEF[3],
     "deal": H_ACCEPT,
 }
+# Which field of a lot each reportable field is a value of: a request is a lot,
+# and what a farmer answers with -- how many, how good, at what floor -- is said
+# with the words for a quantity, a quality and a price.
+LOT_FIELD_OF = {"fruit": 0, "colour": 1, "quality": 2, "quantity": 3, "price": 4,
+                "stock": 3, "lot-quality": 2, "reservation": 4}
 # Fields that are a (fruit, colour, quality) combination's parts: the ones the
 # held-out gate can be measured on.
 COMBO_FIELDS = MEANING_FIELDS
@@ -114,6 +119,9 @@ COMBO_FIELDS = MEANING_FIELDS
 ASK_ALL = QUERY_ALL
 N_KINDS = N_LOT_FIELDS + 1
 ROUND_NAMES = LOT_FIELDS + ("whole lots",)
+# The fields of a lot that are magnitudes -- quantity and price -- and so have
+# neighbours: the ones a word can be *nearly* right about.
+NUMERAL_FIELDS = tuple(i for i, k in enumerate(LOT_KINDS) if k in (K_QTY, K_PRICE))
 
 
 # ==========================================================================
@@ -803,6 +811,30 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
                   updates_in_phase: int) -> tuple[bool, dict[str, Any]]:
     """Has this rung demonstrably worked?  Returns (passed, named checks).
 
+    The rung's own bars (:func:`_evaluate_rung`), and -- on the rung the
+    description scaffold is withdrawn in -- that it is gone: until it is,
+    nothing the speakers were measured doing is known to be their own.
+    Unmeasured is not passed.
+    """
+    passed, checks = _evaluate_rung(cfg, phase, ev, updates_in_phase)
+    c = cfg.curriculum
+    if phase.name == c.scaffold_fade_rung:
+        left = _num(ev.get("scaffold"))
+        met = left == left and left <= 0.0
+        checks["describes without the scaffold"] = {
+            "met": met,
+            "detail": "not measured" if left != left else
+            "%.0f%% of the scaffold is still on (held for %d updates of this rung, then "
+            "withdrawn over %d)" % (100 * left, c.scaffold_hold_updates,
+                                    c.scaffold_fade_updates)}
+        passed = passed and met
+    return passed, checks
+
+
+def _evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
+                   updates_in_phase: int) -> tuple[bool, dict[str, Any]]:
+    """A rung's own bars.
+
     ``ev`` is :func:`orchard.metrics.phase_evidence`'s output. The trading rungs
     are judged on pooled numbers. Every rung that exists to make communication
     two-way is judged per role, and every role has to clear every bar on its
@@ -909,6 +941,58 @@ def evaluate_rung(cfg: Config, phase: Phase, ev: dict[str, Any],
             % (_fmt(s), ROUND_NAMES[kind],
                " (each describer: %s)" % " / ".join(_fmt(x) for x in each)
                if len(each) > 1 else "", floor, c.min_channel_transfer, ch))
+    # Numbers have to be exact: every rung that plays rounds on a quantity or a
+    # price is also judged on rounds whose wrong candidates are the nearest
+    # values, each describer on its own. The ordinary rounds draw them at
+    # random, and "about four" wins those: the 2026-10-01 run passed
+    # `name-quantity` at 0.89 with six words for nine quantities, and `mutual`,
+    # which wants the number, then read quantity at 0.40.
+    near = ev.get("near_miss") or {}
+    for kind in phase.kinds:
+        if kind not in NUMERAL_FIELDS or c.numeral_min_near <= 0:
+            continue
+        what = "tells neighbouring %s apart" % (
+            "quantities" if LOT_KINDS[kind] == K_QTY else "prices")
+        d = near.get(kind, near.get(str(kind)))
+        if not d or d.get("error"):
+            checks[what] = (False, "not measured" + (": %s" % d["error"] if d else ""))
+            continue
+        each = [_num(x) for x in (d.get("each") or [])] or [_num(d.get("success"))]
+        worst = min(each) if all(x == x for x in each) else float("nan")
+        checks[what] = (
+            worst == worst and worst >= c.numeral_min_near,
+            "%s on rounds of nearest neighbours%s, need %.2f"
+            % (_fmt(_num(d.get("success"))),
+               " (each describer: %s)" % " / ".join(_fmt(x) for x in each)
+               if len(each) > 1 else "", c.numeral_min_near))
+    if whole_thing:
+        # The vocabulary this rung hands on. `mutual` is where the community
+        # arrives, and what it has to learn is what the founders say: on the
+        # 2026-10-01 run that was 8 distinct words for 27 meanings each, and
+        # not one word the two founders shared, and every gate above passed
+        # it. Measured on what each agent says when asked about one field
+        # (`metrics.vocabulary`): the worst agent's share of meanings with a
+        # word of their own, and the worst pair's share of meanings named alike.
+        voc = ev.get("vocabulary") or {}
+        if c.min_vocabulary_distinct > 0:
+            x = _num(voc.get("distinct_min"))
+            checks["one word per meaning"] = (
+                x == x and x >= c.min_vocabulary_distinct,
+                "%s" % ("not measured" + (": %s" % voc["error"] if voc.get("error") else "")
+                        if x != x else
+                        "the speaker with the fewest has %d distinct words for %d meanings "
+                        "(%s), need %.2f" % (int(voc.get("distinct_fewest", 0)),
+                                             int(voc.get("meanings", 0)), _fmt(x),
+                                             c.min_vocabulary_distinct)))
+        if c.min_vocabulary_agreement > 0 and int(voc.get("speakers", 2) or 0) > 1:
+            x = _num(voc.get("agreement_min"))
+            checks["one dialect"] = (
+                x == x and x >= c.min_vocabulary_agreement,
+                "%s" % ("not measured" if x != x else
+                        "the two speakers furthest apart say the same word for %s of the "
+                        "meanings (%s on average), need %.2f"
+                        % (_fmt(x), _fmt(_num(voc.get("agreement_mean"))),
+                           c.min_vocabulary_agreement)))
     if whole_thing:
         # The productivity gate, on the rungs that describe a whole lot. Every
         # candidate in a held-out round is a combination nobody ever trained on,
@@ -1098,13 +1182,30 @@ class ReferentialWorld:
                            b_meaning=self._draw(n, held_out))
 
     # ------------------------------------------------------------------
-    def _query_round(self, n: int, field: int, held_out: bool) -> tuple:
+    def near_frac(self, field: int, near: Optional[float] = None) -> float:
+        """The share of rounds on ``field`` whose wrong candidates are its
+        nearest values: `curriculum.numeral_near_frac` for a quantity or a
+        price, nothing for a field with no order to be near in. ``near``
+        overrides the setting (a measurement asking for near misses alone)."""
+        if field not in NUMERAL_FIELDS:
+            return 0.0
+        return float(self.cfg.curriculum.numeral_near_frac if near is None else near)
+
+    def _query_round(self, n: int, field: int, held_out: bool,
+                     near: Optional[float] = None) -> tuple:
         """Candidates that share every field but ``field``, which they all differ in.
 
         Every candidate is a combination that *could* be the answer: the one
         value of the field reserved for this pair of other fields is left out of
         the lineup entirely. Including it would hand the guesser a candidate it
         could rule out without listening -- it is never anybody's target.
+
+        On a number, a share of the rounds (:meth:`near_frac`) take the
+        *nearest* values as the wrong candidates -- four against three and
+        five -- because drawn at random two of nine quantities are seldom
+        neighbours, and a word that means "about four" wins nearly every such
+        round: the 2026-10-01 run passed `name-quantity` at 0.89 with six
+        words for nine quantities.
         """
         sp = self.spans[field]
         K = self._n_candidates(field)
@@ -1115,9 +1216,15 @@ class ReferentialWorld:
         grid[:, :, field] = torch.arange(sp, device=self.device).unsqueeze(0)
         reserved = self.is_held_out(grid.reshape(-1, W)).view(n, sp)
         is_base = grid[:, :, field] == base[:, field].unsqueeze(1)
+        order = torch.rand(n, sp, device=self.device, generator=self.gen)
+        frac = self.near_frac(field, near)
+        if frac > 0:
+            # nearest first, ties (one more, one less) broken at random
+            close = torch.rand(n, 1, device=self.device, generator=self.gen) < frac
+            dist = (grid[:, :, field] - base[:, field].unsqueeze(1)).abs().float()
+            order = torch.where(close, dist + order, order * float(sp))
         # rank: real alternatives first, then reserved ones, never the target
-        score = (torch.rand(n, sp, device=self.device, generator=self.gen)
-                 + reserved.float() * 2.0 + is_base.float() * 4.0)
+        score = order + reserved.float() * 2.0 * sp + is_base.float() * 4.0 * sp
         pick = torch.argsort(score, dim=1)[:, :K - 1]
         others = grid.gather(1, pick.unsqueeze(-1).expand(-1, -1, W))[:, :, field]
         slot = torch.randint(0, K, (n,), device=self.device, generator=self.gen)
@@ -1129,7 +1236,8 @@ class ReferentialWorld:
         cand[:, :, field] = vals
         return cand, slot
 
-    def _open_round(self, n: int, held_out: bool, hard_frac: float) -> tuple:
+    def _open_round(self, n: int, held_out: bool, hard_frac: float,
+                    near: Optional[float] = None) -> tuple:
         """Candidates that differ in any field: an anchor plus near misses, mostly.
 
         In a held-out round *every* candidate is a reserved combination, not just
@@ -1164,7 +1272,7 @@ class ReferentialWorld:
             if h:
                 anchor = perm[hard][torch.arange(h, device=self.device),
                                     target[hard]]
-                cl = self._cluster(anchor, K)
+                cl = self._cluster(anchor, K, near)
                 # Shuffle the whole cluster and take the target uniformly from
                 # it. Leaving the anchor as the target would make the target the
                 # one candidate the others are all near misses *of*, and "pick
@@ -1229,7 +1337,8 @@ class ReferentialWorld:
             cand[r, k] = self._draw(r.shape[0], held_out=held_out)
         return cand
 
-    def _cluster(self, anchor: torch.Tensor, K: int) -> torch.Tensor:
+    def _cluster(self, anchor: torch.Tensor, K: int,
+                 near: Optional[float] = None) -> torch.Tensor:
         """(n, K, 5): the anchor, then K-1 of its one-field near misses.
 
         The *field* a near miss differs in is drawn uniformly, and only then a
@@ -1238,11 +1347,17 @@ class ReferentialWorld:
         against four fruits, fruit decided an open round 7% of the time and a
         describer could drop it almost for free. Every field has to be the one
         that decides often enough to be worth saying.
+
+        Where the field is a number, a share of the near misses
+        (:meth:`near_frac`) are one step away: the same lot with one more, or
+        one less.
         """
         n = anchor.shape[0]
         W = N_LOT_FIELDS
         rows = torch.arange(n, device=self.device)
         spans = torch.tensor(self.spans, dtype=torch.long, device=self.device)
+        near_of = torch.tensor([self.near_frac(f, near) for f in range(W)],
+                               dtype=torch.float, device=self.device)
         picks: list[torch.Tensor] = []
         fields_used: list[torch.Tensor] = []
         for _ in range(K - 1):
@@ -1254,6 +1369,13 @@ class ReferentialWorld:
                 span = spans[field]
                 step = 1 + (torch.rand(n, device=self.device, generator=self.gen)
                             * (span - 1).float()).long().clamp(max=(span - 2).clamp(min=0))
+                # one step along the number line: up or down, turned back at an end
+                at = anchor[rows, field]
+                up = torch.rand(n, device=self.device, generator=self.gen) < 0.5
+                up = (up | (at == 0)) & (at < span - 1)
+                one = torch.where(up, torch.ones_like(step), span - 1)
+                close = torch.rand(n, device=self.device, generator=self.gen) < near_of[field]
+                step = torch.where(close, one, step)
                 new = anchor.clone()
                 new[rows, field] = (anchor[rows, field] + step) % span
                 # a reserved combination is never a candidate; nor is a repeat;
@@ -1274,7 +1396,8 @@ class ReferentialWorld:
     def sample(self, n: int, informer: int = FARMER, held_out: bool = False,
                hard_frac: Optional[float] = None, mix: "tuple | None" = None,
                query: "int | None" = None, mixed_query: bool = False,
-               combo_only: bool = False) -> ReferentialBatch:
+               combo_only: bool = False, near: Optional[float] = None
+               ) -> ReferentialBatch:
         """One batch of lineup rounds, mixed as the rung asks.
 
         ``mix`` weights the kinds of round -- one per lot field, then all fields
@@ -1282,7 +1405,10 @@ class ReferentialWorld:
         ``query`` forces a single kind (used by the probes, which ask about one
         field at a time). ``combo_only`` draws every whole-lot round as the
         productivity test's (:meth:`_combo_round`): candidates that share
-        quantity and price and differ in their combination.
+        quantity and price and differ in their combination. ``near`` overrides
+        the share of number rounds whose wrong candidates are the nearest
+        values (:meth:`near_frac`): 1.0 is the test of whether a number word
+        is exact.
         """
         if query is not None:
             mix = tuple(1.0 if i == int(query) else 0.0 for i in range(N_KINDS))
@@ -1311,9 +1437,9 @@ class ReferentialWorld:
             elif kind == ASK_ALL:
                 p = (self.cfg.curriculum.hard_distractor_frac if hard_frac is None
                      else hard_frac)
-                c, t = self._open_round(k, held_out, 0.0 if held_out else p)
+                c, t = self._open_round(k, held_out, 0.0 if held_out else p, near)
             else:
-                c, t = self._query_round(k, kind, held_out)
+                c, t = self._query_round(k, kind, held_out, near)
             cand[sl] = c[:, :K]
             target[sl] = t
             q[sl] = kind

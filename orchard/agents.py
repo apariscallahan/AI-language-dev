@@ -68,6 +68,17 @@ WORD_CLASSES = ("noun", "adjective", "numeral", "none")
 CLASS_OF_FIELD = (0, 1, 1, 2, 2)
 
 
+def lexicon_offsets(cfg: Config) -> list[int]:
+    """Where each field's meanings start among the rows of a speaker's lexicon
+    -- every value of every field of a lot, in lot order
+    (:meth:`CommNet.lexicon_table`)."""
+    out, at = [], 0
+    for span in lot_spans(cfg.world):
+        out.append(at)
+        at += span
+    return out
+
+
 def thermometer(values: torch.Tensor, n_values: int) -> torch.Tensor:
     """(...,) ints -> (..., n_values - 1) floats: [v >= 1, v >= 2, ...].
 
@@ -106,41 +117,158 @@ class LexicalSpeaker(nn.Module):
     What stays learned: which atoms name which value (the output layer), which
     part to name first and next (the attention), how many words to say and
     when to stop (the token head's END), and every structural choice. Where
-    the observation is not a lot -- a barn, a lineup -- the term is absent.
+    the observation is a lineup the term is absent; where it is a barn, the
+    parts are those of the row the farmer is talking about
+    (:meth:`CommNet.barn_concepts`).
+
+    **Which part** is an attention over the five parts, scored against one
+    learned key per part (``part_key``), not against the parts' concepts. The
+    concepts are sums of embeddings that start at 0.02, so a score against
+    them was a few tenths at most however the query was trained, the choice of
+    part stayed close to uniform, and on the 2026-10-01 run it was the
+    scaffold below that chose every part, never the speaker. The keys start at
+    unit scale and the query small: the choice starts uniform and can be
+    learned in tens of updates.
+
+    **The scaffold.** Three biases put the pragmatics of description in from
+    outside while the words are being learned: answer the question asked
+    (``ask``), go on until every part is named and then stop (``go_on``), and
+    do not name a part twice (``inhibit``). They are fixed strengths, all
+    multiplied by ``scaffold``, which the trainer takes from 1 to 0 during
+    `curriculum.scaffold_fade_rung` -- and while it is above 0 the speaker's
+    own policy (the learned scores here and the token head) is trained to do
+    unaided what the scaffold asks for (`train.scaffold_distil`), the way a
+    supported skill becomes a habit. Everything after that rung -- all of
+    trading -- runs with no scaffold at all. On the 2026-10-01 run
+    the three were learnable parameters that barely moved (ask 4.0 -> 4.2), the
+    token head had learned nothing in six rungs, and every description in
+    `mutual` was the scaffold's.
+
+    Two things keep the scaffold in charge for as long as it is on. The
+    speaker's own scores are bounded (``BOUND``), and the two biases on the
+    choice of part are well above the bound: whatever the speaker has learned,
+    the asked part wins and a named part loses. And what the speaker's policy
+    is taught is what the scaffold *asks for*, not what the scaffolded speaker
+    did. Taught the latter, on the first CPU run with keys it could learn
+    from, `name-fruit` -- where the asked part is always the fruit -- taught
+    it "the fruit, whatever is asked", strongly enough to overrule the
+    scaffold: at update 50 it answered a question about colour, quality,
+    quantity or price with the fruit's name (4 distinct words for 27
+    meanings), and a teacher that is the pupil plus a nudge agreed with it.
     """
 
     # How hard a speaker describing a whole thing is pushed on past a word while
     # parts of it are still unnamed, in nats taken from ending and given to
-    # going on. Learned from there; see `CommNet.describing`. Measured with two
+    # going on -- and, once it has said as much as it was asked for, taken from
+    # starting another word. See `CommNet.turn_so_far`. Measured with two
     # founders drilled on "a word, then stop": at 3.0 one founder went on 99%
     # of the time and the other 10%, so its listener never learned its longer
     # descriptions and it stayed at one word for 100 updates; when both did go
     # on, their token heads had learned it so hard that descriptions ran to 8.5
     # words. At 5.0 both said exactly five words, one per part, by update 50.
-    GO_ON_INIT = 5.0
+    GO_ON = 5.0
     # Describing a whole lot, how strongly a part already named in this turn is
     # passed over when choosing the part the next *word* names (inhibition of
-    # return), in attention logits. Learned from there.
-    INHIBIT_INIT = 4.0
+    # return), in attention logits.
+    INHIBIT = 8.0
     # Asked about one field, how strongly the lexicon attends to that field, in
-    # attention logits: answer the question you were asked. Learned from there.
-    ASK_INIT = 4.0
+    # attention logits: answer the question you were asked.
+    ASK = 8.0
+    # The speaker's own score for a part lies within +-BOUND: enough to choose
+    # a part 99% of the time, and too little to overrule the scaffold.
+    BOUND = 3.0
 
     def __init__(self, cfg: Config, d: int):
         super().__init__()
         self.atomic_vocab = cfg.channel.atomic_vocab
         self.n_emittable = cfg.channel.n_emittable
         self.query = nn.Linear(d, d)
+        self.part_key = nn.Parameter(torch.randn(N_LOT_FIELDS, d))
         self.norm = nn.LayerNorm(d)
         self.say = nn.Linear(d, self.atomic_vocab)
         self.gain = nn.Parameter(torch.ones(()))
-        self.go_on = nn.Parameter(torch.tensor(self.GO_ON_INIT))
-        self.inhibit = nn.Parameter(torch.tensor(self.INHIBIT_INIT))
-        self.ask = nn.Parameter(torch.tensor(self.ASK_INIT))
+        # the scaffold: fixed strengths, and how much of them is left (1 -> 0)
+        self.register_buffer("go_on", torch.tensor(self.GO_ON))
+        self.register_buffer("inhibit", torch.tensor(self.INHIBIT))
+        self.register_buffer("ask", torch.tensor(self.ASK))
+        self.register_buffer("scaffold", torch.ones(()))
+        # The words this speaker has heard its elders use and understood: for
+        # each meaning (every value of every field, in lot order), how often
+        # lately each atom opened the word for it. What `reward.lexicon_imitate`
+        # pulls its own lexicon towards. Decays by the update.
+        self.register_buffer("heard", torch.zeros(sum(lot_spans(cfg.world)),
+                                                  self.atomic_vocab))
         push = torch.zeros(self.n_emittable)
         push[cfg.channel.end_id] = -1.0
         push[cfg.channel.space_id] = 1.0
         self.register_buffer("_push", push, persistent=False)
+        # Holding back: no new word -- and, where there are atoms enough to give
+        # every meaning one of its own, no going on inside the word either, so
+        # what is left is to stop. With fewer atoms than meanings (the
+        # `duality` preset) a word needs more than one, and only the new word
+        # is held back. Without the second half a speaker asked about one field
+        # said its word and then, as often as not, a hyphen and more: 2.4-2.6
+        # atoms a word over the first 24 updates of `name-fruit`, every one of
+        # them a different word to a reader that reads words whole.
+        hold = torch.zeros(self.n_emittable)
+        hold[cfg.channel.space_id] = -1.0
+        if self.atomic_vocab >= sum(lot_spans(cfg.world)):
+            hold[cfg.channel.hyphen_id] = -1.0
+        self.register_buffer("_hold", hold, persistent=False)
+        # Whose atoms a word is made of. While this is 0 the token head adds
+        # nothing to *which atom* is said -- only to whether a word goes on, a
+        # new one starts or the turn ends -- so a word is the lexicon's and
+        # nothing else's; at 1 the head's atoms are added, as they always were.
+        # The trainer sets it (`curriculum.own_atoms_from_rung`): 0 through the
+        # naming rungs wherever there are atoms enough for every meaning to
+        # have one, 1 from the first trading rung on.
+        #
+        # Why: the head sees the context, and so it is a second place a word
+        # can live. Measured on a CPU run of this design: a junior's lexicon
+        # had taken its elder's word for a fruit (`a8`, 0.99) -- and it went on
+        # saying its own old one, `a29`, which its token head had learned to
+        # add 6.5 nats to in exactly that context, because that was the word
+        # its listener could already read and the head was the one place the
+        # game's gradient could still put it. One dialect cannot be reached
+        # while every speaker has somewhere private to keep its own.
+        self.register_buffer("own_atoms", torch.zeros(()))
+        is_atom = torch.zeros(self.n_emittable)
+        is_atom[:self.atomic_vocab] = 1.0
+        self.register_buffer("_is_atom", is_atom, persistent=False)
+
+    def gate(self, base: torch.Tensor) -> torch.Tensor:
+        """The token head's logits with its say in *which atom* scaled by
+        ``own_atoms`` (see there); everything else untouched."""
+        return base * (1.0 - self._is_atom * (1.0 - self.own_atoms))
+
+    def reset_innate(self) -> None:
+        """Initial values that are part of the design, set after the generic
+        init: unit-scale keys and a small query, so the choice of part starts
+        uniform (within a tenth of a nat) and is quick to learn."""
+        with torch.no_grad():
+            self.part_key.normal_(0.0, 1.0)
+            self.query.weight.mul_(0.1)
+            self.query.bias.zero_()
+
+    @torch.no_grad()
+    def restore_strengths(self) -> bool:
+        """Put the scaffold's three strengths back at their innate values; True
+        if any had moved.
+
+        They are constants, and in the state dict only so that a snapshot says
+        what it ran with. A file from when they were learned (before
+        2026-10-01) loads wherever they had drifted to into the same names --
+        `ask` 4.2 on the run that prompted the change -- and at that strength
+        the scaffold no longer outvotes a speaker's own scores (``BOUND``).
+        """
+        moved = False
+        for name, value in (("go_on", self.GO_ON), ("inhibit", self.INHIBIT),
+                            ("ask", self.ASK)):
+            buf = getattr(self, name)
+            if float(buf) != float(value):
+                buf.fill_(float(value))
+                moved = True
+        return moved
 
     @torch.no_grad()
     def part_words(self, concepts: torch.Tensor) -> torch.Tensor:
@@ -150,9 +278,10 @@ class LexicalSpeaker(nn.Module):
 
     def forward(self, h: torch.Tensor, concepts: torch.Tensor,
                 avoid: Optional[torch.Tensor] = None,
-                asked: Optional[torch.Tensor] = None
-                ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``h`` (B, d) or (B, K, d) hidden states, ``concepts`` (B, 5, d);
+                asked: Optional[torch.Tensor] = None, habit: bool = False
+                ) -> tuple[torch.Tensor, ...]:
+        """``h`` (B, d) or (B, K, d) hidden states; ``concepts`` (B, 5, d), or
+        (B, K, 5, d) where the parts differ from state to state (a barn);
         ``avoid`` ((B, 5) or (B, K, 5)) parts to pass over -- describing a
         whole lot, the ones this turn has already named, when a new word
         starts (:meth:`CommNet.turn_so_far`); ``asked`` (B, 5) the field the
@@ -160,6 +289,16 @@ class LexicalSpeaker(nn.Module):
 
         Returns token-logit contributions (h's shape with n_emittable last;
         zero on everything but atoms) and the attention over the five parts.
+        With ``habit``, two more: the speaker's own choice of part, with no
+        scaffold at all, and the choice the scaffold asks for -- the asked
+        part where one is asked about; otherwise the speaker's own choice among
+        the parts not yet named -- which is what `train.scaffold_distil` trains
+        the first towards. The lesson is about *which part*, never about which
+        atom: taught the scaffolded speaker's atoms instead, the token head
+        learned them, context and all -- measured on a CPU run of that design,
+        a junior's lexicon had moved to its elder's word for a fruit (`a8`)
+        while its token head went on saying its own old one (`a29`, 6.4 nats
+        up), and the word a speaker says has to be its lexicon's.
 
         Asked about one field, the lexicon attends to it (``ask``): it used
         not to look at the question at all, so in `name-color` it went on
@@ -183,21 +322,37 @@ class LexicalSpeaker(nn.Module):
         squeeze = h.dim() == 2
         if squeeze:
             h = h.unsqueeze(1)                                           # (B, 1, d)
+            if concepts.dim() == 4:
+                concepts = concepts.squeeze(1)
+        mixing = "bkf,bfd->bkd" if concepts.dim() == 3 else "bkf,bkfd->bkd"
         q = self.query(h)                                                # (B, K, d)
-        scores = torch.einsum("bkd,bfd->bkf", q, concepts) / math.sqrt(q.shape[-1])
+        raw = torch.einsum("bkd,fd->bkf", q, self.part_key) / math.sqrt(q.shape[-1])
+        learned = self.BOUND * torch.tanh(raw / self.BOUND)
+        bias = torch.zeros_like(learned)
+        a_ = None
         if asked is not None:
-            asked = asked.to(scores.dtype)
-            scores = scores + self.ask * (asked.unsqueeze(1) if asked.dim() == 2 else asked)
+            a_ = asked.to(learned.dtype)
+            a_ = a_.unsqueeze(1) if a_.dim() == 2 else a_
+            bias = bias + self.ask * a_
         if avoid is not None:
-            avoid = avoid.to(scores.dtype)
-            scores = scores - self.inhibit * (avoid.unsqueeze(1) if avoid.dim() == 2 else avoid)
-        att = torch.softmax(scores, dim=-1)                              # (B, K, 5)
-        mix = torch.einsum("bkf,bfd->bkd", att, concepts)                 # (B, K, d)
+            avoid = avoid.to(learned.dtype)
+            bias = bias - self.inhibit * (avoid.unsqueeze(1) if avoid.dim() == 2 else avoid)
+        att = torch.softmax(learned + self.scaffold * bias, dim=-1)       # (B, K, 5)
+        mix = torch.einsum(mixing, att, concepts)                         # (B, K, d)
         atoms = self.gain * self.say(self.norm(mix))                      # (B, K, A)
         out = F.pad(atoms, (0, self.n_emittable - self.atomic_vocab))
+        own = teach = None
+        if habit:
+            own = torch.softmax(learned, dim=-1)
+            # a question decides the part outright; with none, which of the
+            # parts not yet named comes next is the speaker's own to say
+            free = (1.0 - a_.sum(-1, keepdim=True).clamp(max=1.0)) if a_ is not None else 1.0
+            teach = torch.softmax(learned.detach() * free + bias, dim=-1)
         if squeeze:
-            return out.squeeze(1), att.squeeze(1)
-        return out, att
+            out, att = out.squeeze(1), att.squeeze(1)
+            if habit:
+                own, teach = own.squeeze(1), teach.squeeze(1)
+        return (out, att, own, teach) if habit else (out, att)
 
 
 class LexicalReader(nn.Module):
@@ -326,6 +481,31 @@ class LexicalReader(nn.Module):
         atoms); ``ids`` (B, D) the same symbols as ids; ``heard`` (D,) bool,
         the dialogue slots the *other* party produced.
         """
+        got = self.read(dialogue, ids, heard)
+        return None if got is None else got[0]
+
+    def read(self, dialogue: torch.Tensor, ids: torch.Tensor, heard: torch.Tensor,
+             concepts: Optional[Sequence[torch.Tensor]] = None
+             ) -> Optional[tuple[tuple[torch.Tensor, ...], Optional[torch.Tensor],
+                                 torch.Tensor]]:
+        """:meth:`forward`'s five log-distributions; -- given ``concepts``,
+        one (span, d) table per field of what each value *is* to this listener
+        -- each heard word's meaning, as a (B, D, d) vector at every dialogue
+        position holding one of its atoms (zero elsewhere); for each field,
+        the first atom of the word the listener took to name it ((B, 5), -1
+        where it took no word to); and what the *first* heard word is read as
+        naming ((B, 5) log-probabilities over the five fields, before the
+        floor; meaningless in a row with no word, which the last value, (B,)
+        bool, marks).
+
+        A word's meaning is what it is read as, in the listener's own terms:
+        over the five attributes it may name, the expected concept of the
+        value it names. Looked up out of context like everything here, so it
+        is the same vector wherever the word is heard, and exactly causal --
+        nothing said later changes it. How sure the reading is comes from the
+        reader as it stands (no gradient into it from here): the reading is
+        trained where it is scored, on the five belief heads.
+        """
         B, D = ids.shape
         heard = heard[:D].to(ids.device).unsqueeze(0).expand(B, D)
         if not bool((heard & (ids < self.atomic_vocab)).any()):
@@ -357,6 +537,7 @@ class LexicalReader(nn.Module):
                                 cls[..., 1] + adj[..., 0], cls[..., 1] + adj[..., 1],
                                 cls[..., 2] + num[..., 0], cls[..., 2] + num[..., 1]],
                                dim=-1)                                # (B, W, 5)
+        first_names = of_field[:, 0]                                  # (B, 5)
         # Every word keeps a small chance of naming every attribute. Without it
         # a word filed under the wrong attribute early was never read as its
         # own: its weight went to 0, so its meaning for that attribute was never
@@ -371,6 +552,9 @@ class LexicalReader(nn.Module):
         attend = F.log_softmax(torch.cat([of_field, none], dim=1), dim=1)   # (B, W+1, 5)
 
         out = []
+        word_means = (torch.zeros((B, W, d), device=ids.device, dtype=v.dtype)
+                      if concepts is not None else None)
+        names = of_field.exp().detach()                              # (B, W, 5); 0 where no word
         line_at = torch.sigmoid(self.line_place(v))                  # (B, W, 2)
         line_w = F.softplus(self.line_width(v)) + 0.3
         for f, span in enumerate(self.spans):
@@ -387,10 +571,26 @@ class LexicalReader(nn.Module):
                 # back: the value was read as never meant.
                 lg = lg - torch.log1p(((grid - mu) / width) ** 2)
             lp = F.log_softmax(lg, dim=-1)
+            if word_means is not None:
+                word_means = word_means + names[..., f:f + 1] * (
+                    lp.exp().detach() @ concepts[f].to(v.dtype))
             flat = torch.full((B, 1, span), -math.log(span), device=ids.device, dtype=lp.dtype)
             lp = torch.cat([lp, flat], dim=1)                        # (B, W+1, span)
             out.append(torch.logsumexp(attend[..., f].unsqueeze(-1) + lp, dim=1))
-        return tuple(out)
+        meaning = None
+        if word_means is not None:
+            at = word_means.gather(1, word.unsqueeze(-1).expand(-1, -1, d))
+            meaning = F.pad(at * atom.unsqueeze(-1).to(at.dtype), (0, 0, 0, D - used))
+        # which word was taken to name each field: the one the field's reading
+        # attends to most, if any beats "no word names it"
+        with torch.no_grad():
+            words_lp = attend[:, :W]
+            best = words_lp.argmax(dim=1)                             # (B, 5)
+            named = words_lp.max(dim=1).values > attend[:, W]
+            opens = torch.zeros((B, W + 1), dtype=torch.long, device=ids.device).scatter(
+                1, torch.where(atom & (pos == 0), word, torch.full_like(word, W)), ids)
+            said = torch.where(named, opens.gather(1, best), torch.full_like(best, -1))
+        return tuple(out), meaning, said, first_names, exists[:, 0]
 
 # Sequence layout.  The number of observation slots is whatever the world's
 # schema needs (a farm with several varieties has more to look at than a buyer
@@ -399,6 +599,21 @@ class LexicalReader(nn.Module):
 SLOT_BOS, SLOT_SEP, SLOT_DIALOGUE, SLOT_DECIDE = 0, 1, 2, 3
 N_FIXED_SLOT_TYPES = 4
 N_SLOT_TYPES = N_FIXED_SLOT_TYPES + 7        # + one per field kind
+
+
+@dataclass
+class Heard:
+    """What an agent has made of the other party's words (:meth:`CommNet.listen`)."""
+    fields: tuple                           # five (B, span) log-distributions, lot order
+    meaning: Optional[torch.Tensor] = None  # (B, n, d): each word's meaning, at its atoms
+    said: Optional[torch.Tensor] = None     # (B, 5): the word taken to name each field
+                                            # (its first atom; -1: none was)
+    first: Optional[torch.Tensor] = None    # (B, 5): log P(the first word names each field)
+    spoke: Optional[torch.Tensor] = None    # (B,) bool: there was a first word
+
+
+# `CommNet.encode(heard=AUTO)`: listen here, rather than be told what was heard.
+AUTO = object()
 
 
 def dialogue_offset(cfg: Config) -> int:
@@ -548,6 +763,13 @@ class CommNet(nn.Module):
         if self.speaks_lexically:
             self.speaker_lexicon = LexicalSpeaker(cfg, d)
             self._gesture_offsets = gesture_offsets(cfg)
+        # In the market (`model.lexical_barn`): the farmer finds the lot it was
+        # asked about through its reader, and talks about that row with its
+        # lexicon. (`model.heard_meaning`): what a listener has understood of
+        # each word reaches its own state, not only its report heads.
+        self.barn_lexicon = bool(m.lexical_barn) and self.speaks_lexically
+        self.reads_rows = bool(m.lexical_barn) and self.lexical
+        self.hears_meaning = bool(m.heard_meaning) and self.lexical
         # Innate concepts (`model.innate_concepts`): the kind of thing each lot
         # field is, and a number line under quantities and prices.
         self.innate_concepts = bool(m.innate_concepts)
@@ -568,6 +790,8 @@ class CommNet(nn.Module):
         nn.init.xavier_uniform_(self.lookup_out.weight, gain=0.1)
         if self.lexical:
             self.reader.reset_innate()
+        if self.speaks_lexically:
+            self.speaker_lexicon.reset_innate()
         if self.innate_concepts:
             # On the embeddings' scale, so the number line orders the values
             # without drowning which field the slot holds.
@@ -606,29 +830,94 @@ class CommNet(nn.Module):
         return (len(s) > w and s[w] == K_PRICE
                 and s[:4] == [K_VARIETY, K_COLOR, K_QUALITY, K_QTY])
 
-    def barn_lookup(self, h: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
-        """(B, L, d) -> (B, L, d): each state reads the barn row it asks for.
+    def barn_rows(self, obs: torch.Tensor) -> torch.Tensor:
+        """(B, C, 4): the barn's rows -- (fruit, colour, quality, stock) each."""
+        return obs[:, :4 * self.n_cells].reshape(obs.shape[0], self.n_cells, 4)
+
+    def row_attention(self, h: torch.Tensor, obs: torch.Tensor,
+                      heard: Optional[tuple] = None) -> torch.Tensor:
+        """(B, C) or (B, K, C): which barn row each state ((B, d) or (B, K, d))
+        is about.
+
+        Two readings, added. The state's own: a query against each row's
+        (fruit, colour) embeddings. And, with `model.lexical_barn`, the innate
+        reader's: ``heard`` is what the other party's words say about each
+        field (:meth:`read_words`), and a row scores the log-probability of
+        its own fruit and colour under it -- the factored lineup choice
+        (:meth:`choice_logits`) with the farmer's own lots as the candidates.
+        A buyer that says "green pear" in words the farmer can read has
+        pointed at a row; nothing has to be learned in the market for that to
+        work, where the query alone had to be learned there from nothing.
+        Nothing heard, or nothing said about fruit or colour, leaves the rows
+        level.
+        """
+        rows = self.barn_rows(obs)
+        key = self.variety_emb(rows[:, :, 0]) + self.color_emb(rows[:, :, 1])   # (B,C,d)
+        q = self.lookup_q(h)
+        flat = h.dim() == 2
+        scores = (torch.einsum("bd,bcd->bc", q, key) if flat
+                  else torch.bmm(q, key.transpose(1, 2))) / math.sqrt(self.d_model)
+        if heard is not None and self.reads_rows:
+            said = (heard[0].gather(1, rows[:, :, 0].clamp(0, heard[0].shape[1] - 1))
+                    + heard[1].gather(1, rows[:, :, 1].clamp(0, heard[1].shape[1] - 1)))
+            scores = scores + (said if flat else said.unsqueeze(1)).to(scores.dtype)
+        return torch.softmax(scores, dim=-1)
+
+    def barn_lookup(self, h: torch.Tensor, obs: torch.Tensor,
+                    heard: Optional[tuple] = None) -> torch.Tensor:
+        """(B, L, d) -> (B, L, d) (or (B, d) -> (B, d)): each state reads the
+        barn row it asks for.
 
         Keys are each row's (fruit, colour) embeddings -- the same tables the
         words for fruit and colour are grounded in everywhere else -- and values
         its (quality, stock). A state that has decoded "green pears" from the
         buyer's words only has to reproduce those two embeddings as its query
-        to read back how many green pears there are and how good they are.
+        to read back how many green pears there are and how good they are; and
+        the reader's own decoding of them picks the row directly
+        (:meth:`row_attention`).
         """
-        B = obs.shape[0]
-        rows = obs[:, :4 * self.n_cells].reshape(B, self.n_cells, 4)
-        key = self.variety_emb(rows[:, :, 0]) + self.color_emb(rows[:, :, 1])   # (B,C,d)
+        rows = self.barn_rows(obs)
         val = self.quality_emb(rows[:, :, 2]) + self.field_embed(K_QTY, rows[:, :, 3])
-        q = self.lookup_q(h)                                                    # (B,L,d)
-        att = torch.softmax(torch.bmm(q, key.transpose(1, 2)) / math.sqrt(self.d_model),
-                            dim=-1)                                             # (B,L,C)
-        return h + self.lookup_out(torch.bmm(att, val))
+        att = self.row_attention(h, obs, heard)                                 # (B,[L,]C)
+        got = (torch.einsum("bc,bcd->bd", att, val) if h.dim() == 2
+               else torch.bmm(att, val))
+        return h + self.lookup_out(got)
+
+    def barn_concepts(self, h: torch.Tensor, obs: torch.Tensor,
+                      heard: Optional[tuple] = None) -> torch.Tensor:
+        """(B, 5, d) or (B, K, 5, d): the lot a farmer is talking about, as the
+        five concepts its lexicon names -- the fruit, colour, quality and stock
+        of the barn row it is attending to (:meth:`row_attention`), and its
+        floor price.
+
+        A lot in a barn is the same kind of thing as a lot held in the hand,
+        so the same words name it. Without this the lexicon was absent
+        wherever the observation was a barn, and a farmer answering a request
+        had only its token head to speak with -- which had said nothing in six
+        naming rungs (measured on the 2026-10-01 run: the token head alone
+        told the values of a field apart no better than chance), so `offer`
+        would have had to invent the numbers again.
+        """
+        rows = self.barn_rows(obs)
+        att = self.row_attention(h, obs, heard)
+        parts = torch.stack([self.concept(kind, rows[:, :, j].clamp(
+            0, self._table(kind).num_embeddings - 1))
+            for j, kind in enumerate((K_VARIETY, K_COLOR, K_QUALITY, K_QTY))], dim=2)
+        price = self.concept(K_PRICE, obs[:, 4 * self.n_cells].clamp(
+            0, self.price_emb.num_embeddings - 1))                              # (B, d)
+        if h.dim() == 2:
+            mixed = torch.einsum("bc,bcfd->bfd", att, parts)                    # (B, 4, d)
+            return torch.cat([mixed, price.unsqueeze(1)], dim=1)
+        mixed = torch.einsum("bkc,bcfd->bkfd", att, parts)                      # (B, K, 4, d)
+        return torch.cat([mixed, price[:, None, None, :].expand(-1, mixed.shape[1], 1, -1)],
+                         dim=2)
 
     # ------------------------------------------------------------------
     def embed(self, obs: torch.Tensor, tokens: torch.Tensor,
               schema: "list[int] | None" = None,
               self_mask: Optional[torch.Tensor] = None,
-              upto: Optional[int] = None) -> torch.Tensor:
+              upto: Optional[int] = None,
+              meaning: Optional[torch.Tensor] = None) -> torch.Tensor:
         """obs: (B,4) long -> (B, seq_len, d).
 
         ``tokens`` is either (B,D) integer ids, or (B,D,n_token_ids) of
@@ -647,6 +936,11 @@ class CommNet(nn.Module):
         discarding most of it cost memory (the soft tokens are kept for the
         backward pass) in proportion to the buffer, at every symbol step.
         ``tokens`` may be just the dialogue prefix that ``upto`` needs.
+
+        ``meaning`` (B, n, d) is what this agent has understood of the other
+        party's words (:meth:`listen`): each heard word's meaning, added at
+        the slots its atoms sit in, so that what was understood is something
+        the state can use and not only something the report heads can say.
         """
         B = obs.shape[0]
         n = self.seq_len if upto is None else upto
@@ -681,6 +975,11 @@ class CommNet(nn.Module):
         dial = (tok_vec
                 + self.speaker_emb(spk).unsqueeze(0)
                 + self.slot_emb.weight[SLOT_DIALOGUE])
+        if meaning is not None and n_dial > 0:
+            m = meaning[:, :n_dial]
+            if m.shape[1] < n_dial:
+                m = F.pad(m, (0, 0, 0, n_dial - m.shape[1]))
+            dial = dial + m.to(dial.dtype)
         parts.append(dial)
 
         if n > self.dialogue_offset + self.cfg.channel.dialogue_len:
@@ -692,16 +991,36 @@ class CommNet(nn.Module):
     def encode(self, obs: torch.Tensor, tokens: torch.Tensor,
                upto: Optional[int] = None,
                schema: "list[int] | None" = None,
-               self_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Hidden states for the prefix of length ``upto`` (default: whole sequence)."""
+               self_mask: Optional[torch.Tensor] = None,
+               heard: Any = AUTO, lookup: bool = True) -> torch.Tensor:
+        """Hidden states for the prefix of length ``upto`` (default: whole sequence).
+
+        ``heard`` is what this agent has made of the other party's words in
+        that prefix (:meth:`listen`): by default it listens here; a caller that
+        has already listened passes the result (or None for "nothing heard")
+        so the words are read once. The heard words' meanings go in with the
+        dialogue (:meth:`embed`) and, looking at a barn, pick the row
+        (:meth:`row_attention`). That last reading is of the whole prefix, so
+        it is right for the *last* state -- the one generation and every
+        decision read; :meth:`full_pass`, which reads states inside earlier
+        turns too, passes ``lookup=False`` and looks the rows up turn by turn.
+        """
         n = self.seq_len if upto is None else upto
         mask = self._causal[:n, :n]
+        barn = bool(self.cfg.model.barn_lookup) and lookup and self.is_barn(schema)
+        if heard is AUTO:
+            n_dial = max(0, min(self.cfg.channel.dialogue_len, n - self.dialogue_offset))
+            want = self.hears_meaning or (barn and self.reads_rows)
+            heard = (self.listen(tokens[:, :n_dial], None, self_mask)
+                     if want and n_dial > 0 else None)
+        meaning = heard.meaning if heard is not None else None
+        fields = tuple(heard.fields) if heard is not None and barn else ()
 
-        def run(tok):
-            x = self.embed(obs, tok, schema, self_mask, upto=n)
+        def run(tok, meaning, *fields):
+            x = self.embed(obs, tok, schema, self_mask, upto=n, meaning=meaning)
             h = self.norm(self.encoder(x, mask=mask))
-            if self.cfg.model.barn_lookup and self.is_barn(schema):
-                h = self.barn_lookup(h, obs)
+            if barn:
+                h = self.barn_lookup(h, obs, fields or None)
             return h
         # Gradient checkpointing covers embedding, layers and the final norm, so
         # all the backward pass keeps per call is the (soft) tokens that went in.
@@ -712,10 +1031,18 @@ class CommNet(nn.Module):
         # newborns come out of their apprenticeship in eval mode.
         if self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
             from torch.utils.checkpoint import checkpoint
-            return checkpoint(run, tokens, use_reentrant=False)
-        return run(tokens)
+            return checkpoint(run, tokens, meaning, *fields, use_reentrant=False)
+        return run(tokens, meaning, *fields)
 
     # ------------------------------------------------------------------
+    def concept(self, kind: int, values: torch.Tensor) -> torch.Tensor:
+        """A field value as a concept, with no context: its embedding, the kind
+        of field it is and -- with `model.innate_concepts` -- the kind of thing."""
+        v = self.field_embed(kind, values) + self.slot_emb.weight[N_FIXED_SLOT_TYPES + kind]
+        if self.innate_concepts:
+            v = v + self.concept_emb.weight[CONCEPT_OF_KIND[kind]]
+        return v
+
     def lot_concepts(self, obs: torch.Tensor, schema=None) -> Optional[torch.Tensor]:
         """(B, 5, d): the speaker's own lot, field by field, as concepts -- each
         field's value and kind, with no context -- or None where the
@@ -724,71 +1051,128 @@ class CommNet(nn.Module):
         n = N_LOT_FIELDS
         if len(s) <= n or tuple(s[:n]) != tuple(LOT_KINDS) or s[n] != K_FIELD:
             return None
-        vecs = []
-        for i, kind in enumerate(LOT_KINDS):
-            v = self.field_embed(kind, obs[:, i]) + self.slot_emb.weight[N_FIXED_SLOT_TYPES + kind]
-            if self.innate_concepts:
-                v = v + self.concept_emb.weight[CONCEPT_OF_KIND[kind]]
-            vecs.append(v)
-        return torch.stack(vecs, dim=1)
+        return torch.stack([self.concept(kind, obs[:, i])
+                            for i, kind in enumerate(LOT_KINDS)], dim=1)
+
+    def value_concepts(self) -> list[torch.Tensor]:
+        """One (span, d) table per field of a lot: every value it can take, as
+        a concept. What a heard word is understood *as* (:meth:`listen`), and
+        the rows of the speaker's own lexicon (:meth:`lexicon_table`)."""
+        dev = self.slot_emb.weight.device
+        return [self.concept(kind, torch.arange(span, device=dev))
+                for kind, span in zip(LOT_KINDS, lot_spans(self.cfg.world))]
+
+    def lexicon_table(self) -> torch.Tensor:
+        """(M, A) logits: this speaker's whole lexicon -- for every value of
+        every field of a lot (M of them, in lot order), the atoms its word
+        starts with. What `reward.lexicon_exclusive` keeps one-to-one and
+        `reward.lexicon_imitate` moves towards a word heard and understood."""
+        lex = self.speaker_lexicon
+        return lex.gain * lex.say(lex.norm(torch.cat(self.value_concepts(), dim=0)))
+
+    def set_scaffold(self, value: float) -> None:
+        """How much of the description scaffold is left, 1 to 0 (the trainer's
+        schedule: `curriculum.scaffold_fade_rung`)."""
+        if self.speaks_lexically:
+            self.speaker_lexicon.scaffold.fill_(float(min(1.0, max(0.0, value))))
+
+    def set_own_atoms(self, on: bool) -> None:
+        """May the token head add atoms of its own to what the lexicon says
+        (:attr:`LexicalSpeaker.own_atoms`; the trainer's schedule)?"""
+        if self.speaks_lexically:
+            self.speaker_lexicon.own_atoms.fill_(1.0 if on else 0.0)
 
     def speak(self, h: torch.Tensor, obs: torch.Tensor, schema=None,
-              turn: Optional[tuple] = None) -> torch.Tensor:
+              turn: Optional[tuple] = None, heard: Optional[tuple] = None,
+              habit: bool = False):
         """Token logits from hidden state(s) ``h`` ((B, d) or (B, K, d)): the
-        token head's, plus -- with `model.lexical_speaker`, describing a lot --
-        the mental lexicon's word for the part being named (:class:`LexicalSpeaker`).
-        The question (the observation's query slot) is read here: asked
-        about one field, the lexicon attends to it. ``turn`` is (push, avoid)
-        from :meth:`turn_so_far`: describing a whole lot, the parts to pass
-        over as a new word starts, and whether parts are still unnamed (there
-        ending loses ``go_on`` nats to going on). Every place that emits or
-        scores a symbol reads this, so generation, evaluation and a newborn's
-        lessons agree."""
-        logits = self.token_head(h)
+        token head's, plus -- with `model.lexical_speaker` -- the mental
+        lexicon's word for the part being named (:class:`LexicalSpeaker`).
+
+        Describing a lot, the question (the observation's query slot) is read
+        here: asked about one field, the lexicon attends to it. ``turn`` is
+        (push, avoid) from :meth:`turn_so_far`: the parts to pass over as a
+        new word starts, and whether to go on (parts still unnamed: ending
+        loses ``go_on`` nats to a new word) or hold (everything asked for has
+        been said: a new word loses them). All of that is the scaffold, and
+        fades with it.
+
+        Looking at a barn (`model.lexical_barn`), the parts are those of the
+        row being talked about, which ``heard`` -- the reader's reading of the
+        other party's words so far -- helps find (:meth:`barn_concepts`). No
+        scaffold there: by the market it is gone.
+
+        With ``habit`` the return is (logits, lesson): ``lesson`` is what
+        `train.scaffold_distil` needs -- (the token head's logits alone, its
+        own choice of part, the choice the scaffold asks for, the next symbol
+        the scaffold asks for as logits (zero where it asks for nothing)) --
+        or None where there is no scaffold to do without. Every place that
+        emits or scores a symbol reads this method, so generation, evaluation
+        and a newborn's lessons agree."""
+        base = self.token_head(h)
+        logits, own = base, None
         if self.speaks_lexically:
+            lex = self.speaker_lexicon
             concepts = self.lot_concepts(obs, schema)
             if concepts is not None:
-                lex = self.speaker_lexicon
+                base = lex.gate(base)
                 push, avoid = turn if turn is not None else (None, None)
                 q = obs[:, N_LOT_FIELDS]
                 asked = (F.one_hot(q.clamp(0, N_LOT_FIELDS - 1), N_LOT_FIELDS)
                          * (q < QUERY_ALL).unsqueeze(-1))
-                logits = logits + lex(h, concepts, avoid, asked)[0]
+                out = lex(h, concepts, avoid, asked, habit=habit)
+                logits = base + out[0]
+                plan = torch.zeros_like(base)
                 if push is not None:
-                    logits = logits + (lex.go_on * push.to(logits.dtype)).unsqueeze(-1) * lex._push
-        return logits
+                    p = push.to(logits.dtype).unsqueeze(-1)
+                    plan = lex.go_on * (p.clamp(min=0) * lex._push
+                                        + (-p).clamp(min=0) * lex._hold)
+                    logits = logits + lex.scaffold * plan
+                if habit:
+                    own = (base, out[2], out[3], plan)
+            elif self.barn_lexicon and self.is_barn(schema):
+                base = lex.gate(base)
+                logits = base + lex(h, self.barn_concepts(h, obs, heard))[0]
+        return (logits, own) if habit else logits
 
     def describing(self, obs: torch.Tensor, schema, tokens: torch.Tensor,
                    positions: Sequence[int]) -> Optional[torch.Tensor]:
-        """(B, P) bool: the push part of :meth:`turn_so_far`."""
+        """(B, P) bool: is the speaker being pushed on (:meth:`turn_so_far`)?"""
         got = self.turn_so_far(obs, schema, tokens, positions)
-        return None if got is None else got[0]
+        return None if got is None else got[0] > 0
 
     @torch.no_grad()
     def turn_so_far(self, obs: torch.Tensor, schema, tokens: torch.Tensor,
                     positions: Sequence[int]) -> Optional[tuple]:
-        """(push (B, P) bool, avoid (B, P, 5) bool) before each dialogue
-        position in ``positions``: is this speaker describing a whole lot with
-        some of its parts still unnamed, and -- if a new word starts there --
-        which parts has the turn already named? Both are empty for a question
-        about one field: there the speaker names the field it was asked about,
-        however many atoms its word has, and whatever it pointed at.
+        """(push (B, P) in {+1, 0, -1}, avoid (B, P, 5) bool) before each
+        dialogue position in ``positions``: should this speaker go on (+1: it
+        is describing a whole lot and parts are still unnamed), hold (-1: it
+        has said as much as it was asked for), or neither; and -- if a new
+        word starts there -- which parts has the turn already named? Nothing
+        is avoided on a question about one field: there the speaker names the
+        field it was asked about, however many atoms its word has, and
+        whatever it pointed at.
 
         The innate pragmatics of the production side -- say as much as the
-        question asks (Grice's maxim of quantity). The speaker sees the question
-        (the query slot: one field, or all of it) and monitors its own turn: a
-        part counts as named once the turn holds that part's word (what the
-        lexicon says for it, :meth:`LexicalSpeaker.part_words`) or a gesture at
-        it. Asked for a whole lot, it is pushed on while any part is unnamed,
-        and never past one word per part; asked for one field, never.
+        question asks, and no more (Grice's maxim of quantity). The speaker
+        sees the question (the query slot: one field, or all of it) and
+        monitors its own turn: a part counts as named once the turn holds that
+        part's word (what the lexicon says for it,
+        :meth:`LexicalSpeaker.part_words`) or a gesture at it. Asked for a
+        whole lot, it is pushed on while any part is unnamed, never past one
+        word per part, and held once every part is named; asked for one field,
+        it is held after one word.
 
         Why it exists: measured on 2026-09-30, speakers who could name every
         field alone, and whose next word -- when made to go on -- named a
         different part of the lot 99-100% of the time, went on after their first
         word 0.02-0.03% of the time. One-field rounds teach "a word, then stop",
         nothing in a whole-lot round says there is more to say, and a
-        continuation that is never tried cannot be learned. How hard the push
-        is (`go_on`) is learned like everything else.
+        continuation that is never tried cannot be learned. And the hold:
+        nothing said when to stop either, so on the 2026-10-01 run descriptions
+        in `mutual` ran to 8.3 words for five parts, 5.4 of them distinct.
+        Both are the scaffold's (:class:`LexicalSpeaker`): they fade, and the
+        token head is taught to do the same unaided while they do.
 
         None where it does not apply: no production lexicon, or not a lot.
         """
@@ -824,7 +1208,13 @@ class CommNet(nn.Module):
         said = (cs_n[:, pos] - cs_n[:, t0]) > 0                           # (B, P, 5)
         n_words = cs_s[:, pos] - cs_s[:, t0]                              # (B, P)
         unnamed = N_LOT_FIELDS - said.sum(-1)
-        push = whole.unsqueeze(1) & (unnamed > 0) & (n_words >= 1) & (n_words < N_LOT_FIELDS)
+        w = whole.unsqueeze(1)
+        go = w & (unnamed > 0) & (n_words >= 1) & (n_words < N_LOT_FIELDS)
+        # as much as was asked for: every part of a whole lot (or a word per
+        # part, whatever those words named), or one word for one field
+        done = (n_words >= 1) & torch.where(
+            w, (unnamed == 0) | (n_words >= N_LOT_FIELDS), torch.ones_like(w))
+        push = go.to(torch.int8) - done.to(torch.int8)
         # a new word starts where the symbol before is not a hyphen (the turn's
         # start, a space, a gesture); inside a word the part stays the same
         prev = torch.where(pos > t0, tokens[:, (pos - 1).clamp(min=0)],
@@ -837,21 +1227,42 @@ class CommNet(nn.Module):
                           seq_pos: int, schema=None, self_mask=None
                           ) -> tuple[torch.Tensor, torch.Tensor]:
         """Logits for the token that will occupy ``seq_pos``, plus that state's value."""
+        p = seq_pos - dialogue_offset(self.cfg)
+        hd = self.listen(tokens[:, :p], None, self_mask) if p > 0 else None
         h = self.encode(obs, tokens, upto=seq_pos, schema=schema,
-                        self_mask=self_mask)[:, -1]
-        turn = self.turn_so_far(obs, schema, tokens, [seq_pos - dialogue_offset(self.cfg)])
+                        self_mask=self_mask, heard=hd)[:, -1]
+        turn = self.turn_so_far(obs, schema, tokens, [p])
         return (self.speak(h, obs, schema, None if turn is None
-                           else (turn[0][:, 0], turn[1][:, 0])),
+                           else (turn[0][:, 0], turn[1][:, 0]),
+                           heard=None if hd is None else hd.fields),
                 self.value_head(h).squeeze(-1))
+
+    def listen(self, dialogue: torch.Tensor, ids: Optional[torch.Tensor] = None,
+               self_mask: Optional[torch.Tensor] = None) -> Optional[Heard]:
+        """What this agent makes of the other party's words in ``dialogue``:
+        the innate reader's five log-distributions over what was said about
+        each field of a lot, and -- with `model.heard_meaning` -- each heard
+        word's meaning at the slots it was heard in (:meth:`LexicalReader.read`).
+        None with the reader off, or nothing heard. ``dialogue`` is (B, n) ids
+        or (B, n, V) soft one-hots, in which case ``ids`` gives the same
+        symbols as ids; n may be any prefix of the dialogue."""
+        if not self.lexical or dialogue.shape[1] == 0:
+            return None
+        if ids is None:
+            ids = dialogue if dialogue.dtype == torch.long else dialogue.argmax(-1)
+        mine = self._self_mask if self_mask is None else self_mask
+        got = self.reader.read(dialogue, ids, ~mine.to(ids.device),
+                               self.value_concepts() if self.hears_meaning else None)
+        return None if got is None else Heard(fields=got[0], meaning=got[1], said=got[2],
+                                              first=got[3], spoke=got[4])
 
     def read_words(self, dialogue: torch.Tensor, ids: Optional[torch.Tensor] = None,
                    self_mask: Optional[torch.Tensor] = None
                    ) -> Optional[tuple[torch.Tensor, ...]]:
         """What the other party's words say about each field of a lot, read by
         the innate reader -- five log-distributions -- or None (reader off, or
-        nothing heard). ``dialogue`` is (B, D) ids or (B, D, V) soft one-hots,
-        in which case ``ids`` gives the same symbols as ids."""
-        if not self.lexical:
+        nothing heard). The reading half of :meth:`listen`."""
+        if not self.lexical or dialogue.shape[1] == 0:
             return None
         if ids is None:
             ids = dialogue if dialogue.dtype == torch.long else dialogue.argmax(-1)
@@ -862,8 +1273,9 @@ class CommNet(nn.Module):
                         self_mask=None):
         """Every discrete head, then the value.  Order matches curriculum.py's
         head indices, so callers can slice the first N_HEADS and trust it."""
-        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)[:, -1]
-        lex = self.read_words(tokens, None, self_mask)
+        hd = self.listen(tokens, None, self_mask)
+        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask, heard=hd)[:, -1]
+        lex = hd.fields if hd is not None else None
         return self.all_heads(h, obs, lex) + (self.value_head(h).squeeze(-1),)
 
     def decision_heads(self, h: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -993,16 +1405,36 @@ class CommNet(nn.Module):
         dialogue slot ``p``).  Returns token logits and values at those
         positions, plus the four decision logits and the value at DECIDE.
         """
-        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask)   # (B, L, d)
-        hr = h[:, read_positions]                           # (B, K, d)
+        heard = self.listen(tokens, None, self_mask)
+        lex = heard.fields if heard is not None else None
+        barn = bool(self.cfg.model.barn_lookup) and self.is_barn(schema)
+        # looking at a barn, the rows are looked up below, turn by turn: a
+        # state found its row by what had been said *when it spoke*, which for
+        # every turn but the last is less than the whole conversation
+        h = self.encode(obs, tokens, schema=schema, self_mask=self_mask,
+                        heard=heard, lookup=not barn)                      # (B, L, d)
         # the dialogue position each of those states emits into
-        turn = (self.turn_so_far(obs, schema, tokens,
-                                 (read_positions - dialogue_offset(self.cfg) + 1).tolist())
-                if read_positions.numel() else None)
-        tok_logits = self.speak(hr, obs, schema, turn)      # (B, K, V+1)
+        pos = read_positions - dialogue_offset(self.cfg) + 1
+        if barn and read_positions.numel():
+            L = self.cfg.channel.max_msg_len
+            turn_of = pos // L
+            states, logits = [], []
+            for t in sorted(set(turn_of.tolist())):
+                at = read_positions[turn_of == t]
+                said = self.read_words(tokens[:, :t * L], None, self_mask) if t > 0 else None
+                hr_t = self.barn_lookup(h[:, at], obs, said)
+                states.append(hr_t)
+                logits.append(self.speak(hr_t, obs, schema, None, heard=said))
+            # read positions come in dialogue order, so the turns are in order
+            hr, tok_logits = torch.cat(states, dim=1), torch.cat(logits, dim=1)
+        else:
+            hr = h[:, read_positions]                       # (B, K, d)
+            turn = (self.turn_so_far(obs, schema, tokens, pos.tolist())
+                    if read_positions.numel() else None)
+            tok_logits = self.speak(hr, obs, schema, turn)  # (B, K, V+1)
         tok_values = self.value_head(hr).squeeze(-1)        # (B, K)
-        hd = h[:, -1]
-        dec = self.all_heads(hd, obs, self.read_words(tokens, None, self_mask))
+        hd = self.barn_lookup(h[:, -1], obs, lex) if barn else h[:, -1]
+        dec = self.all_heads(hd, obs, lex)
         dec_value = self.value_head(hd).squeeze(-1)
         return tok_logits, tok_values, dec, dec_value
 

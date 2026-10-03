@@ -273,7 +273,9 @@ def _report_evidence(phase, farmer_ok: bool = True, buyer_ok: bool = True,
           "speakers": {"farmer": good, "buyer": good},
           "transfer": 0.6, "topsim": 0.4, "null": 0.0,
           "holdout_field_ratio": holdout, "holdout_field_success": 0.6,
-          "seen_field_success": 0.7, "holdout_success": 0.2, "seen_success": 0.3}
+          "seen_field_success": 0.7, "holdout_success": 0.2, "seen_success": 0.3,
+          # the description scaffold is gone (it is withdrawn in `mutual`)
+          "scaffold": 0.0}
     for role, label, ok in ((FARMER, "farmer", farmer_ok), (BUYER, "buyer", buyer_ok)):
         names = phase.report_names(role)
         if not names:
@@ -305,6 +307,13 @@ def _swap_evidence(farmer_ok: bool, buyer_ok: bool, holdout: float = 0.75) -> di
         # the productivity gate: success on combinations never trained on
         "seen_success": 0.80, "holdout_success": 0.80 * holdout,
         "holdout_ratio": holdout,
+        # numbers told apart from their neighbours, each describer on its own
+        "near_miss": {k: {"success": 0.92, "each": [0.93, 0.91]} for k in (3, 4)},
+        # what the speakers say for each meaning, and whether they agree
+        "vocabulary": {"meanings": 27, "speakers": 2, "distinct_fewest": 27,
+                       "distinct_min": 1.0, "agreement_min": 0.96, "agreement_mean": 0.96},
+        # the description scaffold is gone
+        "scaffold": 0.0,
         "views": [
             {"informer": "farmer", "guesser": "buyer", "success": 0.80 if farmer_ok else 0.28,
              "transfer": 0.70 if farmer_ok else 0.02},
@@ -868,6 +877,12 @@ class TestEveryRungIsReachable(unittest.TestCase):
             "by_kind": {k: {"success": 1.0} for k in range(6)},
             "holdout_field_ratio": 1.0, "holdout_field_success": 1.0,
             "seen_field_success": 1.0,
+            # the naming ladder's own bars: numbers told from their neighbours,
+            # one word per meaning in one dialect, and no scaffold left
+            "near_miss": {k: {"success": 1.0, "each": [1.0, 1.0]} for k in (3, 4)},
+            "vocabulary": {"meanings": 27, "speakers": 2, "distinct_fewest": 27,
+                           "distinct_min": 1.0, "agreement_min": 1.0, "agreement_mean": 1.0},
+            "scaffold": 0.0,
         }
         for r, role in (("farmer", FARMER), ("buyer", BUYER)):
             names = list(phase.report_names(role)) or ["x"] * 6
@@ -957,6 +972,7 @@ class TestSnapshots(unittest.TestCase):
             tr.store.add_batch(batch, tr.pop.farmers, tr.pop.buyers, 0)
             tr.episode = 128
             tr.curriculum.index = [p.name for p in tr.curriculum.phases].index("mutual")
+            tr.apply_scaffold()               # as a promotion does: none is left by `mutual`
             path = tr.save_snapshot("t")
             tr2 = Trainer(cfg, d + "/b", quiet=True)
             tr2.load_snapshot(path)
@@ -2661,6 +2677,7 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
             tr = self._trainer(d + "/a")
             names = [p.name for p in tr.curriculum.phases]
             tr.curriculum.index = names.index("order")
+            tr.apply_scaffold()               # as a promotion does
             tr.episode = 4096
             path = tr.save_snapshot("after-mutual")
             before = [a.net.state_dict() for a in tr.pop.all_agents()]
@@ -2671,8 +2688,20 @@ class TestWindingACurriculumBackToARung(unittest.TestCase):
             self.assertEqual(tr2.episode, 4096)
             after = [a.net.state_dict() for a in tr2.pop.all_agents()]
             self.assertEqual(len(before), len(after))
+            # Two entries are not weights: how much of the description scaffold
+            # is left, and whose atoms a word is made of. The trainer sets both
+            # from the rung, so they go back with it -- `mutual` starts with the
+            # whole scaffold and words that are the lexicon's alone.
+            schedule = {"speaker_lexicon.scaffold": tr2.scaffold_now(),
+                        "speaker_lexicon.own_atoms": float(tr2.own_atoms_now())}
+            self.assertEqual(schedule["speaker_lexicon.scaffold"], 1.0)
             for x, y in zip(before, after):
+                self.assertEqual(float(x["speaker_lexicon.scaffold"]), 0.0,
+                                 "saved at `order`, where none of it is left")
                 for k in x:
+                    if k in schedule:
+                        self.assertEqual(float(y[k]), schedule[k], k)
+                        continue
                     self.assertTrue(torch.equal(x[k], y[k].to(x[k].device)), k)
             tr2.close()
 
@@ -3095,3 +3124,104 @@ class TestProbesAskWhatTheRungAsks(unittest.TestCase):
                              n, informer=FARMER, held_out=held_out, query=1),
                          n_holdout=len(rw.holdout))
         self.assertTrue(str(zs["suppressed"]).startswith("not applicable"))
+
+
+# ==========================================================================
+class TestThePriceNamedIsMeasured(unittest.TestCase):
+    """A trade needs both sides to name the same price, and one price said
+    whatever the limits are is the cheapest way to agree. The first local run
+    to reach `haggle` (2026-10-01) did exactly that -- 2.50 in 99-100% of
+    rounds, with floors from 1.00 to 3.00 and limits from 1.50 to 3.50 -- and
+    nothing a checkpoint printed could tell it from bargaining."""
+
+    VALUES = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5)
+
+    def _rounds(self):
+        g = torch.Generator().manual_seed(0)
+        lo = torch.randint(0, 5, (400,), generator=g)
+        hi = (lo + torch.randint(0, 3, (400,), generator=g)).clamp(max=5)
+        return torch.ones(400, dtype=torch.bool), lo, hi
+
+    def test_one_price_whatever_the_limits_reads_zero(self):
+        viable, lo, hi = self._rounds()
+        fixed = torch.full((400,), 3)
+        out = M.price_habit(self.VALUES, viable, lo, hi, fixed, fixed)
+        for side in ("farmer", "buyer"):
+            self.assertEqual(out[side]["commonest"], 2.5)
+            self.assertEqual(out[side]["commonest_share"], 1.0)
+            self.assertEqual(out[side]["follows"], 0.0)
+            self.assertGreater(out[side]["off_share"], 0.2, "the habit must fail somewhere")
+            self.assertAlmostEqual(out[side]["fits"], 1.0 - out[side]["off_share"], places=6)
+
+    def test_a_price_that_follows_the_limits_reads_one(self):
+        viable, lo, hi = self._rounds()
+        follows = torch.minimum(torch.maximum(torch.full((400,), 3), lo), hi)
+        fixed = torch.full((400,), 3)
+        out = M.price_habit(self.VALUES, viable, lo, hi, follows, fixed)
+        self.assertEqual(out["farmer"]["follows"], 1.0)
+        self.assertEqual(out["farmer"]["fits"], 1.0)
+        self.assertEqual(out["buyer"]["follows"], 0.0)
+        # and it is still the habitual price wherever that fits
+        self.assertEqual(out["farmer"]["commonest"], 2.5)
+
+    def test_only_rounds_with_a_deal_to_be_had_are_counted(self):
+        viable, lo, hi = self._rounds()
+        viable = viable.clone()
+        viable[200:] = False
+        price = torch.full((400,), 3)
+        price[200:] = 0                        # what is named where no deal exists is not it
+        out = M.price_habit(self.VALUES, viable, lo, hi, price, price)
+        self.assertEqual(out["n"], 200)
+        self.assertEqual(out["farmer"]["commonest_share"], 1.0)
+        none = M.price_habit(self.VALUES, torch.zeros(400, dtype=torch.bool), lo, hi,
+                             price, price)
+        self.assertEqual(none, {"n": 0})
+
+    def test_where_the_habit_always_fits_the_question_is_not_askable(self):
+        viable = torch.ones(50, dtype=torch.bool)
+        lo, hi = torch.zeros(50, dtype=torch.long), torch.full((50,), 5)
+        price = torch.full((50,), 3)
+        out = M.price_habit(self.VALUES, viable, lo, hi, price, price)
+        self.assertNotEqual(out["farmer"]["follows"], out["farmer"]["follows"])   # nan
+        self.assertEqual(out["farmer"]["fits"], 1.0)
+
+    def test_the_trainer_measures_it_where_a_deal_is_named_and_nowhere_else(self):
+        """Through the real path: the rung's own sampler, a greedy rollout, and
+        the keys the checkpoint prints."""
+        from orchard.train import Trainer
+        cfg = cfg_small()
+        cfg.population.n_farmers = cfg.population.n_buyers = 2
+        cfg.train.device, cfg.log.plot = "cpu", False
+        cfg.log.ablation_episodes = 96
+        with tempfile.TemporaryDirectory() as d:
+            tr = Trainer(cfg, d, quiet=True)
+            try:
+                names = [q.name for q in tr.curriculum.phases]
+                for name in names:
+                    tr.curriculum.index = names.index(name)
+                    ph = tr.curriculum.phase
+                    tr.maybe_split_roles(ph)
+                    got = tr.price_named(ph)
+                    if name not in ("haggle", "bargain", "market"):
+                        self.assertIsNone(got, name)
+                        continue
+                    self.assertGreater(got["n"], 0, name)
+                    for side in ("farmer", "buyer"):
+                        self.assertEqual(set(got[side]), {"commonest", "commonest_share",
+                                                          "distinct", "fits", "off_share",
+                                                          "follows"}, name)
+                        self.assertIn(got[side]["commonest"], cfg.world.price_values)
+                        self.assertTrue(0.0 < got[side]["commonest_share"] <= 1.0)
+                    self.assertIn("success_on_viable", got)
+                self.assertTrue(tr.curriculum.phases[names.index("haggle")].trading)
+                self.assertFalse(tr.curriculum.phases[names.index("judge")].trading)
+            finally:
+                tr.close()
+
+    def test_the_checkpoint_says_it(self):
+        src = (Path(__file__).resolve().parents[1] / "orchard" / "train.py").read_text(
+            encoding="utf-8")
+        self.assertIn('"price_named": price,', src)
+        self.assertIn("price named       :", src)
+        self.assertIn("follows the limits", src)
+

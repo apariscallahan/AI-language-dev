@@ -470,12 +470,15 @@ Two founders who never die will each keep a dialect if nothing pays them not
 to, and nothing did: the convention bonus used to wait for the community at
 `mutual`, so all the naming rungs ran with no term anywhere rewarding a speaker
 for saying the same thing twice. Measured at `name-all`: within-role coherence
-0.15–0.17, which is two codes with no form in common. It now comes on at
-`name-all` ([§6](#6-speaker-pressures-and-the-community)), the first rung that
-invents no word of its own; at `mutual` newcomers are taught from transcripts of
-both founders and turnover leaves the commoner form. Deaths used to paper over
-the dialects earlier — a newborn apprenticed to the survivor inherited its words
-— at the cost of half the population, which is why nobody dies before `mutual`.
+0.15–0.17, which is two codes with no form in common. Bringing the bonus on at
+`name-all` ([§6](#6-speaker-pressures-and-the-community)) did not mend it: with
+two speakers "the community's word" is whichever of two words was said last, and
+on the 2026-10-01 run the founders had **0 of 27 words in common** at the end of
+every naming rung, `name-all` included. What mends it is that a learner takes
+its elders' words
+([below](#a-vocabulary-fit-to-hand-on)). Deaths used to paper over the dialects
+earlier — a newborn apprenticed to the survivor inherited its words — at the
+cost of half the population, which is why nobody dies before `mutual`.
 
 **Cross-role coherence and cross-role overlap cannot be read while the pool is
 shared.** Row *i* of "the farmers" and row *i* of "the buyers" are the same
@@ -585,6 +588,18 @@ seats: the report rungs run in both directions, and one pool learns both from
 the same words. The split exists so the two sides can diverge in *strategy*,
 which only starts to matter where selling and buying pay differently.
 
+**Agreeing is not bargaining.** A trade needs both sides to name the same
+price, and the first run to reach `haggle` (2026-10-01, locally) found the
+cheapest way to do it: both named 2.50 in 99% of rounds, whatever the floor and
+the limit they had just told each other. That agrees every time, fits 0.83 of
+the deals that exist, passes the rung, and is not a negotiation
+([§11](#11-findings-with-the-evidence), item 17). Success cannot tell the two
+apart, so every checkpoint of a trading rung now prints the commonest price
+each side names and, in the rounds where that price does not fit both limits,
+how often one that does is named instead (`price named … follows the limits`:
+0 is one price whatever the limits are, 1 is a price that follows them). It is
+a measurement, not yet a bar.
+
 **Weights carry across every transition.** The population that learned to name is
 the population that learns to haggle — nothing is reinitialised at a boundary.
 That works because every rung shares one sequence layout, one channel and one set
@@ -607,7 +622,16 @@ All of these have to hold at the same check before the next rung starts:
 - on `name-all`, **structure** — positional structure ≥ 0.15 and **field
   coverage** ≥ 0.30, and ≥ 0.25 for every field — and **the reserved
   combinations understood**, field by field, at least 60% as well as trained ones
-  over the headroom a message-blind reader leaves (`min_holdout_ratio`).
+  over the headroom a message-blind reader leaves (`min_holdout_ratio`);
+- on every rung that plays rounds on a quantity or a price, **numbers told from
+  their neighbours**: rounds whose wrong candidates are the nearest values won
+  0.80 of the time, each describer on its own (`numeral_min_near`);
+- on `name-all`, **the vocabulary it hands on**: the speaker with the fewest
+  distinct words has one for 0.95 of the meanings, and the two speakers furthest
+  apart say the same word for 0.90 of them (`min_vocabulary_distinct`,
+  `min_vocabulary_agreement`), both read off what the agents say when asked;
+- on `mutual`, **the description scaffold gone**
+  ([below](#a-vocabulary-fit-to-hand-on)).
 
 In the lineup rungs and the report rungs every one of these is checked **per
 role**, never pooled: each role's own utterances must show topsim over null and
@@ -1032,9 +1056,16 @@ to the agents.**
 | phrases have a consistent order | `reward.word_order` (0.15) | each pair of fields comes in the speaker's usual order; which order is learned |
 | words are read one at a time, as nouns, adjectives or numerals | `model.lexical_reader` (`agents.LexicalReader`) | a listener understands a combination of words it learned one at a time |
 | a thing's parts are named through one mental lexicon | `model.lexical_speaker` (`agents.LexicalSpeaker`) | a speaker says the word it learned for a part wherever it names that part, alone or in a description |
-| say as much as the question asks | inside the production lexicon (`CommNet.turn_so_far`, `go_on`) | asked about a whole lot, a speaker is pushed past its first word while parts are unnamed; asked about one field, never |
-| a part once named is passed over | inside the production lexicon (`inhibit`) | describing a whole lot, the next word goes to a part not yet named, instead of the last one again |
-| answer the question asked | inside the production lexicon (`ask`) | asked about one field, the lexicon names that field |
+| say as much as the question asks, then stop | a **scaffold** on the production lexicon (`CommNet.turn_so_far`, `go_on`), withdrawn during `mutual` | asked about a whole lot, a speaker is pushed past each word while parts are unnamed and held back once all are named; asked about one field, held back after one word |
+| a part once named is passed over | scaffold (`inhibit`), withdrawn with it | describing a whole lot, the next word goes to a part not yet named, instead of the last one again |
+| answer the question asked | scaffold (`ask`), withdrawn with it | asked about one field, the lexicon names that field |
+| every meaning has a word of its own | `reward.lexicon_exclusive` (`conventions.lexicon_exclusivity`) | 27 meanings get 27 words: no atom serves two meanings, in any field. Which word names what is the speaker's own |
+| a learner takes its elders' words | `reward.lexicon_imitate` (`LexicalSpeaker.heard`) | one dialect: a listener remembers the word an elder used where it understood, and its own word moves to it |
+| a number word is exact | `curriculum.numeral_near_frac`, `numeral_min_near` | in half the rounds on a quantity or a price the wrong candidates are the nearest values; "about four" loses those |
+| an answer names what was asked | `train.answer_class_coef` | a word's class: the first word of the answer to a question about colour is read as a colour word |
+| in the naming rungs a word is the lexicon's alone | `curriculum.own_atoms_from_rung` (`LexicalSpeaker.own_atoms`) | the token head decides whether a word goes on, another starts or the turn ends, and not which atom is said, until the market |
+| a lot in a barn is a lot | `model.lexical_barn` (`CommNet.row_attention`, `barn_concepts`) | a farmer finds the lot it was asked about through its reader and names that row's parts with the same lexicon |
+| what is understood can be used | `model.heard_meaning` (`CommNet.listen`) | each heard word's meaning reaches the listener's own state, not only its report heads |
 | numerals sit on a number line | inside the reader, and `model.innate_concepts` | numbers are magnitudes: 3 is near 4 and far from 8, in perception and in word meaning |
 | a fruit is an object, colour and quality properties, number magnitudes | `model.innate_concepts` | concepts arrive sorted into the kinds that nouns, adjectives and numerals name |
 
@@ -1202,10 +1233,11 @@ the question implies, Grice's maxim of quantity: be as informative as asked. The
 speaker sees the question (the query slot: one field, or all of it) and monitors
 its own turn. A part counts as named once the turn holds that part's word (what
 its lexicon says for the part) or a gesture at it. Asked about a whole lot, and
-with parts still unnamed, ending loses `go_on` nats (5.0 at birth) to starting
+with parts still unnamed, ending loses `go_on` nats (5.0) to starting
 a new word. It never pushes past one word per part, and never at all in a round
-that asks about one field. `go_on` is learned like everything else, so a
-community for which the fifth word does not pay can learn to stop. On the
+that asks about one field. (`go_on` was a learnable strength until 2026-10-01;
+it never moved, and it is now part of a scaffold that is withdrawn —
+[below](#a-vocabulary-fit-to-hand-on).) On the
 update-50 snapshot above, a push of 3 raised the chance of going on from 0.03% to
 3–9%. That is a speaker drilled on "a word, then stop" by supervised teaching,
 harder than any reinforcement run drills it. In the rerun, descriptions were 2.6
@@ -1221,7 +1253,7 @@ does: a speaker named a second part and then said that part's word again until
 the five-word cap, `a11 a28 a28 a28 a28`, because nothing told its choice of part
 what it had already said. The production lexicon now knows (the same record the
 push reads): describing a whole lot, when a new word starts, a part already
-named in the turn loses `inhibit` (4.0 at birth, learned) from its attention
+named in the turn loses `inhibit` (8.0) from its attention
 score. That is inhibition of return, the coverage idea from machine translation,
 and the plainest reading of "don't say it twice".
 
@@ -1243,10 +1275,193 @@ but its words went wrong from `name-color` on, and the pieces were the cause:
   point-and-say lesson the quantity words form on.
 
 Now, asked about one field, the lexicon's attention to that field gets `ask`
-(4.0 at birth, learned): at birth it attends there 93% of the time, so the first
+(8.0): at birth it attends there 99.9% of the time, so the first
 atom of an answer comes from the asked field's own concept. Inhibition of return
 applies only when a new word starts in a whole-lot description; inside a word,
 and on any one-field question, nothing is passed over.
+
+#### A vocabulary fit to hand on
+
+The first GPU run of the whole faculty (2026-10-01, `gpu_community`) passed
+every naming rung at its first possible check — 100 updates each, `name-all` in
+200 — and then spent three hours in `mutual`. When it was stopped, 630 updates
+in, each side reported the other's whole lot 0.20 and 0.18 of the time against a
+0.25 bar, and both did in one round 0.035 of the time against 0.08. Nothing was
+wrong with `mutual`. It had been handed a vocabulary that no gate had looked
+at, and the snapshots the run left say what was in it:
+
+| what the gates saw | what the snapshots hold |
+|---|---|
+| every field named alone at 0.89–1.00 | **8 distinct words for 27 meanings** per founder: one atom for a fruit, a colour and a number, told apart by the question — which a description of a whole lot does not ask. The vocabulary *shrank* as the ladder went on: 12 and 11 words after `name-fruit`, 8 and 8 after `name-all` |
+| `name-quantity` at 0.89 | **6 words for 9 quantities**. With the wrong candidates drawn at random a perfect listener wins 0.92 of rounds with six words; `mutual` wants the number, and read it at 0.40 |
+| each founder read by the other | **0 of 27 words in common**, at the end of every naming rung. The six newcomers learned from both and came out as mixtures (0.59–0.81 of their words shared with a founder; the founders, 0.26 by then): eight speakers, eight dialects, and a reader that cannot know who is speaking |
+| `name-all` at 0.82, every field covered | in `mutual`, **8.3 words per description** of five parts, 5.4 of them distinct. Nothing said when to stop |
+| — | the three biases that make a speaker answer the question, go on, and not repeat itself were learnable, and were where they were born (`ask` 4.0 → 4.2, `go_on` 5.0 → 5.1, `inhibit` 4.0 → 3.8–3.9). The token head alone told a field's values apart at the base rate (0.14–0.33 against 0.13–0.28). **Every description was the scaffold's** |
+| — | a farmer in the market looks at a barn, where the production lexicon did not exist |
+
+Was there too much hand-holding in that run? In one place, yes — the scaffold
+never left — and in another there was none at all: nothing was asked of the
+vocabulary. The response has both halves. What is innate about *words* got
+stronger; what is innate about *what to say* is now withdrawn before anything
+is traded.
+
+**One word per meaning.** Each speaker's whole lexicon — its word for every
+value of every field, 27 rows — is pulled towards the nearest table in which no
+two meanings share a word (`reward.lexicon_exclusive`;
+`conventions.lexicon_exclusivity`). "Nearest" is an exact assignment of
+meanings to atoms: the one that keeps the most of what the speaker already
+says. Where two meanings share a word the one with the weaker claim is given
+the free atom it leans to; where none do, the term is silent. This is mutual
+exclusivity as children show it — a new word names something that has no word
+yet — and it says nothing about *which* word names what. The first version
+used the objective the naming signal uses (information plus separation), taken
+over the whole table. It sharpened every word within 50 updates and separated
+only some — 17, 16 and 18 distinct words of 27 on three fresh lexicons — because
+two meanings both certain of one atom have no gradient left to part them. A
+target does not saturate. It is summed over the meanings, not averaged: a word
+has to be pulled about as hard as a round's reward pulls it, and averaged, the
+game won (two meanings still on one atom at update 50).
+
+**One dialect.** A listener that understood what an elder said remembers the
+word it heard for that meaning, and its own word moves towards what it
+remembers (`reward.lexicon_imitate`; `LexicalSpeaker.heard`,
+`conventions.imitation_loss`). An elder is an agent born earlier, or the earlier
+of two born together; the eldest keeps its own words, and the rule runs one way
+because two speakers adopting each other's words at once swap them. In a round
+about one field the word is the answer and understanding is having picked the
+right lot. In a description of a whole lot the listener cannot be sure which
+word named which field, and does not need to be: it files each field's value
+under the word its own reader took to name it, and a wrong guess lands on a
+different word every time while the right one is there every time the value is.
+The memory peaks on the right word even for a listener guessing at random
+(cross-situational learning; `tests/test_vocabulary.py` has it converge from
+guesses that are right a fifth of the time). So a newcomer, who never plays a
+one-field round, still takes its elders' words. A word heard from an elder also
+has first claim on its atom in the matching above: the word a junior made up
+for something else moves aside. It is a memory and not the batch's own rounds
+because a word pulled only in the updates it was heard in was pulled back in
+all the others.
+
+**Numbers are exact.** In half the rounds on a quantity or a price
+(`curriculum.numeral_near_frac`) the wrong candidates are the nearest values —
+four against three and five — and in a hard whole-lot round the same share of
+near misses in a number are one step away. A rung that plays number rounds is
+not passed until rounds of nearest neighbours alone are won 0.80 of the time,
+each describer on its own (`numeral_min_near`). Read by a perfect listener,
+eight words for nine quantities score 0.89 there, seven 0.78, and the
+2026-10-01 founders' six 0.67.
+
+**An answer names what was asked.** In a round about one field the listener's
+reader is taught that the first word it hears names that field
+(`train.answer_class_coef`). The question is in both observations; what the word
+says *about* the field is still learned only from whether the guess landed. A
+word's class was otherwise learned through the reading it enables, which
+saturates: on one reader in eight, taught on one-word utterances alone, two
+quality words were filed as a quantity and a fruit by step 100 and stayed
+there — each still answered its own question through the floor that keeps every
+reading possible, so nothing moved it — and quality was then read at 0.84 from
+a five-word description where every other field read 1.00.
+
+**In the naming rungs a word is the lexicon's alone.** The token head sees the
+context, so it is a second place a word can live, and the first run with the
+pieces above found it there: a junior's lexicon had taken its elder's word for
+a fruit (`a8`, at 0.99) and it went on saying its own old one, `a29`, which its
+token head had learned to add 6.5 nats to in exactly that context — that was
+the word its listener could already read, and the head was the one place the
+game's gradient could still put it. Until the market the head now decides
+whether a word goes on, another starts or the turn ends, and has no say in
+which atom is said (`curriculum.own_atoms_from_rung` = `order`;
+`LexicalSpeaker.own_atoms`). From `order` on its atoms are added again, so a
+word for something that is not a part of a lot — a yes, a no, a counter-offer —
+has somewhere to come from. With fewer atoms than meanings (`duality`) a word
+needs more than its lexicon's one atom and the head's are on throughout.
+
+**The scaffold is withdrawn.** "Answer the question asked", "go on until every
+part is named", "not the same part twice" and "then stop" are pragmatics put in
+from outside. They are now fixed strengths multiplied by one number, which is 1
+below `mutual`, held for the first 100 updates of it, taken linearly to 0 over
+the next 300, and 0 in every rung above (`curriculum.scaffold_fade_rung`,
+`scaffold_hold_updates`, `scaffold_fade_updates`). `mutual` cannot be passed
+until it is 0, so every bar that rung has is cleared by the speakers
+themselves, and all of trading runs with no scaffold at all. While any of it is
+left, each symbol a scaffolded speaker emits is also a lesson for its own policy
+(`train.scaffold_distil`): where a word starts, which part to name; after a
+word, whether to go on, start another or stop. The lesson runs to the end of
+`mutual`, not only until the scaffold reaches 0 — a schedule does not know how
+long a habit takes to form — and no rung above has either. Four things had to
+be got right for that hand-over, each found by running it:
+
+- *The lesson is the choice, never the atom.* Taught the scaffolded speaker's
+  atoms, the token head learned the words itself: a junior's own old word was
+  6.4 nats up there. (And 6.5 with the lesson changed, through the game's own
+  gradient, which is why the head now has no say in the atom at all.)
+- *The lesson is what the scaffold asks for, not what the scaffolded speaker
+  did.* `name-fruit` asks about nothing but the fruit. A pupil taught "do what
+  you just did with help" learned "the fruit, whatever is asked" there, strongly
+  enough to overrule the help when the colour question came: at update 50 it
+  answered every question with the fruit's name, 4 distinct words for 27
+  meanings, and its teacher — the pupil plus a nudge — agreed.
+- *The scaffold stays in charge while it is on.* The speaker's own scores for
+  the parts are bounded (±3) and the biases are well above the bound (8), so
+  whatever it has learned so far, the asked part wins.
+- *A habit is learned where it was practised.* Withdrawn in `name-all`, the
+  first design, the hand-over was clean: the speakers' own policy came to
+  within 0.01 nats a symbol of what the scaffold asked as it faded, and
+  `name-all` passed with none of it left at 0.98, five words to a description
+  and every field covered. But every description in a naming rung opens the
+  conversation. In `mutual` the first speaker then said its five words and the
+  second, in a seat it had never described from, ran to the end of the buffer:
+  `a15 a13 a15 a7 a7 a16 a7 a7 a15 a9 a16`. So the scaffold is withdrawn in
+  `mutual`, the last rung over bare lots and the one where both seats describe.
+
+The choice of part is also scored against a learned key per part now, not
+against the parts' concepts, which are sums of embeddings that start at 0.02:
+against those a score could not be more than a few tenths however the speaker
+was trained, which is the other reason the scaffold used to do all the
+choosing.
+
+**The faculty in the market** (`model.lexical_barn`, `model.heard_meaning`). A
+lot in a barn is the same kind of thing as a lot held in the hand. The farmer's
+sixteen rows are scored by the reader's reading of what it heard — a row's
+log-probability of its own fruit and colour — exactly as the lineup's candidates
+are (the factored choice, with the farmer's lots as the candidates), so a buyer
+that says "green pear" in words the farmer can read has pointed at a row and
+nothing has to be learned in the market for that. The row found is a lot whose
+five parts (fruit, colour, quality, stock, floor price) the lexicon names with
+the words the naming rungs built. And each heard word's meaning — the concept of
+the value the reader takes it to name, looked up out of context — is added to
+the listener's input at the slots the word was heard in, in the same embedding
+space as the things it sees. Before, the reader's decoding existed only at the
+five report heads, and every *decision* was read off a hidden state that had to
+learn to read the words again by itself: on the 2026-10-01 snapshot in `mutual`
+the hidden state alone reported the other's lot at 0.46 / 0.54 / 0.59 / 0.42 /
+0.30 per field where state and reader together reported 0.79 / 0.82 / 0.84 /
+0.76 / 0.67.
+
+**Three gates that were missing.** On `name-all`, the last rung before the
+community arrives: the speaker with the fewest distinct words has one for at
+least 0.95 of the meanings (`min_vocabulary_distinct`), and the two speakers
+furthest apart say the same word for at least 0.90 of them
+(`min_vocabulary_agreement`). On `mutual`: the scaffold is gone. The first two
+are measured on what the agents say when asked (`metrics.vocabulary`: greedy,
+word-only, six lots per meaning), not on their weights, and every checkpoint
+prints all three. Above `name-all` the vocabulary line reads the speakers'
+lexicons instead: nobody is asked about one field there, a speaker's own policy
+is practised on whole lots only, and once the scaffold that made it answer the
+question has gone, asking measures a skill the ladder has stopped using (four
+speakers with identical lexicons read "17 of 27 words, 63% shared" when asked,
+in `mutual`, with a third of the scaffold left).
+
+```
+vocabulary        : asked about one field, the speaker with the fewest has 27 distinct
+                    words for 27 meanings; two speakers say the same word for 100% of
+                    meanings on average, 100% for the pair furthest apart; ...
+description scaffold: 67% on (withdrawn during `mutual`); the speakers' own policy is
+                    0.044 nats a symbol from what it has them say; ...
+```
+
+What these did on the CPU, from scratch, is in
+[§11](#11-findings-with-the-evidence), item 17.
 
 **Names and word order keep their own clocks.** The speakers' lexicons learn
 names only from one-field rounds, which end with the naming rungs, and word
@@ -1268,10 +1483,18 @@ code (v ≥ 1, v ≥ 2, …): neighbouring magnitudes share most of their
 representation, the way infants' approximate number sense orders numerosities
 before there is any counting word.
 
-**What this does not give.** No atom is assigned to any meaning. No word is
-given a class. No order is chosen, and nothing forces a description to name
-every field: the composition term pays for it, and the gates judge whether it
-happened. What the faculty does change is where compositionality comes from.
+**What this does not give.** No atom is assigned to any meaning from outside:
+each speaker's words are the one-to-one table nearest its own random one, and
+the community's are its eldest speaker's. No word is given a class. No order is
+chosen. Until it is withdrawn in `mutual` a scaffold makes a description name
+every part once and stop; from `order` on nothing does, and the gates judge
+whether it still happens. What the faculty does change is where the vocabulary and
+compositionality come from. The vocabulary is no longer negotiated between a
+speaker and a listener: that each meaning has a word of its own is innate
+(mutual exclusivity), which word is arbitrary, and agreement comes by imitation
+— so "how the words formed" is not something these runs can be asked. What they
+can be asked is what is done with the words: reading them, combining them, and
+trading with them.
 The listener's side of productivity is now largely innate (a reader that
 composes understands novel combinations of known words by construction). The
 speaker's side is given the means, a lexicon that says a part's word wherever
@@ -1687,8 +1910,23 @@ magnitude), and quantities and prices a thermometer-coded place on a number
 line. Both are part of the architecture and so are fixed for a run
 (`ARCH_KEYS`): a snapshot records whether it had them.
 
+**The faculty in the market** (`model.lexical_barn`, `model.heard_meaning`;
+[§5](#a-vocabulary-fit-to-hand-on)). Three connections that were missing
+between the faculty and the rest of the agent. A barn row is scored by the
+reader's reading of the other party's words — the log-probability of the row's
+own fruit and colour — on top of the learned query above, so a request the
+farmer can read finds its row with nothing learned in the market
+(`CommNet.row_attention`). The production lexicon speaks on a barn too: its
+five parts are the fruit, colour, quality and stock of the row attended to and
+the floor price (`CommNet.barn_concepts`). And each heard word's meaning, as
+the reader reads it, is added to the listener's input at the slots the word was
+heard in (`CommNet.listen`), so what was understood reaches the state every
+decision is read off — it is looked up word by word, out of context, so a state
+sees exactly the words said before it, in generation and in a newborn's lessons
+alike. None of the three adds a parameter.
+
 Sizes are a declared scale choice ([§14](#14-one-method-declared-scale)): about
-74k parameters per agent at the reference scale (55k before the reader), up to
+79k parameters per agent at the reference scale (55k before the reader), up to
 ~900k in `gpu_large`.
 
 ### Why Gumbel-softmax
@@ -1845,6 +2083,7 @@ Everything the brief's §5 asks for, plus the addendum's §3, at every checkpoin
 | stability | re-probing the same meaning against the same agent at different times |
 | cross-generation intelligibility | a newborn straight out of its apprenticeship, tested against veterans it never played |
 | zero-shot generalisation | success on the reserved combinations against success on trained ones — whole-round in the lineup; on a report rung **per field**, each field's held-out accuracy over trained as a share of the headroom above a message-blind guesser (the commonest value's share on the rounds actually played, per side — the shopper mostly wants LOW quality, so a trained round's quality floor is ~0.44 while a reserved one's is 0.25), then the mean of those ratios, never a ratio of means. The whole round is a conjunction of every field on both sides and sits at 0.00 while each field generalises: on the first run to promote out of `mutual` the fields transferred 0.89, 0.41 and 0.41 of their headroom and the whole round read 0.000 — fewer successes than independence would predict, because a Latin-square holdout asks for exactly the quality a correctly-read (fruit, colour) pair never showed. The checkpoint line prints both, per field by name |
+| **price named** | on a trading rung, played greedily: the price each side names most often and its share of the rounds with a deal to be had; how often the named price lies inside both limits; and, where the commonest price does not, how often one that does is named. One price whatever the limits reads 0, a price that follows them 1 — the difference between agreeing and bargaining, which success does not show (`metrics.price_convention`) |
 | length ↔ frequency | correlation between how often a meaning occurs and how long its message is, in symbols and in words |
 | per-bucket metrics | everything above, split into frequent and rare meanings |
 | form survival | whether a meaning's form survives, drifts, or is rebuilt compositionally across turnover |
@@ -2170,6 +2409,159 @@ current design answers.
    one thing in those descriptions nothing chose. See
    [§5](#the-language-faculty-words-word-classes-and-composition) for each
    piece.
+16. **The whole ladder passed in 700 updates, and handed `mutual` a vocabulary
+   it could not use** (2026-10-01, `gpu_community`, the faculty of item 15 with
+   the question read by the lexicon). Every naming rung passed at its first
+   check: five single-field rungs at 100 updates each, 0.89–1.00 word-only, and
+   `name-all` at 200 with 0.82, five-word descriptions and every field covered.
+   `mutual` then ran for 630 updates and three hours without passing: the
+   other's whole lot reported 0.055 → 0.20 of the time against 0.25, both sides
+   in one round 0.001 → 0.035 against 0.08, per field 0.75 / 0.71 / 0.76 /
+   0.67 / 0.58. The snapshots hold the reason, and none of it was visible in a
+   gate:
+
+   - each founder ended the naming ladder with **8 distinct words for 27
+     meanings** (12 and 11 after `name-fruit`; the vocabulary shrank as fields
+     were added), and **6 words for 9 quantities**;
+   - the two founders had **0 of 27 words in common** at the end of every
+     naming rung, and the six newcomers taught from both came out as mixtures;
+   - descriptions in `mutual` ran to **8.3 words** for five parts;
+   - the scaffold's three strengths were where they were born and the token
+     head alone told nothing apart: **nothing the speakers did in a description
+     was their own**;
+   - and a farmer's production lexicon did not exist on a barn, so `offer`
+     could not have used the words either.
+
+   Every one of those is a property the next rung needed and no rung measured.
+   The response is in [§5](#a-vocabulary-fit-to-hand-on): one word per meaning
+   and one dialect as properties of the lexicon itself, number rounds against
+   the nearest values, three new gates, the scaffold withdrawn before the
+   market, and the faculty connected to the barn.
+17. **With a vocabulary held to that standard the ladder ran from nothing to
+   its first trades** (2026-10-01, local CPU at the reference scale, one seed;
+   the response to item 16, [§5](#a-vocabulary-fit-to-hand-on)). From random
+   weights, batch 256, two founders:
+
+   | rung | updates | word-only, each describer | the vocabulary, as said when asked |
+   |---|---|---|---|
+   | `name-fruit` | 100 | 0.99 / 1.00 | 27 distinct words each from update 50; the younger founder's four fruit words are its elder's by then (15% of the 27 shared) |
+   | `name-color` | 100 | 1.00 / 1.00 | 30% shared |
+   | `name-quality` | 100 | 1.00 / 1.00 | 44% |
+   | `name-quantity` | 100 | 1.00 / 1.00; nearest neighbours 1.00 / 1.00 | 78% |
+   | `name-price` | 100 | 1.00 / 1.00; nearest neighbours 1.00 / 1.00 (quantities 0.99 / 0.99) | **27 words for 27 meanings, 100% shared** |
+   | `name-all` | 100 | 0.96 / 0.97; five words a description, held-out 1.00 against 1.00 per field | the same 27, both speakers |
+
+   (In that run the scaffold was withdrawn in `name-all`, the first design, so
+   the rung was held to update 400: every other bar was met at update 100, and
+   at 400, with none of the scaffold left, it read 0.98 / 0.99, coverage 1.00
+   on every field. As the scaffold went from 100% to 0 the speakers' own policy
+   went from 0.65 nats a symbol away from what it asks to 0.01.)
+
+   The 2026-10-01 GPU run left the same six rungs with 8 words for 27 meanings,
+   6 for 9 quantities and no word in common.
+
+   From that run's `name-all` snapshot, with the scaffold withdrawn in `mutual`
+   as shipped, two more runs. One with no newcomers, batch 128 and a short
+   schedule (held 30 updates, withdrawn over 120), to reach the market:
+
+   | rung | updates | at promotion | |
+   |---|---|---|---|
+   | `mutual` | 150 — the update the scaffold reached 0 | both report the other's lot in one round **0.91**; each side's whole lot 0.95 / 0.96; per field 0.98–1.00; held-out 0.99 against 1.00 | 4.99 words a description, the speakers' own. On the GPU run of item 16: 0.035 after 630 updates |
+   | `order` | 100 | the farmer, a barn in view, reports the whole request 0.97 | every field 0.99–1.00 |
+   | `offer` | 100 | the buyer reports stock, quality and floor together **0.98** (0.99 / 0.99 / 1.00) | see below |
+   | `judge` | 100 | whether the deal is worth doing: the farmer calls it right 0.81 of the time (0.62 with the channel muted), the buyer 0.84 (0.52) | every earlier field still 0.98–1.00 |
+   | `haggle` | 100 | the first rung that is a trade — both name the same fruit, quantity and price, and both accept: **0.30** of encounters as the gate measures it (sampled play, as in training; 0.29–0.35 over the checkpoint's three samples, 0.01 muted). Played greedily **0.55**, which is 0.81 of the encounters where a deal exists | the deal the farmer names has the fruit that was asked for 0.93 of the time, the quantity 0.93, a price inside both limits 0.82; both judge rightly whether a deal exists 0.77 |
+
+   `offer` is the rung that asks a farmer to find a lot in its barn by the
+   words it heard and say what it holds, and the one predicted to stall. It was
+   at 0.95 at its first checkpoint. A round from update 40 of it, the farmer
+   never having spoken from a barn before:
+
+   ```
+   buyer : a15 a1 a31 a22 a4                    (fruit 2, price 5, quantity 3, colour 1, quality 0)
+   farmer: a20 a23 a15 a18 a20 a23 a20 a23 ...  (stock 5, floor 2, fruit 2, quality 2 — and on to the buffer's end)
+   ```
+
+   Every word is the naming rungs': `a20` is the word for the quantity five,
+   `a23` for the third price, `a15` the buyer's own word for the fruit, said
+   back. The row was found through the reader and named through the lexicon,
+   with nothing learned in the market for either. What the farmer had *not*
+   got is when to stop — there is no scaffold here, and it had never described
+   from a barn. Sixty updates later: `a12 a23 a15 a10 a7`, five words, and the
+   turn ends. That part was learned in the market, from the length cost.
+
+   `haggle` is where a conversation first has to end in a deal: the roles
+   split, each side has a limit the other cannot see, and the round counts only
+   if both name the same deal and both accept it. One that did, eighty updates
+   in:
+
+   ```
+   buyer : a29 a16 a21 a4 a22     two; 2.50 at most; banana; any quality; yellow
+   farmer: a24 a23 a21 a10 a22    seven in stock; 2.00 at least; banana; prime; yellow
+   both  : BANANA x2 at 2.50, accept
+   ```
+
+   Ten words, all of them the naming rungs' and both speakers' the same 27; the
+   farmer's five are about the one row of fifteen that the buyer's words
+   pointed at. The rung read 0.03 at its first checkpoint and 0.30 at its
+   second, against a floor of 0.15. Played greedily at promotion (1,024
+   rounds), in the rounds with a deal to be had the two named the same fruit
+   1.00 of the time, the same quantity 1.00 and the same price 0.99, both
+   accepted 0.97, and 0.81 of those deals were struck.
+
+   **And the price is not bargained.** Both sides named 2.50 in 99% of those
+   rounds — with the farmer's floor anywhere from 1.00 to 3.00 and the
+   buyer's limit from 1.50 to 3.50, both of which had been said, and read at
+   0.97–0.99. 2.50 lies inside both limits in 0.83 of the deals that exist,
+   and that is nearly all of the gap between 0.81 and 1: one price whatever
+   the limits are agrees every time, which is the cheapest way through a rung
+   that pays for naming the same deal. Fifty updates into `bargain` it had not
+   moved (2.50 in 100%; in the rounds where it does not fit, a price that does
+   was named 0.00 of the time by either side), and where no deal exists both
+   refused only about half the time (0.47–0.54). Nothing a checkpoint printed
+   could tell this from haggling, so one now does: `price named`, on every
+   trading rung (`metrics.price_convention`, [§9](#9-what-is-measured)). This
+   is a first deal and not yet a market. `bargain` and `market` were not run
+   to a verdict (each trains and checkpoints from this state; `bargain` read
+   0.32 fifty updates in).
+
+   The other with the community arriving: two newcomers joining the two
+   founders in `mutual`, batch 256, the scaffold held for 100 updates and then
+   withdrawn. (It was restarted from its own snapshot part-way through to
+   shorten the wait, with the withdrawal speeded up from the shipped 300
+   updates to 150.) Each newcomer came out of its lessons with the founders'
+   27 words — 27 of 27, and 100% shared with the speaker furthest from it, at
+   the first checkpoint after it joined — and scored 0.62 and 0.80 against the
+   veterans before it had played a round. With all four present `mutual` read
+   0.76 at its first checkpoint and 0.90 from update 150, the scaffold on its
+   way out. It passed at update 250, the update the scaffold reached 0, at
+   **0.81** both in one round (each side's whole lot 0.86 / 0.95, every field
+   0.93–0.99, 5.0 words a description, held-out 0.98 against 0.97), the four
+   lexicons still identical. The second speaker's descriptions were a little
+   less complete than the first's once the support had gone (coverage 0.97
+   against 1.00): the newcomers had had the least practice with it.
+
+   **A birth with no scaffold.** Deaths start in `mutual` and the first comes
+   at least 900 updates later, by which time the scaffold has gone and its
+   lesson with it, so a newborn in the market has only its elders'
+   transcripts. One was forced there: in `offer`, one of the two pooled agents
+   retired and its replacement put through the ordinary apprenticeship. It
+   copied 0.96 of its elders' symbols in its lessons, came out with their 27
+   words (27 of 27 shared), and played `offer` against the veteran at **0.88**
+   before a single live round, where two veterans score 0.98. The pair was
+   still at 0.88 ten updates of play later and at 0.91–0.92 from twenty to
+   forty, the two lexicons still identical — and the newborn is in every round
+   of a pool of two, so that number is a whole community with a child in it.
+
+   What this does not show: a GPU run; more than one seed; a community larger
+   than four; a price that was bargained; `bargain` or `market` passed; or the
+   ladder climbed in one piece. It was climbed in three legs joined by
+   snapshots, and both `mutual` runs began from speakers whose own way of
+   opening a description was already formed (in the first leg's `name-all`).
+   The shipped ladder reaches `mutual` with that still 0.39 nats a symbol
+   short of what the scaffold asks and gives it 400 updates there; in the
+   short run above the second seat, which started from nothing, closed its
+   distance in 150.
 
 ### The rest of the log
 
@@ -2245,7 +2637,23 @@ runs a checkpoint and yields the per-role, per-field evidence its gate reads;
 a snapshot of one pool comes back as one pool; the bottleneck withholds the
 combinations it says it does; the costs wait and ramp; the barn lookup is
 inactive off a barn, small at birth, and learns the lookup when told the answer.
-396 tests, about ten minutes on a CPU.
+The vocabulary pieces (`tests/test_vocabulary.py`): the matching is exact and
+gives every meaning an atom of its own; a fresh lexicon becomes one-to-one
+under it, three seeds; a junior with words of its own ends up with its elder's,
+from one-field answers and from descriptions it can only guess the words of;
+near rounds take the nearest values and a coarse number code loses them; the
+scaffold changes nothing at zero, cannot be overruled while it is on, is
+withdrawn on schedule and gated, and a snapshot from before it could be
+withdrawn is resumed with its strengths put back and a warning; practice with
+it becomes the speaker's own choice of part and its own going on and stopping,
+without bending a word; a request in words points at a barn row and the farmer
+names that row with the naming rungs' words; and generation and the full pass
+agree symbol for symbol on a lot, on a barn, and where the other party speaks
+again afterwards. And
+the price named on a trading rung is measured through the rung's own sampler:
+one price whatever the limits reads 0, a price that follows them 1
+(`tests/test_rungs.py`).
+444 tests, about nine minutes on a CPU.
 
 **Demonstrated in runs.** Founding at 2 + 2 and growing gets a lineup code off
 chance where 6 + 6 never does; the code forms suddenly and late (~300–600
@@ -2259,9 +2667,49 @@ word-only: number words form where they had sat at chance. The words then did
 not combine: `name-all` stalled at 0.65 ([§11](#11-findings-with-the-evidence),
 item 14).
 
+**Also demonstrated, on a GPU (2026-10-01).** With the faculty of 2026-09-30
+every naming rung passes at its first check, `name-all` included — and hands on
+a vocabulary `mutual` cannot use (8 words for 27 meanings, no word shared;
+[§11](#11-findings-with-the-evidence), item 16).
+
+**Demonstrated locally, one seed (2026-10-01).** With one word per meaning, one
+dialect, exact numbers and the scaffold withdrawn, the ladder has been climbed
+from random weights to its first trades at the reference scale on a CPU, in
+three legs joined by snapshots: 27 words for 27 meanings shared by both
+founders after 500 updates; `mutual` at 0.91 with no scaffold where the GPU run
+had 0.035 (0.81 with two newcomers); `offer` — the farmer finding a lot in its
+barn by the words it heard — at 0.98 in 100 updates; `judge` in 100; and
+`haggle`, the first rung that is a trade, at 0.30 of encounters in 100, half of
+those where a deal exists as the gate measures it (sampled play) and 0.81
+played greedily — with one price, 2.50, named whatever the limits were. A
+newborn with no scaffold, taught from its elders' transcripts alone, came out
+with their 27 words and played `offer` at 0.88
+([§11](#11-findings-with-the-evidence), item 17).
+
 **Not yet validated — the open questions.**
 
-- **The language faculty has not been run on a GPU**
+- **That result on a GPU, at the community's size, on more than one seed, in
+  one run.** The local runs had two founders and at most two newcomers, and
+  the ladder was climbed in three legs. What to read first is on the second
+  checkpoint line: `vocabulary 27/27 words, 100% shared`, and in `mutual`,
+  `scaffold` falling to 0% with `words/utterance` staying at 5.
+- **Whether the price is ever bargained, and `bargain` and `market`.** At
+  `haggle` both sides named one price, 2.50, whatever their limits
+  ([§11](#11-findings-with-the-evidence), item 17). That agrees every time and
+  fits 0.83 of the deals that exist, so the rung passes and nothing is
+  negotiated; fifty updates into `bargain` it had not moved, and neither rung
+  above has been run to a verdict. The words are not what is missing — each
+  side reads the other's five at 0.97–0.99, limits included. Every checkpoint
+  of a trading rung now prints `price named … follows the limits`. If that
+  still reads 0.00 after a long stretch at the GPU's batch, the game pays too
+  well for a habit, and that is the next thing to change: rounds drawn so that
+  no one price fits most deals (what the nearest-neighbour rounds did for the
+  number words), or a bar on the rung itself.
+- **Whether a word for something that is not part of a lot ever forms.** In the
+  naming rungs a word is the lexicon's alone; from `order` on the token head's
+  atoms are added back, and a yes, a no or a counter-offer would have to come
+  from there. Nothing has needed one yet.
+- **The language faculty's other pieces on a GPU**
   ([§5](#the-language-faculty-words-word-classes-and-composition)). What is
   verified (`tests/test_language_faculty.py`):
   - a name is a word, and repeating it does not make it another name;
@@ -2294,23 +2742,21 @@ item 14).
   dropped repetition rule had it at chance twice. Given words for every part,
   `name-all` now combines them in play: five-word descriptions covering every
   field and generalising to unseen combinations by update 50
-  ([§11](#11-findings-with-the-evidence), item 15). What is not yet shown is
-  the whole ladder on the GPU with these pieces: words formed by the naming
-  rungs rather than taught, both founders combining, and `name-all` passing.
-  Watch **words per utterance** and **coverage** on the checkpoint line.
-- Whether the farmer learns the **lookup** in `offer` *by reinforcement*:
-  finding the asked-for lot among its barn rows by content, and describing it
-  from a row rather than from the naming layout. This is the one genuinely new
-  skill the trading half asks for, it is deliberately the only new thing in its
-  rung, and the agent now has a structure that learns it in a few hundred
-  supervised steps; whether hindsight on the buyer's report is enough to teach
-  it in play is the open question.
+  ([§11](#11-findings-with-the-evidence), item 15). The 2026-10-01 GPU run
+  then showed the whole naming ladder passing with these pieces — words formed
+  by the naming rungs rather than taught, both founders combining, `name-all`
+  at 0.82 — and what passing it did not show (item 16).
+- Whether the farmer could learn the **lookup** in `offer` *by reinforcement*
+  alone is no longer asked: the row is found through the reader and named
+  through the lexicon (`model.lexical_barn`), and locally `offer` passed in 100
+  updates. With that switched off it is the old open question again.
 - Whether separate words specialise to separate fields — the adjective question,
   and the point of the whole naming ladder. The report's "word classes" row is
   where it would show.
-- `haggle` and above. Price coordination (both sides must pick the same bin,
-  `reward.price_tol` = 0) is the likely next bottleneck; if it stalls there, that
-  is a candidate for a further rung rather than for quietly loosening the test.
+- (Price coordination — both sides must pick the same bin, `reward.price_tol`
+  = 0 — was listed here as the likely next bottleneck. It was not one: the
+  first run to get there coordinated by always naming the same price. See the
+  second open question above.)
 - The `duality` experiment (12 fruits against 8 atoms, so no atom can name a
   whole meaning — the setting where duality of patterning is *necessary*).
 - **Whether the speakers drop the gestures.** On 2026-09-29 gestures were used
@@ -2447,7 +2893,8 @@ orchard/
   economy.py     market days, seasons, lot inventories, replenishment
   env.py         episode mechanics, word parsing, trade resolution, reward
   agents.py      the randomly-initialised transformer policies, the innate reader
-                 (words -> word classes -> attributes) and the innate concepts
+                 (words -> word classes -> attributes), the production lexicon and its
+                 scaffold, the barn as a lot, and the innate concepts
   batched.py     the tensor world and reward the training loop uses
   rollout.py     batched play (probes and evaluation)
   gumbel.py      training: straight-through Gumbel channel + REINFORCE decisions
@@ -2456,11 +2903,14 @@ orchard/
   curriculum.py  the ladder of rungs, the lineup and report games, and promotion
   conventions.py the population's recent usage: rarity cost, convention bonus;
                  each speaker's own lexicon of words and the community's, the naming
-                 objective (one word per meaning), composition and word order
+                 objective, one word per meaning as an exact matching, imitation of
+                 elders' words, composition and word order
   population.py  ageing, death, birth, generation counting, the role split
   bottleneck.py  iterated learning: frequency-skewed apprenticeship, withheld combinations
   metrics.py     success, topsim, entropy, stability, intelligibility,
-                 zero-shot, channel ablation, per-rung and per-field evidence
+                 zero-shot, channel ablation, per-rung and per-field evidence,
+                 the vocabulary probe (what each agent says for each meaning), the
+                 price named on a trading rung (agreed, or bargained)
   lexicon.py     words, length↔frequency, buckets, form survival
   ledger.py      trades.jsonl / trades.csv / metrics.jsonl / births.jsonl / run.log
   render.py      human-readable transcripts (placeholder names only)
@@ -2472,10 +2922,12 @@ orchard/
   hardware.py    device resolution; pins fp32 everywhere
   run.py         the CLI (also --smoke, --benchmark, --resume, --compare)
 configs/         scale presets and named experiments
-tests/           396 tests; test_config.py is the one that keeps the method honest,
+tests/           444 tests; test_config.py is the one that keeps the method honest,
                  test_lots.py the one that keeps the lot layout and its mechanisms honest,
                  test_language_faculty.py the one that keeps words, word classes and
-                 composition honest
+                 composition honest, test_vocabulary.py the one that keeps the
+                 vocabulary one-to-one and shared, the scaffold withdrawn, and the
+                 faculty working on a barn
 sweep.py         the same arm across seeds, because one run proves nothing
 compare_runs.py  two finished runs side by side, from what they recorded
 cloud_run.sh     the GPU launcher: checks the device, picks a folder, auto-resumes

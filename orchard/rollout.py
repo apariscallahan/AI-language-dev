@@ -491,3 +491,11 @@ class UpdateStats:
     names_reused: float = 0.0
     order_pairs: int = 0
     order_agreement: float = 0.0
+    # the speakers' own lexicons, as losses averaged over the speakers that
+    # played: how far from one word per meaning (`reward.lexicon_exclusive`)
+    # and from the words heard from elders (`reward.lexicon_imitate`); and how
+    # far, in nats per symbol, a speaker's own policy is from what it says
+    # with the description scaffold (`train.scaffold_distil`; 0 once it is gone)
+    lexicon_exclusive: float = 0.0
+    lexicon_imitate: float = 0.0
+    scaffold_distil: float = 0.0

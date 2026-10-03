@@ -34,7 +34,7 @@ from .ledger import JsonlLog, Ledger, RunLogger
 from .metrics import (RollingStat, StabilityTracker, chance_success_rate,
                       channel_ablation, compositionality, detect_degenerate,
                       evaluate_success, intelligibility, newborn_vs_veterans,
-                      vocab_stats, zero_shot)
+                      price_convention, vocab_stats, zero_shot)
 from .conventions import PopulationUsage
 from .curriculum import (CurriculumState, ReferentialWorld, convention_applies,
                          costs_apply, evaluate_rung, growth_applies, ladder,
@@ -69,7 +69,9 @@ def expected_generations(cfg: Config) -> float:
 # an innate starting value: a snapshot without one resumes with that value
 # instead of being refused.
 LATE_PARAMETERS = frozenset({"speaker_lexicon.go_on", "speaker_lexicon.inhibit",
-                             "speaker_lexicon.ask"})
+                             "speaker_lexicon.ask", "speaker_lexicon.part_key",
+                             "speaker_lexicon.scaffold", "speaker_lexicon.heard",
+                             "speaker_lexicon.own_atoms"})
 
 
 @dataclass
@@ -167,6 +169,10 @@ class Trainer:
         # set by load_snapshot; named here so the banner never depends on a resume
         self._stale_forms = 0
         self._told_late = False
+        self._told_strengths = False
+        # a resumed snapshot whose speakers have no policy of their own
+        # (`warn_unschooled`)
+        self._unschooled = False
 
         self.world = World(cfg.world, random.Random(cfg.train.seed + 1))
         # Training scenarios are drawn on device, a whole batch at a time. The
@@ -225,6 +231,12 @@ class Trainer:
         self._reused_recent = RollingStat(window=100)
         self._order_recent = RollingStat(window=100)
         self._compose_recent = RollingStat(window=100)
+        # the speakers' own lexicons, as losses (`reward.lexicon_exclusive`,
+        # `reward.lexicon_imitate`), and how far their own policy is from what
+        # the description scaffold has them say (`train.scaffold_distil`)
+        self._exclusive_recent = RollingStat(window=100)
+        self._imitate_recent = RollingStat(window=100)
+        self._distil_recent = RollingStat(window=100)
 
         # ---- the curriculum -------------------------------------------------
         self.curriculum = CurriculumState(ladder(cfg))
@@ -270,6 +282,7 @@ class Trainer:
         self.progress_path = os.path.join(out_dir, "progress.json")
         self._last_progress = 0.0
         self._headline: dict[str, Any] = {}
+        self.apply_scaffold()
 
     # ------------------------------------------------------------------
     def _reset_rung_stats(self) -> None:
@@ -282,7 +295,8 @@ class Trainer:
         """
         self.rung_success = RollingStat(window=2000)
         for k in ("_gesture_recent", "_naming_recent", "_words_used_recent",
-                  "_reused_recent", "_order_recent", "_compose_recent"):
+                  "_reused_recent", "_order_recent", "_compose_recent",
+                  "_exclusive_recent", "_imitate_recent", "_distil_recent"):
             setattr(self, k, RollingStat(window=getattr(self, k).buf.maxlen))
 
     def gesture_share_now(self) -> float:
@@ -290,10 +304,87 @@ class Trainer:
         return gesture_share(self.cfg, self.curriculum.phase,
                              self.curriculum.updates_in_phase)
 
+    def scaffold_now(self) -> float:
+        """How much of the description scaffold is left, 1 to 0.
+
+        Full below `curriculum.scaffold_fade_rung`; in it, held for
+        `scaffold_hold_updates`, then withdrawn linearly over
+        `scaffold_fade_updates`; gone in every rung above -- and gone
+        throughout with no curriculum, where there is no rung to fade it in.
+
+        Counted in the updates the rung has actually played, which a snapshot
+        carries, and not on the promotion clock (`updates_in_phase`): that one
+        stands still while the community is arriving, and the scaffold has to
+        go on being withdrawn through those updates, with each newcomer born
+        into whatever is left of it.
+        """
+        c = self.cfg.curriculum
+        if not c.enabled or not c.scaffold_fade_rung:
+            return 0.0 if not c.enabled else 1.0
+        cur = self.curriculum
+        at = phase_named(self.cfg, c.scaffold_fade_rung).index
+        if cur.phase.index != at:
+            return 1.0 if cur.phase.index < at else 0.0
+        played = cur.episodes_in_phase // max(1, self.batch_size_for(cur.phase))
+        done = played - int(c.scaffold_hold_updates)
+        over = int(c.scaffold_fade_updates)
+        if done <= 0:
+            return 1.0
+        return 0.0 if over <= 0 else max(0.0, 1.0 - done / float(over))
+
+    def warn_unschooled(self) -> bool:
+        """Say so when a resumed snapshot cannot do what this rung asks of it.
+
+        A snapshot from before 2026-10-01 was trained with a scaffold that
+        never left: its speakers have never chosen which part to name, gone on
+        or stopped by themselves, and its vocabulary was never held to one word
+        per meaning (8 words for 27 meanings, none shared, on the run that
+        prompted both). Resumed below the rung the scaffold is withdrawn in,
+        the naming rungs can still teach all of that. Resumed in that rung or
+        above it they cannot: the fade clock counts the updates the rung has
+        already played, so the scaffold is going or gone from the first update
+        and nothing has taken its place.
+        """
+        if not self._unschooled or self.scaffold_now() >= 1.0:
+            return False
+        self.log.always(
+            "  [resume] WARNING: this snapshot was written before the description "
+            "scaffold could be withdrawn (2026-10-01). Its speakers have never chosen "
+            "a part, gone on or stopped by themselves, and on `%s` %.0f%% of the "
+            "scaffold is left: expect descriptions to fall apart. Its vocabulary was "
+            "not held to one word per meaning either. Start a fresh run -- the naming "
+            "rungs are a few hundred updates -- rather than carrying this one on."
+            % (self.curriculum.phase.name, 100.0 * self.scaffold_now()))
+        return True
+
+    def own_atoms_now(self) -> bool:
+        """May a speaker's token head add atoms of its own to its lexicon's
+        word? From `curriculum.own_atoms_from_rung` on -- and always where the
+        lexicon's one atom cannot be a whole word (fewer atoms than meanings),
+        or with no curriculum."""
+        from .world import lot_spans
+        c = self.cfg
+        if not c.curriculum.enabled or c.channel.atomic_vocab < sum(lot_spans(c.world)):
+            return True
+        return (self.curriculum.phase.index
+                >= phase_named(c, c.curriculum.own_atoms_from_rung).index)
+
+    def apply_scaffold(self) -> float:
+        """Set every agent's scaffold, and whose atoms its words are made of,
+        to what the schedule says for this rung and update."""
+        s, own = self.scaffold_now(), self.own_atoms_now()
+        for a in self.pop.all_agents():
+            a.net.set_scaffold(s)
+            a.net.set_own_atoms(own)
+        return s
+
     def record_gestures(self, phase, st, n: int) -> None:
         """Fold one update's gesture statistics into the per-rung record."""
         self._naming_recent.add(st.naming_signal)
         self._words_used_recent.add(st.words_used)
+        self._exclusive_recent.add(st.lexicon_exclusive)
+        self._imitate_recent.add(st.lexicon_imitate)
+        self._distil_recent.add(st.scaffold_distil)
         if st.descriptions:
             self._compose_recent.add(st.compose_bonus)
             self._reused_recent.add(st.names_reused)
@@ -490,6 +581,17 @@ class Trainer:
                 n, held_out=bool(held_out))
         return None
 
+    def price_named(self, phase) -> Optional[dict]:
+        """In a rung where a deal is named: is its price worked out from the two
+        limits, or one price said whatever they are
+        (:func:`orchard.metrics.price_convention`)? ``None`` in any other rung."""
+        if not phase.trading:
+            return None
+        return price_convention(self.cfg, self.pop, self.world,
+                                self.cfg.log.ablation_episodes, device=self.device,
+                                rng=self.eval_rng, phase=phase,
+                                sampler=self.phase_sampler(phase))
+
     def train_sampler(self, phase):
         """How training draws rounds: the rung's whole mixture.
 
@@ -510,6 +612,15 @@ class Trainer:
             return None
         return lambda n, held_out=False: rw.sample(
             n, informer=phase.informer, held_out=bool(held_out), query=int(kind))
+
+    def near_sampler(self, phase, kind: int):
+        """Rounds on one number whose wrong candidates are its nearest values:
+        the test of whether the word is exact (`curriculum.numeral_min_near`)."""
+        rw = self.referential_world
+        if not (phase.referential and rw is not None):
+            return None
+        return lambda n, held_out=False: rw.sample(
+            n, informer=phase.informer, held_out=bool(held_out), query=int(kind), near=1.0)
 
     def _context_consistency(self, phase) -> dict[str, Any]:
         """Only meaningful once buyers have spoken in a trade context too."""
@@ -598,15 +709,21 @@ class Trainer:
         # not, and `evaluate_rung` skipped what was not measured, so every rung
         # promoted between checkpoints -- most of them -- was never checked for
         # having forgotten the fields below it.
-        return phase_evidence(
+        # Measured as the speakers are trained: with whatever is left of the
+        # description scaffold, which the gate is told.
+        left = self.apply_scaffold()
+        ev = phase_evidence(
             self.cfg, self.pop, self.world, phase, sampler_for=self.phase_sampler,
             holdout_sampler_for=self.holdout_sampler,
             holdout_floor_for=self.holdout_floor,
             seen_sampler_for=self.seen_sampler,
             kind_sampler_for=self.kind_sampler,
+            near_sampler_for=self.near_sampler,
             n_eval=max(200, n_eval), n_topsim=max(60, lg.topsim_samples // (2 if light else 1)),
             n_semantics=max(200, lg.topsim_samples * 2), chance=self.chance_for(phase),
             device=self.device, rng=self.eval_rng)
+        ev["scaffold"] = left
+        return ev
 
     def consider_promotion(self, evidence: dict[str, Any], source: str) -> None:
         """Move up a rung only if this one demonstrably worked -- judged per role
@@ -643,6 +760,7 @@ class Trainer:
         if passed:
             done_in, done_updates = cur.episodes_in_phase, cur.updates_in_phase
             nxt = cur.advance(self.episode, checks)
+            self.apply_scaffold()
             self._reset_rung_stats()
             self._costs_ramp_from = None
             self.update_cost_gate()
@@ -1068,6 +1186,7 @@ class Trainer:
         cur.index = names.index(rung)
         cur.episodes_in_phase = 0
         cur.updates_in_phase = 0
+        self.apply_scaffold()
         self._reset_rung_stats()
         self._costs_ramp_from = None
         self.cost_gate = 0.0
@@ -1176,6 +1295,20 @@ class Trainer:
                     self.log.always("  [resume] added since this snapshot was written, "
                                     "starting at their innate values: %s"
                                     % ", ".join(sorted(late)))
+                if getattr(a.net, "speaks_lexically", False):
+                    # The scaffold's strengths are constants now. A file from
+                    # when they were learned holds wherever they had drifted to,
+                    # under the same names.
+                    if a.net.speaker_lexicon.restore_strengths() and not self._told_strengths:
+                        self._told_strengths = True
+                        self.log.always(
+                            "  [resume] this snapshot's speakers had learned scaffold "
+                            "strengths (ask / go_on / inhibit); they are fixed now, and "
+                            "put back at %.0f / %.0f / %.0f"
+                            % (a.net.speaker_lexicon.ASK, a.net.speaker_lexicon.GO_ON,
+                               a.net.speaker_lexicon.INHIBIT))
+                    if "speaker_lexicon.part_key" not in rec["net"]:
+                        self._unschooled = True
             except RuntimeError as exc:
                 raise SystemExit(
                     "%s was written by a version with a different observation layout "
@@ -1303,6 +1436,7 @@ class Trainer:
         self._episode_at_start = self.episode
         self._beat = (time.time(), self.episode)
         self.maybe_split_roles(cur.phase)
+        self.apply_scaffold()
         self.resume_note = ("resumed from     : %s at update %d (episode %d), rung %s%s"
                             % (path, self.updates, self.episode, cur.phase.name,
                                ("; dropped %d conventions recorded under the older "
@@ -1585,6 +1719,37 @@ class Trainer:
             "%d uses" % (c.reward.lexicon, c.reward.lexicon_name_atoms,
                          c.reward.lexicon_min_support)
             if c.reward.lexicon > 0 else "off"))
+        R = c.reward
+        L("one vocabulary     : %s; %s" % (
+            "each speaker's lexicon is kept one word per meaning across every field "
+            "(weight %.1f)" % R.lexicon_exclusive if R.lexicon_exclusive > 0
+            else "nothing keeps a lexicon one word per meaning",
+            "a listener that understood an elder's one-field answer remembers the word "
+            "for %d updates (half-life) and moves its own towards it (weight %.1f)"
+            % (R.lexicon_imitate_half_life_updates, R.lexicon_imitate)
+            if R.lexicon_imitate > 0 else "nothing makes two speakers say the same word"))
+        cu = c.curriculum
+        L("numbers are exact  : %s" % (
+            "in %.0f%% of the rounds on a quantity or a price the wrong candidates are the "
+            "nearest values, and a rung that plays them needs %.2f on those alone"
+            % (100 * cu.numeral_near_frac, cu.numeral_min_near)
+            if cu.numeral_near_frac > 0 else "off -- wrong candidates are drawn at random"))
+        L("description scaffold: %s" % (
+            "answer the question asked, go on until every part is named, never twice, "
+            "then stop -- at full strength below `%s`, held for %d updates of it and "
+            "withdrawn over the next %d while the speakers' own policy is trained to do "
+            "the same unaided (weight %.1f); `%s` cannot be passed until it is gone, and "
+            "no rung above has it" % (cu.scaffold_fade_rung, cu.scaffold_hold_updates,
+                                      cu.scaffold_fade_updates, c.train.scaffold_distil,
+                                      cu.scaffold_fade_rung)
+            if cu.enabled and cu.scaffold_fade_rung else
+            ("on throughout" if cu.enabled else "off")))
+        L("in the market      : %s; %s" % (
+            "a farmer finds the lot it was asked about through its reader and names that "
+            "row's parts with its lexicon" if c.model.lexical_barn
+            else "a farmer speaks with its token head alone",
+            "what a listener understood of each word reaches its own state"
+            if c.model.heard_meaning else "a heard word reaches only the report heads"))
         L("describing a thing : %s" % (
             "a whole lot is described with the speaker's own words for its parts -- "
             "paid %.2f per lot for its right words and charged for a wrong value's, "
@@ -1658,6 +1823,11 @@ class Trainer:
         # every buyer's round as well as every farmer's, whichever seat it was
         # spawned into. It has to be taught both.
         seats = ((FARMER, BUYER) if self.pop.shared else (newborn.role,))
+        # Born into the scaffold of the moment -- whatever is left of it in the
+        # rung it is withdrawn in, none after -- so its lessons teach it to say
+        # what its elders say, as far as it must, by itself.
+        newborn.net.set_scaffold(self.scaffold_now())
+        newborn.net.set_own_atoms(self.own_atoms_now())
         info = train_newborn(self.cfg, newborn, self.store, self.bottleneck_rng,
                              device=self.device, roles=seats)
         ev.bottleneck = info
@@ -1751,6 +1921,7 @@ class Trainer:
         abl = channel_ablation(cfg, self.pop, self.world, cfg.log.ablation_episodes,
                                device=self.device, rng=self.eval_rng,
                                phase=views[0], sampler=sampler)
+        price = self.price_named(views[0])
         newborn_age = max(20, cfg.population.lifespan_min // 6)      # in updates
         intel = intelligibility(cfg, self.pop, self.world,
                                 cfg.log.intelligibility_episodes,
@@ -1799,6 +1970,7 @@ class Trainer:
             "farmer_variety_acc": ev["farmer_variety_acc"],
             "farmer_qty_acc": ev["farmer_qty_acc"],
             "farmer_price_acc": ev["farmer_price_acc"],
+            "price_named": price,
             "train_comprehension_rolling": self.train_comprehension.mean,
             "eval_reward": ev["mean_reward"],
             "chance_success": self.chance,
@@ -1850,6 +2022,15 @@ class Trainer:
                                                   if len(self._order_recent) else float("nan")),
                        "compose_recent": (self._compose_recent.mean
                                           if len(self._compose_recent) else float("nan"))},
+            # what each agent says for each meaning, and whether they agree
+            "vocabulary": self._vocabulary(evidence),
+            "scaffold": {"left": self.scaffold_now(),
+                         "distil_recent": (self._distil_recent.mean
+                                           if len(self._distil_recent) else float("nan")),
+                         "exclusive_recent": (self._exclusive_recent.mean
+                                              if len(self._exclusive_recent) else float("nan")),
+                         "imitate_recent": (self._imitate_recent.mean
+                                            if len(self._imitate_recent) else float("nan"))},
             "gestures": {"share_now": self.gesture_share_now(),
                          "recent_used": (self._gesture_recent.mean
                                          if len(self._gesture_recent) else float("nan")),
@@ -1939,6 +2120,24 @@ class Trainer:
             self._next_check = self.updates + cfg.curriculum.check_every_updates
         return row
 
+    def _vocabulary(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        """The vocabulary probe (`metrics.vocabulary`), so every checkpoint
+        says how many words each speaker has and how far the community shares
+        them: the rung's own evidence in a naming rung, where the speakers are
+        asked; above those, what their lexicons hold -- nobody is asked about
+        one field there, so asking would measure a skill the ladder has
+        stopped using."""
+        got = evidence.get("vocabulary")
+        if got is None:
+            try:
+                from .metrics import vocabulary
+                got = vocabulary(self.cfg, self.pop, device=self.device,
+                                 max_agents=self.cfg.log.max_agents_probed,
+                                 source="lexicon")
+            except Exception as exc:
+                got = {"error": repr(exc)}
+        return got
+
     # ------------------------------------------------------------------
     def print_summary(self, row, ev, comp, vocab, stab, zs, intel, comp_pop, flags,
                       secs, abl=None, words=None, lenfreq=None, buckets=None,
@@ -2020,6 +2219,19 @@ class Trainer:
         L("                      (can the farmer name what the buyer asked for? "
           "chance is %.3f / %.3f)"
           % (1.0 / cfg.world.n_varieties, 1.0 / cfg.world.max_qty))
+        pn = row.get("price_named") or {}
+        if pn.get("farmer") and pn.get("buyer"):
+            fa, bu = pn["farmer"], pn["buyer"]
+            L("  price named       : farmer %.2f in %.0f%% of the rounds with a deal to be "
+              "had, buyer %.2f in %.0f%%; where that price does not fit both limits "
+              "(%.0f%% / %.0f%% of them) one that does is named %s / %s of the time"
+              % (fa["commonest"], 100 * fa["commonest_share"], bu["commonest"],
+                 100 * bu["commonest_share"], 100 * fa["off_share"], 100 * bu["off_share"],
+                 "n/a" if fa["follows"] != fa["follows"] else "%.2f" % fa["follows"],
+                 "n/a" if bu["follows"] != bu["follows"] else "%.2f" % bu["follows"]))
+            L("                      (played greedily, %d rounds, %.3f of them traded: 0 is "
+              "one price whatever the limits are, 1 is a price that follows them)"
+              % (pn["n"], pn.get("success_on_viable", float("nan"))))
         L("  comprehension     : %.3f  (beliefs matched and described an executable "
           "deal, whether or not they traded)" % ev["comprehension_rate"])
         L("  viability judged  : %.3f  (both sides correctly decided whether a deal "
@@ -2097,6 +2309,44 @@ class Trainer:
                   "with its own word%s (`reward.compose`)"
                   % (100 * nr, ("; %.0f%% of named field pairs in its usual order" % (100 * oa))
                      if oa == oa else ""))
+        voc = row.get("vocabulary") or {}
+        if voc.get("agents"):
+            by_id = {a.agent_id: a.name for a in self.pop.all_agents()}
+            am, an = voc.get("agreement_min", float("nan")), voc.get("agreement_mean", float("nan"))
+            asked = voc.get("source", "said") != "lexicon"
+            L("  vocabulary        : %s, the speaker with the fewest has "
+              "%d distinct words for %d meanings%s; %s %.0f%% of the time"
+              % ("asked about one field" if asked else "in the speakers' lexicons",
+                 voc.get("distinct_fewest", 0), voc.get("meanings", 0),
+                 ("; two speakers %s the same word for %.0f%% of meanings on average, "
+                  "%.0f%% for the pair furthest apart"
+                  % ("say" if asked else "hold", 100 * an, 100 * am))
+                 if am == am else "",
+                 "a word is the same whatever the rest of the lot" if asked
+                 else "a lexicon says its word for a meaning",
+                 100 * voc.get("consistency", float("nan"))))
+            for k, v in list(voc["agents"].items())[:4]:
+                by_field: dict[str, list] = {}
+                for key, word in (v.get("words") or {}).items():
+                    fld, val = key.split("=")
+                    by_field.setdefault(fld, []).append("%s:%s" % (val, word or "-"))
+                L("    %-14s %s" % (by_id.get(int(k), "agent %s" % k),
+                                    " | ".join("%s %s" % (fld, " ".join(ws))
+                                               for fld, ws in by_field.items())))
+        elif voc.get("error"):
+            L("  vocabulary        : not measured: %s" % voc["error"])
+        sc = row.get("scaffold") or {}
+        if sc:
+            left = sc.get("left", float("nan"))
+            dr = sc.get("distil_recent", float("nan"))
+            L("  description scaffold: %s%s; lexicon one-to-one loss %.3f, imitation loss %.3f"
+              % ("gone -- every description is the speakers' own" if left <= 0
+                 else "%.0f%% on (withdrawn during `%s`)" % (
+                     100 * left, self.cfg.curriculum.scaffold_fade_rung),
+                 ("; the speakers' own policy is %.3f nats a symbol from what it has them say"
+                  % dr) if left > 0 and dr == dr else "",
+                 sc.get("exclusive_recent", float("nan")),
+                 sc.get("imitate_recent", float("nan"))))
         gs = row.get("gestures") or {}
         if gs:
             d = (gs.get("by_rung") or {}).get(self.curriculum.phase.name) or {}
@@ -2376,6 +2626,25 @@ class Trainer:
             oa = nm.get("order_agreement_recent", float("nan"))
             if oa == oa:
                 gest += ", %s in usual order" % f(100 * oa, "%.0f%%")
+        # What each speaker says for each meaning, and whether they say the same
+        # (`metrics.vocabulary`); and how much of the description scaffold is on.
+        voc = row.get("vocabulary") or {}
+        if voc.get("agents"):
+            am = voc.get("agreement_min", float("nan"))
+            gest += " | vocabulary %s/%s words%s" % (
+                voc.get("distinct_fewest", 0), voc.get("meanings", 0),
+                (", %s shared" % f(100 * am, "%.0f%%")) if am == am else "")
+        sc = row.get("scaffold") or {}
+        if sc and self.cfg.curriculum.enabled:
+            gest += " | scaffold %s" % f(100 * sc.get("left", float("nan")), "%.0f%%")
+        # Where a deal is named: one price whatever the limits, or one that
+        # follows them (`metrics.price_convention`).
+        pn = row.get("price_named") or {}
+        if pn.get("farmer") and pn.get("buyer"):
+            gest += " | price %s in %s of deals, follows the limits %s / %s" % (
+                f(pn["farmer"]["commonest"], "%.2f"),
+                f(100 * pn["farmer"]["commonest_share"], "%.0f%%"),
+                f(pn["farmer"]["follows"], "%.2f"), f(pn["buyer"]["follows"], "%.2f"))
         self.log.always(
             "    coherence farmer %s buyer %s across %s | overlap %s | %s words sampled, "
             "%s said, %s atoms/word, %s words/utterance, %s silent, %s at buffer end%s"
@@ -2400,6 +2669,7 @@ class Trainer:
         L.always("run %s started %s -> %s  (full log: %s)"
                  % (cfg.name, self.started_utc, os.path.abspath(self.out_dir),
                     os.path.join(os.path.abspath(self.out_dir), "run.log")))
+        self.warn_unschooled()
 
         while self.episode < cfg.train.episodes and not self._stop_requested:
             rung = self.curriculum.phase
@@ -2410,6 +2680,7 @@ class Trainer:
             phase = (rung.with_informer(FARMER if self.updates % 2 == 0 else BUYER)
                      if rung.swaps else rung)
             f_idx, b_idx = self.pop.pair(n, device=self.device)
+            self.apply_scaffold()
             if phase.referential:
                 # A lineup: no market, no stock, no price -- just things to name.
                 scen = self.referential_world.sample(

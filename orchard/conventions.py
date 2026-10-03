@@ -73,7 +73,9 @@ import random
 from collections import defaultdict
 from typing import Any, Optional, Sequence
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .config import Config
 from .env import BUYER, FARMER, parse_words, word_text
@@ -250,6 +252,142 @@ def _naming_objective(lp: torch.Tensor, values: Sequence, rows: Sequence[int]
     sep = (p_m.unsqueeze(0) - p_m.unsqueeze(1)).abs().sum(-1) / 2.0        # (G, G) in [0, 1]
     sep = sep.sum() / (G * (G - 1))
     return mi + sep
+
+
+def _assign(cost: "np.ndarray") -> "np.ndarray":
+    """The column each row gets in the cheapest one-to-one assignment of rows
+    to columns (no more rows than columns): the Hungarian algorithm, O(n^3),
+    exact. Ties go to whichever the algorithm reaches first -- arbitrary but
+    always the same, which is what parts two meanings with identical claims.
+    """
+    n, m = cost.shape
+    u = np.zeros(n + 1)
+    v = np.zeros(m + 1)
+    owner = np.zeros(m + 1, dtype=np.int64)          # the row holding each column; 0 = free
+    way = np.zeros(m + 1, dtype=np.int64)
+    for i in range(1, n + 1):
+        owner[0] = i
+        j0 = 0
+        least = np.full(m + 1, np.inf)
+        used = np.zeros(m + 1, dtype=bool)
+        while True:
+            used[j0] = True
+            i0 = owner[j0]
+            cur = cost[i0 - 1] - u[i0] - v[1:]
+            better = ~used[1:] & (cur < least[1:])
+            least[1:][better] = cur[better]
+            way[1:][better] = j0
+            open_ = np.where(used[1:], np.inf, least[1:])
+            j1 = int(open_.argmin()) + 1
+            delta = open_[j1 - 1]
+            u[owner[used]] += delta
+            v[used] -= delta
+            least[~used] -= delta
+            j0 = j1
+            if owner[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            owner[j0] = owner[j1]
+            j0 = j1
+    out = np.zeros(n, dtype=np.int64)
+    held = owner[1:] > 0
+    out[owner[1:][held] - 1] = np.nonzero(held)[0]
+    return out
+
+
+def one_to_one(table: torch.Tensor, heard: Optional[torch.Tensor] = None,
+               floor: float = -6.0, trust: float = 20.0) -> torch.Tensor:
+    """(M,): the atom each of M meanings is given by the assignment nearest
+    ``table`` in which no two meanings share one.
+
+    Nearest is the highest total log-probability the rows give their atoms,
+    each no lower than ``floor`` -- beyond "this speaker would hardly ever say
+    it" one unlikely atom is as good as another, and without the floor a word
+    said with certainty could never be given up. ``heard`` (M, A), the
+    speaker's memory of its elders' words (:func:`imitation_loss`), adds
+    ``trust`` nats to an atom in proportion to its share of what was heard
+    for that meaning: a word heard for one meaning beats a word made up for
+    another, so the made-up one moves.
+
+    With fewer atoms than meanings (the `duality` preset) every atom is shared
+    by as few meanings as it can be: ceil(M / A).
+    """
+    with torch.no_grad():
+        z = F.log_softmax(table.detach().float(), dim=-1).clamp(min=floor)
+        if heard is not None:
+            tot = heard.sum(-1, keepdim=True)
+            z = z + trust * (heard / tot.clamp(min=1e-9)) * (tot > 0.5)
+        M, A = z.shape
+        cost = (-z).cpu().numpy().astype("float64")
+        share = -(-M // A)
+        if share > 1:
+            cost = np.tile(cost, (1, share))
+        return torch.as_tensor(_assign(cost) % A, dtype=torch.long, device=table.device)
+
+
+def lexicon_exclusivity(table: torch.Tensor, heard: Optional[torch.Tensor] = None
+                        ) -> torch.Tensor:
+    """A loss: how far a speaker's lexicon is from one word per meaning.
+
+    ``table`` (M, A) holds, for each of a speaker's M meanings -- every value
+    of every field of a lot -- the logits of the atom its word starts with
+    (:meth:`orchard.agents.CommNet.lexicon_table`). The loss is the
+    cross-entropy of each row against the atom the nearest one-to-one
+    assignment gives it (:func:`one_to_one`), summed over the meanings: next
+    to nothing where the lexicon is already one-to-one and sure of itself,
+    and where two meanings share a word the one with the weaker claim is
+    given the free atom it leans to most.
+
+    Across fields is the point: on the 2026-10-01 run each founder left the
+    naming ladder with 8 words for 27 meanings, one atom serving a fruit, a
+    colour and a quantity (:func:`naming_mutual_information` separates the
+    values *within* a field, because its rows are whole utterances, where
+    telling the question apart satisfied the objective without telling any
+    value apart; a lexicon row has no question in it).
+
+    Why a matching and not that function's objective taken over the table.
+    Tried first, and measured on fresh lexicons with nothing else training
+    them: information plus separation sharpened every word within 50 updates
+    and separated only some -- 17, 16 and 18 distinct words of 27 on three
+    runs, and there it stayed for 250 more. Two meanings both certain of one
+    atom have no gradient left to part them: the softmax that makes a word
+    certain is the same one the gradient has to pass through. A target does
+    not saturate.
+
+    Summed, not averaged: a word has to be pulled about as hard as a round's
+    reward pulls it. Averaged over the 27, each was pulled a 27th as hard, and
+    on the first CPU run of this design the game won -- the elder still had two
+    meanings on one atom at update 50, and its junior, pulled the same way by
+    :func:`imitation_loss`, still said its own fruit words (4% of words shared).
+    """
+    return F.cross_entropy(table.float(), one_to_one(table, heard), reduction="sum")
+
+
+def imitation_loss(table: torch.Tensor, heard: torch.Tensor, min_support: float = 0.5
+                   ) -> torch.Tensor:
+    """A loss: how far a speaker's words are from the words it has heard its
+    elders use and understood.
+
+    ``heard`` (M, A) is the speaker's memory of them: for each meaning, how
+    often lately it heard each atom open the word for it
+    (:attr:`orchard.agents.LexicalSpeaker.heard`). The loss is the
+    cross-entropy of each lexicon row against that meaning's share of what
+    was heard, summed over the meanings heard at all (``min_support`` of
+    recent uses) -- summed for the reason :func:`lexicon_exclusivity` is.
+
+    A memory rather than the batch's own rounds: pulled only in the updates
+    where a meaning happened to be heard, a word was pulled back to the
+    speaker's own by every update in between. Measured with a tenth of the
+    meanings heard per update and a junior with a lexicon of its own: 7 of 27
+    words shared with its elder after 350 updates (3 before it began); with
+    the memory, 27 of 27 within 50.
+    """
+    tot = heard.sum(-1)
+    have = (tot > min_support).to(table.dtype)
+    target = heard / tot.clamp(min=1e-9).unsqueeze(-1)
+    per = -(target.to(table.dtype) * F.log_softmax(table, dim=-1)).sum(-1)
+    return (per * have).sum()
 
 
 class _WordTable:

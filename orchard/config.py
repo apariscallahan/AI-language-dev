@@ -353,6 +353,32 @@ class ModelConfig:
     # infants' approximate number sense orders numerosities before any
     # counting word exists. Structure in the concepts, none in the words.
     innate_concepts: bool = True
+    # The language faculty in the market. A farmer looks at a barn, not at a
+    # lot, and until 2026-10-01 neither half of the faculty reached it: the
+    # production lexicon was absent wherever the observation was not a lot,
+    # and the reader's reading of a request went to the report heads and
+    # nowhere else. So a farmer answering "how many green pears, how good, at
+    # what floor" had to (a) find the row from words its hidden state had to
+    # learn to read all over again and (b) say the numbers with a token head
+    # that had said nothing through six naming rungs. With this on, a barn
+    # row scores the reader's log-probability of its own fruit and colour --
+    # the factored lineup choice, with the farmer's lots as the candidates --
+    # and the row found that way is a lot whose five parts (fruit, colour,
+    # quality, stock, floor price) the lexicon names with the words the naming
+    # rungs built (`CommNet.row_attention`, `CommNet.barn_concepts`).
+    lexical_barn: bool = True
+    # What a listener understood reaches its own state. Each heard word's
+    # meaning -- the concept of the value the reader takes it to name, looked
+    # up out of context -- is added to the listener's input at the slots the
+    # word was heard in, in the same embedding space as the things it sees.
+    # Without it the reader's decoding existed only at the report heads: a
+    # decision ("is this deal any good", which fruit, how many, at what price)
+    # is read off the hidden state, which had to learn to read the words a
+    # second time, on its own, with nothing but a decision's reward to teach
+    # it. Measured on the 2026-10-01 snapshot in `mutual`: the hidden state
+    # alone reported the other's lot at 0.46/0.54/0.59/0.42/0.30 per field
+    # where state and reader together reported 0.79/0.82/0.84/0.76/0.67.
+    heard_meaning: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -745,6 +771,42 @@ class RewardConfig:
     # 0.13 to 0.47. From `mutual` on the utterance-level bonus is unchanged.
     convention_words: bool = True
     lexicon_mi: float = 2.0
+    # One word per meaning, over the *whole* lexicon. `lexicon_mi` separates
+    # the values of one field in the rounds a batch happens to hold, and
+    # `lexicon` charges a resemblance through REINFORCE; neither stopped the
+    # 2026-10-01 run's founders leaving the naming ladder with 8 distinct
+    # words for 27 meanings each -- the same atom for a fruit, a colour and a
+    # number, told apart only by the question, which a description of a whole
+    # lot does not ask -- and 6 words for 9 quantities. The vocabulary shrank
+    # as the ladder went on (12 and 11 words after `name-fruit`, 8 and 8 after
+    # `name-all`): every rung passed its gate with it, and `mutual` then spent
+    # 600 updates taking it apart. Here each speaker's whole lexicon table --
+    # every value of every field, against every other -- is pulled towards the
+    # nearest table in which no two meanings share a word
+    # (`conventions.lexicon_exclusivity`, `CommNet.lexicon_table`), with no
+    # listener and no sampling in it: where the lexicon is one-to-one it does
+    # nothing, and where two meanings share a word one of them is given
+    # another. Mutual exclusivity (Markman): a new word names something that
+    # has no word yet. Which word names what is not decided here -- the table
+    # it is nearest to is the speaker's own. 0 turns it off.
+    lexicon_exclusive: float = 1.0
+    # One dialect. A listener that understood a one-field answer -- it picked
+    # the lot that was meant -- remembers the word it heard for that meaning,
+    # if the speaker is its elder (born earlier; the earlier agent of two born
+    # together), and its *own* word for the meaning is pulled towards what it
+    # remembers hearing (`conventions.imitation_loss`). Nothing else makes two
+    # speakers say the same thing: each learns to read the other, which is all
+    # a two-agent round rewards, and on the 2026-10-01 run the founders agreed
+    # on 0 of 27 words at the end of every naming rung. The newcomers then
+    # learned from both and came out as mixtures (0.59-0.81 agreement with a
+    # founder), and a community of eight had eight dialects for a reader that
+    # cannot know who is speaking. Imitation is how a word spreads (Steels'
+    # naming game: the hearer adopts the speaker's word); from elder to
+    # younger only, because two agents adopting each other's words at once
+    # swap them. 0 turns it off.
+    lexicon_imitate: float = 2.0
+    # ...and how long a heard word is remembered, in training updates.
+    lexicon_imitate_half_life_updates: int = 20
     # How "recent" the population's recent usage is, in training updates. (It
     # was 20,000 episodes: ~80 updates at the CPU runs' batch of 256, but only
     # ~5 at a GPU batch of 4,096 -- the coining cost and convention bonus were
@@ -866,6 +928,52 @@ class CurriculumConfig:
     # draw the candidates independently and are easy. Was 0.75 with three
     # fields, where each field decided about a third of the rounds.
     hard_distractor_frac: float = 0.9
+    # Numbers have to be exact. In this share of the rounds that turn on a
+    # quantity or a price, the wrong candidates are the *nearest* values (one
+    # more, one less) instead of any two others, and the same share of a hard
+    # round's near misses in a number are one step away. Drawn at random, two
+    # of nine quantities are rarely neighbours, so "about four" passed: the
+    # 2026-10-01 run left `name-quantity` at 0.89 with 6 words for 9
+    # quantities, and `mutual`, which wants the number itself, read quantity
+    # at 0.40 and price at 0.45.
+    numeral_near_frac: float = 0.5
+    # ...and a rung that plays number rounds is not passed until rounds of
+    # nearest neighbours alone are won this often, each describer on its own.
+    # Seven words for nine quantities scores 0.78 here; eight score 0.89.
+    numeral_min_near: float = 0.80
+    # The vocabulary `name-all` has to hand on, measured on what each agent
+    # actually says when asked about one field (`metrics.vocabulary`): the
+    # share of the meanings it names with a word of their own, and the share
+    # two agents name with the same word (the worst agent, the worst pair).
+    min_vocabulary_distinct: float = 0.95
+    min_vocabulary_agreement: float = 0.90
+    # The description scaffold (`agents.LexicalSpeaker`) is at full strength
+    # below this rung, held for `scaffold_hold_updates` of it, withdrawn
+    # linearly over `scaffold_fade_updates`, and gone from then on; the rung
+    # cannot be passed until it is gone. Every rung above it -- all of trading
+    # -- runs on what the speakers themselves have learned.
+    #
+    # `mutual`, not `name-all`: it is the last rung played over bare lots, and
+    # the only one below the market in which a lot is described from the
+    # *second* seat. Withdrawn in `name-all`, where every description opens
+    # the conversation, the hand-over was clean -- `name-all` passed at 0.98
+    # with no scaffold left -- and then in `mutual` the first speaker said its
+    # five words and the second, in a seat it had never described from, ran to
+    # the end of the buffer: `a15 a13 a15 a7 a7 a16 a7 a7 a15 a9 a16`. A habit
+    # is learned where it was practised. Counted in the rung's own updates,
+    # including those in which the community is still arriving.
+    scaffold_fade_rung: str = "mutual"
+    scaffold_hold_updates: int = 100
+    scaffold_fade_updates: int = 300
+    # Below this rung a word is the lexicon's and nothing else's: a speaker's
+    # token head decides whether a word goes on, another starts or the turn
+    # ends, and has no say in which atom is said (`LexicalSpeaker.own_atoms`).
+    # From it on -- the market -- the head's atoms are added again, so a word
+    # for something that is not a part of a lot (a yes, a no, a counter-offer)
+    # has somewhere to come from. Where there are fewer atoms than meanings
+    # (the `duality` preset) a word needs more than its lexicon's one atom, and
+    # the head's are on throughout.
+    own_atoms_from_rung: str = "order"
     # If a rung never hits threshold inside its budget, advancing anyway would
     # just rebuild the same failure one rung up.  "stop" ends the run and writes
     # the report; "hold" keeps training and flags it loudly.
@@ -1028,6 +1136,34 @@ class TrainConfig:
     # runs without it, and it joins at `mutual`, where every word exists and the
     # listener's job is to put five of them into five heads.
     hindsight_from_rung: str = "mutual"
+    # While the description scaffold is on, and to the end of the rung it is
+    # withdrawn in, the speaker's own policy -- its choice of part and its
+    # token head, with no scaffold -- is trained towards what the scaffold asks
+    # for at each symbol (a KL term: which part to name where a word starts;
+    # whether to go on, start another word or stop after one). Practice becomes
+    # habit, so that withdrawing the scaffold changes nothing. Without it the
+    # scaffold saturated the choice it made (going on at 5 nats is p = 0.99995),
+    # nothing reached the policy underneath, and what was left when the support
+    # went was what had been there at birth. Never which atom to say: the words
+    # are the lexicon's. 0 turns it off.
+    scaffold_distil: float = 1.0
+    # The answer to a question about a field is a word for that field. In a
+    # round that asks about one field, the listener's reader is taught that the
+    # first word it hears names the field that was asked about -- the question
+    # is common ground: it is in both observations. What the word says *about*
+    # that field is still only learned from whether the guess landed.
+    #
+    # Why: a word's class is otherwise learned through the reading it enables,
+    # and that reading saturates. A word filed under the wrong class early
+    # (two of 27 were, on one seed of eight, a reader taught on one-word
+    # utterances alone: one quality word read as a quantity at 0.98 by step
+    # 100 and 1.00 by 400, another as a fruit at 0.99) still answers its own
+    # question, through the floor that keeps every reading possible -- so
+    # nothing moves it back, and in a five-word description it competes with
+    # the real quantity word and leaves the quality unread (0.84 where every
+    # other field read 1.00). This term does not saturate: with it all eight
+    # seeds read every field at 1.00. 0 turns it off.
+    answer_class_coef: float = 1.0
     episodes: int = 6_000_000             # the run's ceiling (~23k updates); rung budgets stop it earlier
     batch_size: int = 256                 # episodes per update (x rung_batch_scale)
     # Adam's step size. It was 3e-4, but below `curriculum.split_roles_at` the
@@ -1565,4 +1701,18 @@ def validate(cfg: Config) -> None:
     assert cfg.reward.lexicon >= 0.0 and cfg.reward.lexicon_min_support >= 1
     assert cfg.reward.lexicon_name_atoms >= 1
     assert cfg.reward.compose >= 0.0 and cfg.reward.word_order >= 0.0
+    assert cfg.reward.lexicon_exclusive >= 0.0 and cfg.reward.lexicon_imitate >= 0.0
+    assert cfg.train.scaffold_distil >= 0.0 and cfg.train.answer_class_coef >= 0.0
+    cu = cfg.curriculum
+    assert 0.0 <= cu.numeral_near_frac <= 1.0 and 0.0 <= cu.numeral_min_near <= 1.0
+    assert 0.0 <= cu.min_vocabulary_distinct <= 1.0
+    assert 0.0 <= cu.min_vocabulary_agreement <= 1.0
+    assert cu.scaffold_hold_updates >= 0 and cu.scaffold_fade_updates >= 0
+    phase_named(cfg, cu.own_atoms_from_rung)                     # must name a rung
+    if cu.scaffold_fade_rung:
+        fade = phase_named(cfg, cu.scaffold_fade_rung)          # must name a rung
+        assert fade.tuples, (
+            "curriculum.scaffold_fade_rung is %r: the scaffold has to be gone before "
+            "the market, so it fades in a rung played over bare lots (a naming rung "
+            "or `mutual`)" % cu.scaffold_fade_rung)
     assert 0.0 <= cfg.curriculum.min_field_coverage_each <= 1.0
